@@ -51,8 +51,43 @@ async fn main() -> Result<()> {
     })
     .context("Cannot set Ctrl-C handler")?;
 
-    // ── start capture ────────────────────────────────────────────────
-    let mut capture_handle = capture::start(&config)?;
+    // ── start capture (with retries) ──────────────────────────────────
+    // If the capture process cannot start (e.g. no microphone attached,
+    // no ALSA device in the container) we retry a few times with a delay
+    // before falling back to running the HTTP server without capture.
+    // This avoids the container dying immediately and gives hardware
+    // (e.g. USB mics) time to initialise.
+    const MAX_CAPTURE_RETRIES: u32 = 5;
+    const CAPTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let mut capture_handle: Option<capture::CaptureHandle> = None;
+    for attempt in 1..=MAX_CAPTURE_RETRIES {
+        match capture::start(&config) {
+            Ok(h) => {
+                info!("Audio capture started on attempt {attempt}");
+                capture_handle = Some(h);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Audio capture attempt {attempt}/{MAX_CAPTURE_RETRIES} failed: {e:#}"
+                );
+                if attempt < MAX_CAPTURE_RETRIES {
+                    tracing::info!(
+                        "Retrying in {}s…",
+                        CAPTURE_RETRY_DELAY.as_secs()
+                    );
+                    std::thread::sleep(CAPTURE_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    if capture_handle.is_none() {
+        tracing::warn!(
+            "All {MAX_CAPTURE_RETRIES} capture attempts failed. \
+             HTTP server will run without active capture."
+        );
+    }
 
     // ── start HTTP server ────────────────────────────────────────────
     let stream_dir = config.stream_data_dir();
@@ -70,7 +105,9 @@ async fn main() -> Result<()> {
     let _ = server_handle.await;
 
     // Clean up capture processes
-    capture_handle.kill().ok();
+    if let Some(ref mut h) = capture_handle {
+        h.kill().ok();
+    }
     info!("Gaia Capture Server stopped");
 
     Ok(())

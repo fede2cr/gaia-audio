@@ -34,6 +34,14 @@ async fn main() {
         std::env::var("GAIA_DB_PATH").unwrap_or_else(|_| "data/birds.db".into()),
     );
 
+    // Ensure the database and schema exist so the dashboard works even
+    // before the processing server has written any detections.
+    if let Err(e) = gaia_web::server::import::ensure_gaia_schema(&db_path) {
+        tracing::error!("Cannot initialise database: {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("Database ready at {}", db_path.display());
+
     let extracted_dir = PathBuf::from(
         std::env::var("GAIA_EXTRACTED_DIR").unwrap_or_else(|_| "data/extracted".into()),
     );

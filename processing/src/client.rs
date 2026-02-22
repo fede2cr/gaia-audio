@@ -53,6 +53,14 @@ pub fn poll_and_process(
             break;
         }
 
+        // Without models we cannot analyse anything.  Sleep and retry so
+        // the capture server keeps buffering recordings.
+        if models.is_empty() {
+            warn!("No models loaded – skipping poll cycle");
+            std::thread::sleep(poll_interval);
+            continue;
+        }
+
         // ── list available recordings ────────────────────────────────
         let recordings = match list_recordings(&client, base_url) {
             Ok(r) => r,
@@ -62,6 +70,14 @@ pub fn poll_and_process(
                 continue;
             }
         };
+
+        if recordings.is_empty() {
+            debug!("Recording queue empty – nothing to analyse, sleeping");
+            std::thread::sleep(poll_interval);
+            continue;
+        }
+
+        info!("Found {} new recording(s) to process", recordings.len());
 
         for rec in &recordings {
             if shutdown.load(Ordering::Relaxed) {

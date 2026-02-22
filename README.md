@@ -252,8 +252,7 @@ services:
     depends_on:
       - processing
     volumes:
-      - ./data:/data:ro            # SQLite DB (read-only)
-      - ./data/extracted:/data/extracted:ro   # audio clips for playback
+      - ./data:/data                          # SQLite WAL needs write access
       - ./backups:/backups         # BirdNET-Pi backup .tar files for import
     ports:
       - "3000:3000"

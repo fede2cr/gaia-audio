@@ -240,7 +240,11 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     let mut manifests = Vec::new();
 
     if !root_dir.exists() {
-        anyhow::bail!("Model directory does not exist: {}", root_dir.display());
+        tracing::warn!(
+            "Model directory does not exist: {}. No models will be loaded.",
+            root_dir.display()
+        );
+        return Ok(manifests);
     }
 
     // Check if root_dir itself has a manifest (single-model setup)
@@ -265,13 +269,15 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     }
 
     if manifests.is_empty() {
-        anyhow::bail!(
-            "No model manifests found in {}. Each model subdirectory needs a manifest.toml.",
+        tracing::warn!(
+            "No model manifests found in {}. \
+             Each model subdirectory needs a manifest.toml. \
+             The processing server will start but cannot analyse audio until models are available.",
             root_dir.display()
         );
+    } else {
+        info!("Discovered {} model(s)", manifests.len());
     }
-
-    info!("Discovered {} model(s)", manifests.len());
     Ok(manifests)
 }
 

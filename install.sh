@@ -83,6 +83,10 @@ OVERLAP=0.0
 RECORDING_LENGTH=15
 CHANNELS=1
 # REC_CARD=default
+# For USB mics use the ALSA card identifier, e.g.:
+#   REC_CARD=plughw:2,0
+#   REC_CARD=plughw:CARD=Usb_Microphone,DEV=0
+# Run "arecord -l" on the host to list available capture devices.
 
 # Directories (container paths – match compose.yaml volumes)
 RECS_DIR=/data
@@ -202,8 +206,7 @@ services:
     depends_on:
       - processing
     volumes:
-      - ./data:/data:ro
-      - ./data/extracted:/data/extracted:ro
+      - ./data:/data
       - ./backups:/backups
     ports:
       - "3000:3000"

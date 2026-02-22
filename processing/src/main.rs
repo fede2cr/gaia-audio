@@ -62,15 +62,28 @@ fn main() -> Result<()> {
 
     let mut models = Vec::with_capacity(manifests.len());
     for m in &manifests {
-        let loaded = model::load_model(m, &config)?;
-        info!(
-            "Model ready: {} (domain={}, sr={}, chunk={}s)",
-            m.manifest.model.name,
-            m.manifest.model.domain,
-            m.manifest.model.sample_rate,
-            m.manifest.model.chunk_duration,
+        match model::load_model(m, &config) {
+            Ok(loaded) => {
+                info!(
+                    "Model ready: {} (domain={}, sr={}, chunk={}s)",
+                    m.manifest.model.name,
+                    m.manifest.model.domain,
+                    m.manifest.model.sample_rate,
+                    m.manifest.model.chunk_duration,
+                );
+                models.push(loaded);
+            }
+            Err(e) => {
+                tracing::warn!("Cannot load model {}: {e:#}", m.manifest.model.name);
+            }
+        }
+    }
+
+    if models.is_empty() {
+        tracing::warn!(
+            "No models loaded. The processing server will run but cannot \
+             analyse audio until model files (tflite) are present."
         );
-        models.push(loaded);
     }
 
     // ── ctrl-c ───────────────────────────────────────────────────────

@@ -437,7 +437,7 @@ pub fn import_backup(
 }
 
 /// Ensure the Gaia detections table exists.
-fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
+pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create DB dir: {e}"))?;
     }
