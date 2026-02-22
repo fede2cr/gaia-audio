@@ -1,0 +1,69 @@
+# ── Build stage ─────────────────────────────────────────────────────
+FROM debian:trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    pkg-config libssl-dev \
+    gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH="/usr/local/cargo/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+WORKDIR /build
+
+# Copy workspace manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY common/Cargo.toml common/Cargo.toml
+COPY capture/Cargo.toml capture/Cargo.toml
+COPY processing/Cargo.toml processing/Cargo.toml
+COPY web/Cargo.toml web/Cargo.toml
+
+# Create dummy sources so cargo can fetch/compile dependencies
+RUN mkdir -p common/src capture/src processing/src web/src && \
+    echo "pub fn _dummy() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > capture/src/main.rs && \
+    echo "fn main() {}" > processing/src/main.rs && \
+    echo "pub fn _dummy() {}" > web/src/lib.rs && \
+    echo "fn main() {}" > web/src/main.rs && \
+    cargo build --release -p gaia-processing 2>/dev/null || true
+
+# Copy real source
+COPY common/src common/src
+COPY processing/src processing/src
+
+# Build for real
+RUN cargo build --release -p gaia-processing
+
+# ── Runtime stage ──────────────────────────────────────────────────
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-0 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+
+RUN mkdir -p /etc/gaia /data /models
+
+# Default config — override by mounting your own
+RUN echo '# Gaia Processing Server config\n\
+LATITUDE=-1\n\
+LONGITUDE=-1\n\
+CONFIDENCE=0.7\n\
+SENSITIVITY=1.25\n\
+OVERLAP=0.0\n\
+MODEL_DIR=/models\n\
+DATABASE_LANG=en\n\
+DB_PATH=/data/detections.db\n\
+CAPTURE_SERVER_URL=http://capture:8089\n\
+POLL_INTERVAL_SECS=5\n\
+RECS_DIR=/data\n\
+EXTRACTED=/data/Extracted\n' > /etc/gaia/gaia.conf
+
+VOLUME ["/data", "/models"]
+
+ENTRYPOINT ["gaia-processing"]
+CMD ["/etc/gaia/gaia.conf"]

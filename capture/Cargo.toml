@@ -1,0 +1,24 @@
+[package]
+name = "gaia-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gaia-capture"
+path = "src/main.rs"
+
+[dependencies]
+gaia-common = { path = "../common" }
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+notify.workspace = true
+ctrlc.workspace = true

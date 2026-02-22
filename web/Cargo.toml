@@ -1,0 +1,84 @@
+[package]
+name = "gaia-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "gaia-web"
+path = "src/main.rs"
+
+[dependencies]
+# ── Core Leptos ──────────────────────────────────────────────
+leptos       = "0.6"
+leptos_router = "0.6"
+leptos_meta  = "0.6"
+
+# ── Shared (compiled for both native + wasm) ────────────────
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+cfg-if     = "1"
+
+# ── SSR-only deps (server binary) ───────────────────────────
+leptos_axum         = { version = "0.6", optional = true }
+axum                = { version = "0.7", optional = true }
+tokio               = { version = "1", features = ["full"], optional = true }
+tower               = { version = "0.4", optional = true }
+tower-http          = { version = "0.5", features = ["fs", "cors"], optional = true }
+tracing             = { version = "0.1", optional = true }
+tracing-subscriber  = { version = "0.3", features = ["env-filter"], optional = true }
+rusqlite            = { version = "0.32", features = ["bundled"], optional = true }
+reqwest             = { version = "0.12", features = ["json"], optional = true }
+chrono              = { version = "0.4", optional = true }
+http                = { version = "1", optional = true }
+tar                 = { version = "0.4", optional = true }
+
+# ── Hydrate-only deps (WASM client) ─────────────────────────
+wasm-bindgen              = { version = "0.2", optional = true }
+console_error_panic_hook  = { version = "0.1", optional = true }
+
+[features]
+default = []
+hydrate = [
+    "leptos/hydrate",
+    "leptos_router/hydrate",
+    "leptos_meta/hydrate",
+    "dep:wasm-bindgen",
+    "dep:console_error_panic_hook",
+]
+ssr = [
+    "leptos/ssr",
+    "leptos_router/ssr",
+    "leptos_meta/ssr",
+    "dep:leptos_axum",
+    "dep:axum",
+    "dep:tokio",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:rusqlite",
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:http",
+    "dep:tar",
+]
+
+[package.metadata.leptos]
+output-name     = "gaia-web"
+site-root       = "target/site"
+site-pkg-dir    = "pkg"
+style-file      = "style/main.css"
+assets-dir      = "public"
+site-addr       = "0.0.0.0:3000"
+reload-port     = 3001
+browserquery    = "defaults"
+watch-additional-files = ["style"]
+env             = "DEV"
+bin-features    = ["ssr"]
+bin-default-features  = false
+lib-features    = ["hydrate"]
+lib-default-features  = false

@@ -1,0 +1,55 @@
+# Example model manifest for BirdNET V2.4
+#
+# Place this file as manifest.toml inside a model directory, e.g.:
+#   /models/birds/manifest.toml
+#
+# The processing server auto-discovers all subdirectories of MODEL_DIR
+# that contain a manifest.toml.
+#
+# If model files are missing and a [download] section is present, the
+# server will automatically download the selected variant from Zenodo.
+
+[model]
+name = "BirdNET V2.4"
+domain = "birds"
+sample_rate = 48000
+chunk_duration = 3.0
+tflite_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite"
+labels_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt"
+# Set to true only for BirdNET V1 (requires metadata input tensor)
+v1_metadata = false
+# Set to true for models like Perch that output raw logits needing softmax
+apply_softmax = false
+
+[metadata_model]
+enabled = true
+tflite_file = "BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite"
+
+[language]
+# Subdirectory containing labels_{lang}.json files
+dir = "l18n"
+
+# ── Automatic download from Zenodo ────────────────────────────────────
+# The processing server downloads and extracts the model if the
+# tflite_file is not already present on disk.
+#
+# Set MODEL_VARIANT in gaia.conf to choose a variant:
+#   fp32  – Full precision, highest accuracy (~77 MB download)
+#   fp16  – Half precision, good balance  (~53 MB download, default)
+#   int8  – Quantised, smallest & fastest (~46 MB download, ideal for RPi)
+
+[download]
+zenodo_record_id = "15050749"
+default_variant = "fp16"
+
+[download.variants.fp32]
+zenodo_file = "BirdNET_v2.4_tflite.zip"
+md5 = "c13f7fd28a5f7a3b092cd993087f93f7"
+
+[download.variants.fp16]
+zenodo_file = "BirdNET_v2.4_tflite_fp16.zip"
+md5 = "4cd35da63e442d974faf2121700192b5"
+
+[download.variants.int8]
+zenodo_file = "BirdNET_v2.4_tflite_int8.zip"
+md5 = "69becc3e8eb1c72d1d9dae7f21062c74"

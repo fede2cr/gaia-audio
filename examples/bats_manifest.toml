@@ -1,0 +1,18 @@
+# Example model manifest for a bat detection model.
+#
+# This is a hypothetical example showing how to configure a non-bird model.
+# Adjust tflite_file, labels_file, and parameters for your actual model.
+
+[model]
+name = "BatDetect2"
+domain = "bats"
+# Bat echolocation is ultrasonic — models typically need high sample rates
+sample_rate = 256000
+chunk_duration = 1.0
+tflite_file = "batdetect2.tflite"
+labels_file = "bat_labels.txt"
+v1_metadata = false
+apply_softmax = true
+
+# No metadata model for bats
+# [metadata_model]

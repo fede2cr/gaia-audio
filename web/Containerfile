@@ -1,0 +1,70 @@
+# ── Build stage ─────────────────────────────────────────────────────
+FROM debian:trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    pkg-config libssl-dev \
+    gcc libc6-dev \
+    perl make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install rustup (needed for wasm32 target, not available via Debian packages)
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH="/usr/local/cargo/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+WORKDIR /build
+
+# Install wasm target + cargo-leptos
+RUN rustup target add wasm32-unknown-unknown && \
+    cargo install cargo-leptos
+
+# Copy workspace manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY common/Cargo.toml common/Cargo.toml
+COPY capture/Cargo.toml capture/Cargo.toml
+COPY processing/Cargo.toml processing/Cargo.toml
+COPY web/Cargo.toml web/Cargo.toml
+
+# Create dummy sources so cargo can fetch/compile dependencies
+RUN mkdir -p common/src capture/src processing/src web/src && \
+    echo "pub fn _dummy() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > capture/src/main.rs && \
+    echo "fn main() {}" > processing/src/main.rs && \
+    echo "pub fn _dummy() {}" > web/src/lib.rs && \
+    echo "fn main() {}" > web/src/main.rs && \
+    cargo build --release -p gaia-web --features ssr 2>/dev/null || true
+
+# Copy real source + assets
+COPY web/src web/src
+COPY web/style web/style
+COPY web/public web/public
+
+# Build with cargo-leptos (compiles SSR binary + WASM hydration bundle)
+RUN cd web && cargo leptos build --release
+
+# ── Runtime stage ──────────────────────────────────────────────────
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the server binary
+COPY --from=builder /build/target/release/gaia-web /usr/local/bin/gaia-web
+
+# Copy the built site (WASM bundle, CSS, static assets)
+COPY --from=builder /build/target/site /srv/site
+
+RUN mkdir -p /data
+
+# Leptos reads LEPTOS_SITE_ROOT at runtime for serving static assets
+ENV LEPTOS_SITE_ROOT=/srv/site
+ENV LEPTOS_SITE_ADDR=0.0.0.0:3000
+ENV GAIA_DB_PATH=/data/detections.db
+
+EXPOSE 3000
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["gaia-web"]

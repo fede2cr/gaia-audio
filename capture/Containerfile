@@ -1,0 +1,65 @@
+# ── Build stage ─────────────────────────────────────────────────────
+FROM debian:trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    pkg-config libssl-dev \
+    gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH="/usr/local/cargo/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+WORKDIR /build
+
+# Copy workspace manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY common/Cargo.toml common/Cargo.toml
+COPY capture/Cargo.toml capture/Cargo.toml
+COPY processing/Cargo.toml processing/Cargo.toml
+COPY web/Cargo.toml web/Cargo.toml
+
+# Create dummy sources so cargo can fetch/compile dependencies
+RUN mkdir -p common/src capture/src processing/src web/src && \
+    echo "pub fn _dummy() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > capture/src/main.rs && \
+    echo "fn main() {}" > processing/src/main.rs && \
+    echo "pub fn _dummy() {}" > web/src/lib.rs && \
+    echo "fn main() {}" > web/src/main.rs && \
+    cargo build --release -p gaia-capture 2>/dev/null || true
+
+# Copy real source
+COPY common/src common/src
+COPY capture/src capture/src
+
+# Build for real
+RUN cargo build --release -p gaia-capture
+
+# ── Runtime stage ──────────────────────────────────────────────────
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    alsa-utils \
+    ffmpeg \
+    libasound2t64 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/gaia-capture /usr/local/bin/gaia-capture
+
+RUN mkdir -p /etc/gaia /data/StreamData
+
+# Default config — override by mounting your own
+RUN echo '# Gaia Capture Server config\n\
+RECORDING_LENGTH=15\n\
+CHANNELS=1\n\
+RECS_DIR=/data\n\
+CAPTURE_LISTEN_ADDR=0.0.0.0:8089\n' > /etc/gaia/gaia.conf
+
+EXPOSE 8089
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["gaia-capture"]
+CMD ["/etc/gaia/gaia.conf"]

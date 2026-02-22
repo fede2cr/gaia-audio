@@ -1,0 +1,55 @@
+[workspace]
+members = ["common", "capture", "processing", "web"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+
+[workspace.dependencies]
+# Shared across crates
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio
+hound = "3.5"
+rubato = "0.15"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Inference
+tract-tflite = "0.21"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Image / FFT
+rustfft = "6.2"
+image = "0.25"
+
+# Config
+toml = "0.8"
+
+# Archive & checksum
+zip = "2"
+md5 = "0.7"
+tar = "0.4"
+
+# Other
+ctrlc = { version = "3.4", features = ["termination"] }
+notify = "7"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
