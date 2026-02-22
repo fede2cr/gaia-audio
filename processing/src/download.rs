@@ -78,34 +78,52 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
     Ok(())
 }
 
-/// Download a zip from `url`, verify MD5, and extract into `dest_dir`.
-fn download_and_extract(url: &str, dest_dir: &Path, expected_md5: Option<&str>) -> Result<()> {
-    info!("GET {}", url);
+/// Maximum number of download attempts before giving up.
+const MAX_RETRIES: u32 = 5;
 
-    let client = reqwest::blocking::Client::builder()
+/// Initial backoff delay between retries.
+const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// User-Agent sent to Zenodo (they block requests without one).
+const USER_AGENT: &str = "gaia-processing/0.1";
+
+/// Build the shared HTTP client used for Zenodo downloads.
+fn build_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(600)) // 10 min for large models
         .build()
-        .context("Cannot build HTTP client")?;
+        .context("Cannot build HTTP client")
+}
 
-    let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("Failed to download: {url}"))?;
+/// Download a zip from `url`, verify MD5, and extract into `dest_dir`.
+///
+/// The download is resumable: data is streamed to a `.part` file and, on
+/// failure, subsequent retries use an HTTP `Range` header to continue where
+/// they left off instead of starting from scratch.  Retries use exponential
+/// backoff to avoid overloading the server.
+fn download_and_extract(url: &str, dest_dir: &Path, expected_md5: Option<&str>) -> Result<()> {
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("Cannot create model directory: {}", dest_dir.display()))?;
 
-    if !response.status().is_success() {
-        anyhow::bail!("Download failed (HTTP {}): {}", response.status(), url);
-    }
+    // Use a .part file so incomplete downloads are obvious and resumable.
+    let part_path = dest_dir.join(".download.part");
 
-    let bytes = response
-        .bytes()
-        .context("Failed to read download response body")?;
+    let client = build_client()?;
+
+    download_with_resume(&client, url, &part_path)?;
+
+    // Read the completed file and verify MD5.
+    let bytes =
+        std::fs::read(&part_path).with_context(|| format!("Cannot read {}", part_path.display()))?;
 
     info!("Downloaded {:.1} MB", bytes.len() as f64 / 1_048_576.0);
 
-    // Verify MD5 if provided
     if let Some(expected) = expected_md5 {
         let digest = format!("{:x}", md5::compute(&bytes));
         if digest != expected {
+            // Remove the corrupt partial file so the next run starts fresh.
+            let _ = std::fs::remove_file(&part_path);
             anyhow::bail!(
                 "MD5 checksum mismatch: expected {}, got {}. \
                  The download may be corrupted.",
@@ -117,11 +135,141 @@ fn download_and_extract(url: &str, dest_dir: &Path, expected_md5: Option<&str>) 
     }
 
     // Extract zip
-    let cursor = std::io::Cursor::new(&bytes);
-    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open zip archive")?;
+    extract_zip(&bytes, dest_dir)?;
 
-    std::fs::create_dir_all(dest_dir)
-        .with_context(|| format!("Cannot create model directory: {}", dest_dir.display()))?;
+    // Clean up the .part file after successful extraction.
+    let _ = std::fs::remove_file(&part_path);
+
+    Ok(())
+}
+
+/// Download `url` into `part_path`, resuming from where a previous attempt
+/// left off.  Retries up to [`MAX_RETRIES`] times with exponential backoff.
+fn download_with_resume(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    part_path: &Path,
+) -> Result<()> {
+    let mut backoff = INITIAL_BACKOFF;
+
+    for attempt in 1..=MAX_RETRIES {
+        // How many bytes we already have on disk.
+        let existing_len = part_path.metadata().map(|m| m.len()).unwrap_or(0);
+
+        info!(
+            "GET {} (attempt {}/{}, resume from {} bytes)",
+            url, attempt, MAX_RETRIES, existing_len
+        );
+
+        let mut request = client.get(url);
+        if existing_len > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={}-", existing_len));
+        }
+
+        let response = match request.send() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Download request failed (attempt {}/{}): {}",
+                    attempt, MAX_RETRIES, e
+                );
+                if attempt == MAX_RETRIES {
+                    return Err(e).with_context(|| format!("Failed to download after {MAX_RETRIES} attempts: {url}"));
+                }
+                info!("Retrying in {:?}…", backoff);
+                std::thread::sleep(backoff);
+                backoff *= 2;
+                continue;
+            }
+        };
+
+        let status = response.status();
+
+        // 416 Range Not Satisfiable → the server says we already have the
+        // full file (existing_len >= content length).  Treat as success.
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && existing_len > 0 {
+            info!("Server indicates the file is already fully downloaded");
+            return Ok(());
+        }
+
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            warn!(
+                "Download failed HTTP {} (attempt {}/{})",
+                status, attempt, MAX_RETRIES
+            );
+            if attempt == MAX_RETRIES {
+                anyhow::bail!(
+                    "Download failed (HTTP {}) after {} attempts: {}",
+                    status,
+                    MAX_RETRIES,
+                    url
+                );
+            }
+            info!("Retrying in {:?}…", backoff);
+            std::thread::sleep(backoff);
+            backoff *= 2;
+            continue;
+        }
+
+        // If the server returned 200 (not 206), it doesn't support Range
+        // requests – we must start from scratch.
+        let append = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(part_path)
+            .with_context(|| format!("Cannot open {}", part_path.display()))?;
+
+        // Stream the body in chunks instead of holding it all in memory.
+        match stream_to_file(response, &mut file) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(
+                    "Download stream interrupted (attempt {}/{}): {}",
+                    attempt, MAX_RETRIES, e
+                );
+                if attempt == MAX_RETRIES {
+                    return Err(e).context(format!(
+                        "Download stream failed after {MAX_RETRIES} attempts: {url}"
+                    ));
+                }
+                info!("Retrying in {:?}…", backoff);
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+        }
+    }
+
+    unreachable!()
+}
+
+/// Copy response body to `file`, chunk by chunk.
+fn stream_to_file(
+    response: reqwest::blocking::Response,
+    file: &mut std::fs::File,
+) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let mut reader = response;
+    let mut buf = vec![0u8; 256 * 1024]; // 256 KB chunks
+    loop {
+        let n = reader.read(&mut buf).context("Error reading response body")?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .context("Error writing to .part file")?;
+    }
+    file.flush().context("Error flushing .part file")?;
+    Ok(())
+}
+
+/// Extract a zip archive from `bytes` into `dest_dir`.
+fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<()> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open zip archive")?;
 
     let mut extracted = 0usize;
     for i in 0..archive.len() {

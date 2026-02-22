@@ -175,6 +175,7 @@ services:
   # ── Audio capture ───────────────────────────────────────────────────
   capture:
     image: ${REGISTRY}/gaia-capture
+    pull_policy: always
     restart: unless-stopped
     devices:
       - /dev/snd:/dev/snd
@@ -189,6 +190,7 @@ services:
   # ── Model inference & analysis ──────────────────────────────────────
   processing:
     image: ${REGISTRY}/gaia-processing
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       - capture
@@ -202,6 +204,7 @@ services:
   # ── Web dashboard ──────────────────────────────────────────────────
   web:
     image: ${REGISTRY}/gaia-web
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       - processing
