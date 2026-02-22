@@ -35,9 +35,11 @@ RUN mkdir -p common/src capture/src processing/src web/src && \
     echo "fn main() {}" > web/src/main.rs && \
     cargo build --release -p gaia-web --features ssr 2>/dev/null || true
 
-# Copy real source + assets
+# Copy real source + assets (touch to invalidate cargo fingerprint from dummy layer)
+COPY common/src common/src
 COPY web/src web/src
 COPY web/style web/style
+RUN touch common/src/lib.rs web/src/lib.rs web/src/main.rs
 COPY web/public web/public
 
 # Build with cargo-leptos (compiles SSR binary + WASM hydration bundle)

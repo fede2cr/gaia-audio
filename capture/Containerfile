@@ -29,9 +29,10 @@ RUN mkdir -p common/src capture/src processing/src web/src && \
     echo "fn main() {}" > web/src/main.rs && \
     cargo build --release -p gaia-capture 2>/dev/null || true
 
-# Copy real source
+# Copy real source (touch to invalidate cargo fingerprint from dummy layer)
 COPY common/src common/src
 COPY capture/src capture/src
+RUN touch common/src/lib.rs capture/src/main.rs
 
 # Build for real
 RUN cargo build --release -p gaia-capture
