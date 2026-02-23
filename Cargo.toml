@@ -45,6 +45,8 @@ zip = "2"
 md5 = "0.7"
 tar = "0.4"
 
+mdns-sd = "0.18"
+
 # Other
 ctrlc = { version = "3.4", features = ["termination"] }
 notify = "7"

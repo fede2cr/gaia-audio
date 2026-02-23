@@ -14,6 +14,13 @@ use crate::manifest::ResolvedManifest;
 
 const ZENODO_FILES_URL: &str = "https://zenodo.org/api/records";
 
+/// Name of the marker file used to implement exponential backoff across
+/// container restarts.  The file contains the next retry timestamp.
+const BACKOFF_MARKER: &str = ".download_backoff";
+
+/// Maximum backoff between download attempts (across restarts).
+const MAX_RESTART_BACKOFF_SECS: u64 = 600; // 10 minutes
+
 /// Ensure the model files for `manifest` are present, downloading from
 /// Zenodo if necessary.
 ///
@@ -42,8 +49,13 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
             tflite_path.display(),
             variant
         );
+        // Clear any leftover backoff marker on success
+        clear_backoff_marker(&manifest.base_dir);
         return Ok(());
     }
+
+    // ── honour backoff from a previous failed attempt ────────────────
+    wait_for_backoff(&manifest.base_dir);
 
     info!(
         "Model file not found at {}, downloading variant '{}' from Zenodo record {}…",
@@ -57,16 +69,34 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
         ZENODO_FILES_URL, download.zenodo_record_id, variant_info.zenodo_file
     );
 
-    download_and_extract(&url, &manifest.base_dir, variant_info.md5.as_deref())?;
+    if let Err(e) = download_and_extract(&url, &manifest.base_dir, variant_info.md5.as_deref()) {
+        write_backoff_marker(&manifest.base_dir);
+        return Err(e);
+    }
 
     // Verify the model file now exists
     if !tflite_path.exists() {
+        // List files in `base_dir` to help the user diagnose the mismatch.
+        let available: Vec<String> = std::fs::read_dir(&manifest.base_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        write_backoff_marker(&manifest.base_dir);
         anyhow::bail!(
             "Downloaded and extracted '{}' but expected model file not found: {}.\n\
+             Files present in {}: {:?}\n\
              Check that [model].tflite_file (or the variant override) matches \
              a file inside the Zenodo zip.",
             variant_info.zenodo_file,
-            tflite_path.display()
+            tflite_path.display(),
+            manifest.base_dir.display(),
+            available
         );
     }
 
@@ -75,7 +105,90 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
         tflite_path.display(),
         variant
     );
+    clear_backoff_marker(&manifest.base_dir);
     Ok(())
+}
+
+// ── Backoff marker helpers ───────────────────────────────────────────────────
+//
+// When a download or post-download check fails the container will be
+// restarted by the compose `restart: unless-stopped` policy.  Without a
+// backoff the new instance would immediately re-download and fail in a
+// tight loop, hammering the Zenodo server.
+//
+// We persist a small marker file containing the earliest timestamp (as
+// seconds since UNIX epoch) the next attempt should run at, plus the
+// current backoff duration.  Each failure doubles the backoff up to
+// `MAX_RESTART_BACKOFF_SECS`.
+
+fn backoff_marker_path(base_dir: &Path) -> std::path::PathBuf {
+    base_dir.join(BACKOFF_MARKER)
+}
+
+/// Read the marker and sleep until the recorded deadline, if any.
+fn wait_for_backoff(base_dir: &Path) {
+    let path = backoff_marker_path(base_dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return, // no marker → no wait
+    };
+
+    // Format: "resume_epoch_secs backoff_secs"
+    let mut parts = content.split_whitespace();
+    let resume_at: u64 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if now < resume_at {
+        let wait = resume_at - now;
+        warn!(
+            "Previous download attempt failed — backing off for {}s before retrying",
+            wait
+        );
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+    }
+}
+
+/// Write (or update) the marker, doubling the backoff each time.
+fn write_backoff_marker(base_dir: &Path) {
+    let path = backoff_marker_path(base_dir);
+
+    // Read the previous backoff duration, if any, and double it.
+    let prev_backoff: u64 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| c.split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0);
+
+    let next_backoff = if prev_backoff == 0 {
+        INITIAL_BACKOFF.as_secs()
+    } else {
+        (prev_backoff * 2).min(MAX_RESTART_BACKOFF_SECS)
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let resume_at = now + next_backoff;
+
+    warn!(
+        "Writing download backoff marker: next attempt in {}s (at epoch {})",
+        next_backoff, resume_at
+    );
+
+    let _ = std::fs::write(&path, format!("{resume_at} {next_backoff}"));
+}
+
+/// Remove the backoff marker (called on success).
+fn clear_backoff_marker(base_dir: &Path) {
+    let _ = std::fs::remove_file(backoff_marker_path(base_dir));
 }
 
 /// Maximum number of download attempts before giving up.

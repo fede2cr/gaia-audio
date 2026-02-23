@@ -86,6 +86,21 @@ fn main() -> Result<()> {
         );
     }
 
+    // ── mDNS registration + capture discovery ──────────────────────
+    let discovery = match gaia_common::discovery::register(
+        gaia_common::discovery::ServiceRole::Processing,
+        0, // processing doesn't expose an HTTP port
+    ) {
+        Ok(h) => {
+            info!("mDNS: registered as {}", h.instance_name());
+            Some(h)
+        }
+        Err(e) => {
+            tracing::warn!("mDNS registration failed (non-fatal): {e:#}");
+            None
+        }
+    };
+
     // ── ctrl-c ───────────────────────────────────────────────────────
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
@@ -104,14 +119,25 @@ fn main() -> Result<()> {
         })
         .context("Cannot spawn reporting thread")?;
 
-    // ── poll capture server and process files ────────────────────────
-    if let Err(e) = client::poll_and_process(&models, &config, &report_tx, &SHUTDOWN) {
+    // ── poll capture server(s) and process files ─────────────────────
+    if let Err(e) = client::poll_and_process(
+        &models,
+        &config,
+        discovery.as_ref(),
+        &report_tx,
+        &SHUTDOWN,
+    ) {
         tracing::error!("Processing loop error: {e:#}");
     }
 
     // Signal reporting thread to finish
     drop(report_tx);
     report_thread.join().ok();
+
+    // Clean up mDNS
+    if let Some(dh) = discovery {
+        dh.shutdown();
+    }
 
     info!("Gaia Processing Server stopped");
     Ok(())

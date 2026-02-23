@@ -8,16 +8,13 @@
 //! domain = "birds"
 //! sample_rate = 48000
 //! chunk_duration = 3.0
-//! tflite_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite"
-//! labels_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt"
+//! tflite_file = "audio-model-fp16.tflite"
+//! labels_file = "en_us.txt"
 //! v1_metadata = false
 //!
 //! [metadata_model]
 //! enabled = true
-//! tflite_file = "BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite"
-//!
-//! [language]
-//! dir = "l18n"
+//! tflite_file = "meta-model.tflite"
 //!
 //! [download]
 //! zenodo_record_id = "15050749"
@@ -26,14 +23,17 @@
 //! [download.variants.fp32]
 //! zenodo_file = "BirdNET_v2.4_tflite.zip"
 //! md5 = "c13f7fd28a5f7a3b092cd993087f93f7"
+//! tflite_file = "audio-model.tflite"
 //!
 //! [download.variants.fp16]
 //! zenodo_file = "BirdNET_v2.4_tflite_fp16.zip"
 //! md5 = "4cd35da63e442d974faf2121700192b5"
+//! tflite_file = "audio-model-fp16.tflite"
 //!
 //! [download.variants.int8]
 //! zenodo_file = "BirdNET_v2.4_tflite_int8.zip"
 //! md5 = "69becc3e8eb1c72d1d9dae7f21062c74"
+//! tflite_file = "audio-model-int8.tflite"
 //! ```
 
 use std::collections::HashMap;

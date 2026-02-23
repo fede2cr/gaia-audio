@@ -89,6 +89,29 @@ async fn main() -> Result<()> {
         );
     }
 
+    // ── mDNS registration ─────────────────────────────────────────────
+    // Parse the port from the listen address for mDNS advertisement.
+    let port: u16 = config
+        .capture_listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8089);
+
+    let discovery = match gaia_common::discovery::register(
+        gaia_common::discovery::ServiceRole::Capture,
+        port,
+    ) {
+        Ok(h) => {
+            info!("mDNS: registered as {}", h.instance_name());
+            Some(h)
+        }
+        Err(e) => {
+            tracing::warn!("mDNS registration failed (non-fatal): {e:#}");
+            None
+        }
+    };
+
     // ── start HTTP server ────────────────────────────────────────────
     let stream_dir = config.stream_data_dir();
     let listen_addr = config.capture_listen_addr.clone();
@@ -104,7 +127,10 @@ async fn main() -> Result<()> {
     // Wait for the server task (runs until shutdown)
     let _ = server_handle.await;
 
-    // Clean up capture processes
+    // Clean up
+    if let Some(dh) = discovery {
+        dh.shutdown();
+    }
     if let Some(ref mut h) = capture_handle {
         h.kill().ok();
     }
