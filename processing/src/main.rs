@@ -58,6 +58,10 @@ fn main() -> Result<()> {
         if let Some(variant) = m.effective_variant(config.model_variant.as_deref()) {
             download::ensure_model_files(m, &variant)?;
         }
+        // Convert TFLite → ONNX if needed (best-effort, non-fatal).
+        if let Err(e) = download::ensure_onnx_file(m) {
+            tracing::warn!("ONNX conversion failed for {}: {e:#}", m.manifest.model.name);
+        }
     }
 
     let mut models = Vec::with_capacity(manifests.len());

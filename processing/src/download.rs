@@ -109,6 +109,91 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
     Ok(())
 }
 
+// ── ONNX auto-conversion ─────────────────────────────────────────────────
+
+/// If the manifest declares an `onnx_file` and the ONNX model does not
+/// already exist, attempt to convert the TFLite model using `tf2onnx`
+/// (invoked as a Python subprocess).
+///
+/// This is best-effort: when Python or `tf2onnx` are not installed the
+/// function logs a warning and returns `Ok(())` so the server can still
+/// fall back to TFLite if that happens to work for the model in question.
+pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
+    let onnx_path = match manifest.onnx_path() {
+        Some(p) => p,
+        None => return Ok(()), // no onnx_file configured
+    };
+
+    if onnx_path.exists() {
+        info!("ONNX model already present: {}", onnx_path.display());
+        return Ok(());
+    }
+
+    let tflite_path = manifest.tflite_path();
+    if !tflite_path.exists() {
+        warn!(
+            "Cannot convert to ONNX: TFLite source not found at {}",
+            tflite_path.display()
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Converting TFLite → ONNX: {} → {}",
+        tflite_path.display(),
+        onnx_path.display()
+    );
+
+    let output = std::process::Command::new("python3")
+        .args([
+            "-m",
+            "tf2onnx.convert",
+            "--tflite",
+            &tflite_path.to_string_lossy(),
+            "--output",
+            &onnx_path.to_string_lossy(),
+        ])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => {
+            let size = std::fs::metadata(&onnx_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                "ONNX conversion complete: {} ({:.1} MB)",
+                onnx_path.display(),
+                size as f64 / 1_048_576.0
+            );
+            Ok(())
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            warn!(
+                "tf2onnx conversion failed (exit {}): {}",
+                result.status,
+                stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+            );
+            warn!("The server will attempt to load the TFLite model directly");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "python3 not found – cannot auto-convert TFLite to ONNX. \
+                 Install Python 3 and tf2onnx (`pip install tf2onnx`) to enable \
+                 automatic conversion, or convert manually with: \
+                 python scripts/convert_tflite_to_onnx.py {}",
+                tflite_path.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to run tf2onnx conversion: {e}");
+            Ok(())
+        }
+    }
+}
+
 // ── Backoff marker helpers ───────────────────────────────────────────────────
 //
 // When a download or post-download check fails the container will be
