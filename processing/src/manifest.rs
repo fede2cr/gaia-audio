@@ -100,6 +100,15 @@ pub struct DownloadSection {
     pub default_variant: String,
     /// Map of variant name → download info.
     pub variants: HashMap<String, VariantInfo>,
+    /// Optional Keras zip filename on Zenodo for ONNX conversion.
+    /// When specified, `ensure_onnx_file()` will download this zip,
+    /// extract `audio-model.h5`, and convert the classifier sub-model
+    /// to ONNX using `scripts/convert_keras_to_onnx.py`.
+    #[serde(default)]
+    pub keras_zenodo_file: Option<String>,
+    /// Expected MD5 hex digest of the Keras zip file.
+    #[serde(default)]
+    pub keras_md5: Option<String>,
 }
 
 /// Information about a single model variant available on Zenodo.

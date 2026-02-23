@@ -38,6 +38,10 @@ pub struct LoadedModel {
     labels: Vec<String>,
     pub manifest: ResolvedManifest,
     sensitivity: f64,
+    /// When `true` the ONNX model is a classifier-only sub-model that
+    /// expects a mel-spectrogram input `[1, 96, 511, 2]` instead of raw
+    /// audio `[1, N]`.  The mel computation is handled by [`crate::mel`].
+    onnx_classifier: bool,
 }
 
 /// Species-occurrence metadata model (filters by location/week).
@@ -165,19 +169,19 @@ fn validate_tflite_file(path: &Path) -> Result<()> {
 /// otherwise falls back to TFLite.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
     // ── choose format ────────────────────────────────────────────────
-    let runner = if let Some(onnx_path) = resolved.onnx_path() {
+    let (runner, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
-            info!("Loading ONNX model from {}", onnx_path.display());
-            load_onnx_runner(&onnx_path)?
+            info!("Loading ONNX classifier from {}", onnx_path.display());
+            (load_onnx_runner(&onnx_path)?, true)
         } else {
             info!(
                 "ONNX file configured but missing ({}), falling back to TFLite",
                 onnx_path.display()
             );
-            load_tflite_runner(&resolved.tflite_path())?
+            (load_tflite_runner(&resolved.tflite_path())?, false)
         }
     } else {
-        load_tflite_runner(&resolved.tflite_path())?
+        (load_tflite_runner(&resolved.tflite_path())?, false)
     };
 
     let labels = load_labels(&resolved.labels_path())?;
@@ -193,6 +197,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         labels,
         manifest: resolved.clone(),
         sensitivity: adjusted_sensitivity,
+        onnx_classifier,
     })
 }
 
@@ -247,6 +252,10 @@ impl LoadedModel {
     ///
     /// Returns a sorted list of `(label, confidence)` pairs,
     /// highest confidence first.
+    ///
+    /// When the model is an ONNX classifier (split at the mel-spectrogram
+    /// boundary), the mel preprocessing is computed in Rust via
+    /// [`crate::mel::birdnet_mel_spectrogram`] before feeding the classifier.
     pub fn predict(
         &self,
         chunk: &[f32],
@@ -254,12 +263,23 @@ impl LoadedModel {
         lon: f64,
         week: u32,
     ) -> Result<Vec<Prediction>> {
-        let n = chunk.len();
-        let input: Tensor = tract_ndarray::Array2::from_shape_vec((1, n), chunk.to_vec())
-            .context("Cannot reshape audio chunk")?
-            .into();
-
-        let result = if self.v1_metadata() {
+        let result = if self.onnx_classifier {
+            // ── ONNX classifier: audio → Rust mel → CNN ──────────
+            let mel = crate::mel::birdnet_mel_spectrogram(chunk);
+            let input: Tensor =
+                tract_ndarray::Array4::from_shape_vec((1, 96, 511, 2), mel)
+                    .context("Cannot reshape mel spectrogram")?
+                    .into();
+            self.runner
+                .run(tvec![input.into()])
+                .context("ONNX classifier inference failed")?
+        } else if self.v1_metadata() {
+            // ── TFLite V1 with metadata sidecar ──────────────────
+            let n = chunk.len();
+            let input: Tensor =
+                tract_ndarray::Array2::from_shape_vec((1, n), chunk.to_vec())
+                    .context("Cannot reshape audio chunk")?
+                    .into();
             let mdata = convert_v1_metadata(lat, lon, week);
             let mdata_tensor: Tensor =
                 tract_ndarray::Array2::from_shape_vec((1, 6), mdata.to_vec())
@@ -269,6 +289,12 @@ impl LoadedModel {
                 .run(tvec![input.into(), mdata_tensor.into()])
                 .context("V1 inference failed")?
         } else {
+            // ── TFLite standard ──────────────────────────────────
+            let n = chunk.len();
+            let input: Tensor =
+                tract_ndarray::Array2::from_shape_vec((1, n), chunk.to_vec())
+                    .context("Cannot reshape audio chunk")?
+                    .into();
             self.runner
                 .run(tvec![input.into()])
                 .context("Inference failed")?
@@ -614,5 +640,147 @@ mod tests {
         fs::write(&path, &data).unwrap();
         assert!(validate_tflite_file(&path).is_ok());
         let _ = fs::remove_file(&path);
+    }
+
+    /// Smoke-test ONNX model loading via tract-onnx.
+    ///
+    /// Only runs when the classifier ONNX file exists at the expected path.
+    #[test]
+    fn test_load_onnx_classifier() {
+        let onnx_path = std::path::Path::new("/tmp/birdnet_v2.4_classifier.onnx");
+        if !onnx_path.exists() {
+            eprintln!("Skipping ONNX test: {onnx_path:?} not found");
+            return;
+        }
+        let runner = load_onnx_runner(onnx_path)
+            .expect("Failed to load ONNX model");
+
+        // Run inference with zeros input (1, 96, 511, 2)
+        let input = tract_ndarray::Array4::<f32>::zeros((1, 96, 511, 2));
+        let input_tensor: Tensor = input.into();
+        let result = runner
+            .run(tvec![input_tensor.into()])
+            .expect("ONNX inference failed");
+
+        let output = result[0]
+            .to_array_view::<f32>()
+            .expect("Cannot read output");
+        assert_eq!(output.shape(), &[1, 6522], "unexpected output shape");
+        eprintln!("ONNX output sum: {:.4}", output.iter().sum::<f32>());
+    }
+
+    /// End-to-end test: Rust mel spectrogram → ONNX classifier → compare
+    /// predictions with the Python/Keras reference.
+    ///
+    /// This validates the full inference pipeline that will run in
+    /// production: audio → mel.rs preprocessing → tract-onnx classifier.
+    #[test]
+    fn test_end_to_end_mel_onnx() {
+        let audio_path = std::path::Path::new("/tmp/test_audio_raw.f32");
+        let pred_ref_path = std::path::Path::new("/tmp/test_pred_ref.f32");
+        let onnx_path = std::path::Path::new("/tmp/birdnet_v2.4_classifier.onnx");
+
+        if !audio_path.exists() || !pred_ref_path.exists() || !onnx_path.exists() {
+            eprintln!("Skipping end-to-end test: reference files not found");
+            return;
+        }
+
+        // 1. Load audio
+        let audio_bytes = std::fs::read(audio_path).unwrap();
+        let audio: Vec<f32> = audio_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(audio.len(), 144000);
+
+        // 2. Compute mel spectrogram in Rust
+        let mel = crate::mel::birdnet_mel_spectrogram(&audio);
+        assert_eq!(mel.len(), 96 * 511 * 2);
+
+        // 3. Run ONNX classifier
+        let runner = load_onnx_runner(onnx_path)
+            .expect("Failed to load ONNX model");
+
+        let input = tract_ndarray::Array4::from_shape_vec((1, 96, 511, 2), mel)
+            .expect("Cannot reshape mel spectrogram");
+        let input_tensor: Tensor = input.into();
+        let result = runner
+            .run(tvec![input_tensor.into()])
+            .expect("ONNX inference failed");
+
+        let output = result[0]
+            .to_array_view::<f32>()
+            .expect("Cannot read output");
+        assert_eq!(output.shape(), &[1, 6522]);
+
+        let rust_pred: Vec<f32> = output.iter().copied().collect();
+
+        // 4. Load Python/Keras reference predictions
+        let ref_bytes = std::fs::read(pred_ref_path).unwrap();
+        let ref_pred: Vec<f32> = ref_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(ref_pred.len(), 6522);
+
+        // 5. Compare predictions
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        for (&r, &p) in rust_pred.iter().zip(ref_pred.iter()) {
+            let d = (r - p).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            sum_diff += d as f64;
+        }
+        let mean_diff = sum_diff / 6522.0;
+
+        // Top-5 from Rust
+        let mut rust_top: Vec<(usize, f32)> = rust_pred
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        rust_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        rust_top.truncate(5);
+
+        // Top-5 from reference
+        let mut ref_top: Vec<(usize, f32)> = ref_pred
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        ref_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ref_top.truncate(5);
+
+        eprintln!("=== End-to-end Rust mel → ONNX vs Python/Keras reference ===");
+        eprintln!("Max diff: {max_diff:.6}");
+        eprintln!("Mean diff: {mean_diff:.8}");
+        eprintln!("Rust top-5:");
+        for (i, (idx, score)) in rust_top.iter().enumerate() {
+            eprintln!("  #{}: index {idx:5}, confidence {score:.6}", i + 1);
+        }
+        eprintln!("Reference top-5:");
+        for (i, (idx, score)) in ref_top.iter().enumerate() {
+            eprintln!("  #{}: index {idx:5}, confidence {score:.6}", i + 1);
+        }
+
+        // Check that top-1 species matches
+        assert_eq!(
+            rust_top[0].0, ref_top[0].0,
+            "Top-1 species index mismatch: Rust={} vs Ref={}",
+            rust_top[0].0, ref_top[0].0
+        );
+
+        // Allow some tolerance due to mel spectrogram float differences
+        // propagating through the neural network
+        assert!(
+            max_diff < 0.1,
+            "Prediction max diff too large: {max_diff}"
+        );
+        assert!(
+            mean_diff < 0.01,
+            "Prediction mean diff too large: {mean_diff}"
+        );
     }
 }

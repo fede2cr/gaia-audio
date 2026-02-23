@@ -112,12 +112,20 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
 // ── ONNX auto-conversion ─────────────────────────────────────────────────
 
 /// If the manifest declares an `onnx_file` and the ONNX model does not
-/// already exist, attempt to convert the TFLite model using `tf2onnx`
-/// (invoked as a Python subprocess).
+/// already exist, attempt to convert the model to ONNX.
 ///
-/// This is best-effort: when Python or `tf2onnx` are not installed the
-/// function logs a warning and returns `Ok(())` so the server can still
-/// fall back to TFLite if that happens to work for the model in question.
+/// **Preferred path** (BirdNET V2.4+): download the Keras `.h5` model from
+/// Zenodo and convert the *classifier sub-model* (without the RFFT-based
+/// mel spectrogram layers) using `scripts/convert_keras_to_onnx.py`.
+/// The mel preprocessing is handled at runtime in Rust (`mel.rs`).
+///
+/// **Fallback**: if no `keras_zenodo_file` is configured, attempt a direct
+/// TFLite → ONNX conversion via `tf2onnx` (works for simple models but
+/// fails on BirdNET V2.4 due to unsupported RFFT/SPLIT_V ops).
+///
+/// This is best-effort: when Python or the required packages are not
+/// installed the function logs a warning and returns `Ok(())` so the server
+/// can still attempt to fall back to TFLite.
 pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
     let onnx_path = match manifest.onnx_path() {
         Some(p) => p,
@@ -129,6 +137,155 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         return Ok(());
     }
 
+    // ── Keras-based conversion (preferred) ───────────────────────────
+    if let Some(download) = &manifest.manifest.download {
+        if let Some(keras_file) = &download.keras_zenodo_file {
+            return convert_keras_to_onnx(
+                manifest,
+                &download.zenodo_record_id,
+                keras_file,
+                download.keras_md5.as_deref(),
+                &onnx_path,
+            );
+        }
+    }
+
+    // ── Fallback: direct TFLite → ONNX via tf2onnx CLI ──────────────
+    convert_tflite_to_onnx(manifest, &onnx_path)
+}
+
+/// Download the Keras model from Zenodo, extract it, and convert the
+/// classifier sub-model to ONNX.
+fn convert_keras_to_onnx(
+    manifest: &ResolvedManifest,
+    zenodo_record_id: &str,
+    keras_zenodo_file: &str,
+    keras_md5: Option<&str>,
+    onnx_path: &Path,
+) -> Result<()> {
+    // Download the Keras zip into a temporary subdirectory.
+    let keras_dir = manifest.base_dir.join(".keras_tmp");
+    std::fs::create_dir_all(&keras_dir)
+        .with_context(|| format!("Cannot create {}", keras_dir.display()))?;
+
+    let h5_path = keras_dir.join("audio-model.h5");
+    if !h5_path.exists() {
+        let url = format!(
+            "{}/{}/files/{}/content",
+            ZENODO_FILES_URL, zenodo_record_id, keras_zenodo_file
+        );
+        info!(
+            "Downloading Keras model for ONNX conversion: {} → {}",
+            keras_zenodo_file,
+            keras_dir.display()
+        );
+        download_and_extract(&url, &keras_dir, keras_md5)?;
+
+        if !h5_path.exists() {
+            let available: Vec<String> = std::fs::read_dir(&keras_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "Downloaded Keras zip but audio-model.h5 not found.\n\
+                 Files present: {:?}",
+                available
+            );
+        }
+    }
+
+    // Determine the ONNX output filename.
+    let onnx_filename = onnx_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    info!(
+        "Converting Keras classifier → ONNX: {} → {}",
+        h5_path.display(),
+        onnx_path.display()
+    );
+
+    // Find the conversion script (repo location or container install path).
+    let script = ["scripts/convert_keras_to_onnx.py",
+                   "/usr/local/share/gaia/scripts/convert_keras_to_onnx.py"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap_or("scripts/convert_keras_to_onnx.py");
+
+    let output = std::process::Command::new("python3")
+        .args([
+            script,
+            &keras_dir.to_string_lossy(),
+            "-o",
+            &onnx_filename,
+        ])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => {
+            // The script writes the ONNX into keras_dir — move it to the
+            // final location alongside the other model files.
+            let generated = keras_dir.join(&onnx_filename);
+            if generated.exists() && generated != onnx_path {
+                std::fs::rename(&generated, onnx_path).with_context(|| {
+                    format!(
+                        "Cannot move {} → {}",
+                        generated.display(),
+                        onnx_path.display()
+                    )
+                })?;
+            }
+            let size = std::fs::metadata(onnx_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                "Keras → ONNX conversion complete: {} ({:.1} MB)",
+                onnx_path.display(),
+                size as f64 / 1_048_576.0
+            );
+            // Clean up temporary Keras files.
+            let _ = std::fs::remove_dir_all(&keras_dir);
+            Ok(())
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            warn!(
+                "Keras → ONNX conversion failed (exit {}):\n{}\n{}",
+                result.status,
+                stdout.lines().take(10).collect::<Vec<_>>().join("\n"),
+                stderr.lines().take(10).collect::<Vec<_>>().join("\n"),
+            );
+            warn!("The server will attempt to load the TFLite model directly");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "python3 not found — cannot convert Keras model to ONNX.\n\
+                 Install Python 3 with tf_keras and tf2onnx, or convert manually:\n\
+                 python3 scripts/convert_keras_to_onnx.py {}",
+                keras_dir.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to run Keras → ONNX conversion: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Attempt a direct TFLite → ONNX conversion via tf2onnx CLI.
+/// (Fallback for simple models; fails on BirdNET V2.4 due to RFFT ops.)
+fn convert_tflite_to_onnx(manifest: &ResolvedManifest, onnx_path: &Path) -> Result<()> {
     let tflite_path = manifest.tflite_path();
     if !tflite_path.exists() {
         warn!(
@@ -157,7 +314,7 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
 
     match output {
         Ok(result) if result.status.success() => {
-            let size = std::fs::metadata(&onnx_path)
+            let size = std::fs::metadata(onnx_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
             info!(

@@ -37,11 +37,15 @@ RUN touch common/src/lib.rs processing/src/main.rs
 # Build for real
 RUN cargo build --release -p gaia-processing
 
-# ── Python tools stage (tf2onnx + dependencies) ───────────────────
-# Built in a separate stage so we get pre-compiled wheels from the
-# official Python image and avoid compiling onnx C++ from source.
+# ── Python tools stage (Keras → ONNX conversion) ──────────────────
+# Installs tensorflow-cpu + tf_keras + tf2onnx so the server can
+# automatically download and convert the Keras model to a
+# classifier-only ONNX model on first startup.
+#
+# The mel-spectrogram preprocessing runs in native Rust at inference
+# time — Python is only needed for the one-time ONNX conversion.
 FROM python:3.12-slim AS pytools
-RUN pip install --no-cache-dir tf2onnx
+RUN pip install --no-cache-dir tensorflow-cpu tf_keras tf2onnx onnxruntime
 
 # ── Runtime stage ──────────────────────────────────────────────────
 FROM debian:trixie-slim
@@ -51,11 +55,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 3.12 + tf2onnx from the pre-built stage
+# Python 3.12 + conversion tools from the pre-built stage
 COPY --from=pytools /usr/local /usr/local
 RUN ldconfig
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+
+# Copy Keras → ONNX conversion script
+COPY scripts/convert_keras_to_onnx.py /usr/local/share/gaia/scripts/convert_keras_to_onnx.py
 
 RUN mkdir -p /etc/gaia /data /models
 

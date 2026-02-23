@@ -6,6 +6,7 @@ mod client;
 mod db;
 mod download;
 mod manifest;
+mod mel;
 mod model;
 mod reporting;
 mod spectrogram;
