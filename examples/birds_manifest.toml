@@ -15,6 +15,7 @@ domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
 tflite_file = "audio-model.tflite"
+onnx_file = "audio-model.onnx"
 labels_file = "en_us.txt"
 # Set to true only for BirdNET V1 (requires metadata input tensor)
 v1_metadata = false
@@ -37,6 +38,11 @@ dir = "l18n"
 #   fp32  – Full precision, highest accuracy (~77 MB download, default)
 #   fp16  – NOT SUPPORTED by tract-tflite (will panic)
 #   int8  – Quantised, smallest & fastest (~46 MB download, ideal for RPi)
+#
+# After downloading, convert TFLite to ONNX for full operator support:
+#   pip install tf2onnx
+#   python scripts/convert_tflite_to_onnx.py /models/birds/
+# Then set onnx_file above to the generated .onnx filename.
 
 [download]
 zenodo_record_id = "15050749"

@@ -72,6 +72,7 @@ domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
 tflite_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite"
+onnx_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.onnx"   # preferred when present
 labels_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt"
 v1_metadata = false
 
@@ -79,6 +80,12 @@ v1_metadata = false
 enabled = true
 tflite_file = "BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite"
 ```
+
+> **Why ONNX?** `tract-tflite` does not support every TFLite operator
+> (notably `SPLIT_V`, used by BirdNET V2.4).  Converting the model to ONNX
+> lets `tract-onnx` handle it without patching or vendoring the inference
+> library.  When `onnx_file` is set **and** the file exists, the processing
+> server loads the ONNX variant; otherwise it falls back to TFLite.
 
 ### Automatic Model Download from Zenodo
 
@@ -118,7 +125,9 @@ See `examples/birds_manifest.toml` for a complete example.
 ## Configuration
 
 Both servers read the same `birdnet.conf`-style `KEY=VALUE` file
-(default: `/etc/gaia/gaia.conf`).
+(default: `/etc/gaia/gaia.conf`).  **Environment variables override**
+config-file values, so you can set `CAPTURE_SERVER_URL` in `compose.yaml`
+without editing `gaia.conf`.
 
 | Key | Default | Used By | Description |
 |-----|---------|---------|-------------|
@@ -171,6 +180,25 @@ podman build -f processing/Containerfile -t fede2/gaia-processing .
 # Build web dashboard image
 podman build -f web/Containerfile -t fede2/gaia-web .
 ```
+
+## Converting Models to ONNX
+
+The BirdNET V2.4 TFLite model uses operators (`SPLIT_V`) not supported by
+`tract-tflite`.  Convert the downloaded TFLite model to ONNX once:
+
+```bash
+pip install tf2onnx
+
+# Convert a single model file
+python scripts/convert_tflite_to_onnx.py path/to/audio-model.tflite
+
+# Or convert all .tflite files in a model directory
+python scripts/convert_tflite_to_onnx.py models/birds/
+```
+
+Then set `onnx_file` in `manifest.toml` (already done in the default
+manifest).  On next start the processing server will load the `.onnx` file
+instead of the `.tflite` one.
 
 ## Running with Podman/Docker Compose
 

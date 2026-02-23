@@ -445,6 +445,11 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     let conn =
         Connection::open(db_path).map_err(|e| format!("Cannot open Gaia DB: {e}"))?;
 
+    // Enable WAL once via a read-write connection so that later read-only
+    // connections inherit it without needing write access.
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .map_err(|e| format!("WAL pragma error: {e}"))?;
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS detections (
             Date       DATE,

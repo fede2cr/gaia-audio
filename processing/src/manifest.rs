@@ -63,6 +63,11 @@ pub struct ModelSection {
     pub chunk_duration: f64,
     pub tflite_file: String,
     pub labels_file: String,
+    /// Optional ONNX model file.  When present **and** the file exists on
+    /// disk, tract-onnx is used instead of tract-tflite.  This avoids
+    /// unsupported-operator issues (e.g. SPLIT_V in BirdNET V2.4).
+    #[serde(default)]
+    pub onnx_file: Option<String>,
     /// BirdNET V1 requires a metadata input tensor.
     #[serde(default)]
     pub v1_metadata: bool,
@@ -107,8 +112,9 @@ pub struct VariantInfo {
     pub md5: Option<String>,
     /// Override for `[model].tflite_file` when this variant is selected.
     #[serde(default)]
-    pub tflite_file: Option<String>,
-    /// Override for `[model].labels_file` when this variant is selected.
+    pub tflite_file: Option<String>,    /// Override for `[model].onnx_file` when this variant is selected.
+    #[serde(default)]
+    pub onnx_file: Option<String>,    /// Override for `[model].labels_file` when this variant is selected.
     #[serde(default)]
     pub labels_file: Option<String>,
     /// Override for `[metadata_model].tflite_file` when this variant is selected.
@@ -138,6 +144,15 @@ pub struct ResolvedManifest {
 impl ResolvedManifest {
     pub fn tflite_path(&self) -> PathBuf {
         self.base_dir.join(&self.manifest.model.tflite_file)
+    }
+
+    /// Path to the ONNX model file, if configured.
+    pub fn onnx_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .model
+            .onnx_file
+            .as_ref()
+            .map(|f| self.base_dir.join(f))
     }
 
     pub fn labels_path(&self) -> PathBuf {
@@ -190,6 +205,9 @@ impl ResolvedManifest {
 
         if let Some(ref tf) = variant.tflite_file {
             self.manifest.model.tflite_file = tf.clone();
+        }
+        if let Some(ref of_) = variant.onnx_file {
+            self.manifest.model.onnx_file = Some(of_.clone());
         }
         if let Some(ref lf) = variant.labels_file {
             self.manifest.model.labels_file = lf.clone();

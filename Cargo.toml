@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # Inference
 tract-tflite = "0.21"
+tract-onnx = "0.21"
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }

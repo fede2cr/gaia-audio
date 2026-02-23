@@ -87,7 +87,13 @@ pub fn load(path: &Path) -> Result<Config> {
     let map = parse_conf(&text);
     info!("Loaded config from {}", path.display());
 
-    let get = |key: &str| -> Option<String> { map.get(key).cloned() };
+    // Environment variables override config-file values.
+    let get = |key: &str| -> Option<String> {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| map.get(key).cloned())
+    };
     let get_f64 = |key: &str, default: f64| -> f64 {
         get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
     };

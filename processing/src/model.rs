@@ -1,8 +1,12 @@
-//! TFLite model loading and inference – generalized for multiple domains.
+//! TFLite / ONNX model loading and inference – generalized for multiple domains.
 //!
 //! Evolved from `birdnet-server/src/model.rs`.  Instead of hard-coding model
 //! variants, each model is described by a [`manifest::ResolvedManifest`] that
 //! specifies sample rate, chunk duration, label format, etc.
+//!
+//! When a manifest specifies an `onnx_file` **and** that file exists on disk,
+//! the model is loaded via `tract-onnx` instead of `tract-tflite`.  This
+//! avoids unsupported-operator issues (e.g. `SPLIT_V` in BirdNET V2.4).
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,6 +14,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use tract_tflite::prelude::*;
+use tract_onnx::prelude::InferenceModelExt as _;
 use tracing::info;
 
 use crate::manifest::ResolvedManifest;
@@ -155,20 +160,25 @@ fn validate_tflite_file(path: &Path) -> Result<()> {
 }
 
 /// Load a model from a resolved manifest.
+///
+/// Prefers ONNX when `onnx_file` is configured **and** the file exists;
+/// otherwise falls back to TFLite.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
-    let tflite_path = resolved.tflite_path();
-    validate_tflite_file(&tflite_path)
-        .with_context(|| format!("Pre-flight check failed for {}", tflite_path.display()))?;
-
-    info!("Loading model from {}", tflite_path.display());
-
-    let runner = tract_tflite::tflite()
-        .model_for_path(&tflite_path)
-        .with_context(|| format!("Cannot load TFLite model: {}", tflite_path.display()))?
-        .into_optimized()
-        .context("Model optimisation failed")?
-        .into_runnable()
-        .context("Cannot make model runnable")?;
+    // ── choose format ────────────────────────────────────────────────
+    let runner = if let Some(onnx_path) = resolved.onnx_path() {
+        if onnx_path.exists() {
+            info!("Loading ONNX model from {}", onnx_path.display());
+            load_onnx_runner(&onnx_path)?
+        } else {
+            info!(
+                "ONNX file configured but missing ({}), falling back to TFLite",
+                onnx_path.display()
+            );
+            load_tflite_runner(&resolved.tflite_path())?
+        }
+    } else {
+        load_tflite_runner(&resolved.tflite_path())?
+    };
 
     let labels = load_labels(&resolved.labels_path())?;
 
@@ -184,6 +194,32 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         manifest: resolved.clone(),
         sensitivity: adjusted_sensitivity,
     })
+}
+
+/// Load and optimise a TFLite model file.
+fn load_tflite_runner(path: &Path) -> Result<TypedRunnableModel<TypedModel>> {
+    validate_tflite_file(path)
+        .with_context(|| format!("Pre-flight check failed for {}", path.display()))?;
+    info!("Loading TFLite model from {}", path.display());
+
+    tract_tflite::tflite()
+        .model_for_path(path)
+        .with_context(|| format!("Cannot load TFLite model: {}", path.display()))?
+        .into_optimized()
+        .context("TFLite model optimisation failed")?
+        .into_runnable()
+        .context("Cannot make TFLite model runnable")
+}
+
+/// Load and optimise an ONNX model file.
+fn load_onnx_runner(path: &Path) -> Result<TypedRunnableModel<TypedModel>> {
+    tract_onnx::onnx()
+        .model_for_path(path)
+        .with_context(|| format!("Cannot load ONNX model: {}", path.display()))?
+        .into_optimized()
+        .context("ONNX model optimisation failed")?
+        .into_runnable()
+        .context("Cannot make ONNX model runnable")
 }
 
 impl LoadedModel {

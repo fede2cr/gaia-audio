@@ -8,10 +8,14 @@ use rusqlite::{params, Connection};
 
 use crate::model::{CalendarDay, DayDetectionGroup, SpeciesInfo, SpeciesSummary, WebDetection};
 
-/// Open a read-only connection with WAL mode and a busy timeout.
+/// Open a read-only connection with a busy timeout.
+///
+/// WAL journal mode is set once by [`ensure_gaia_schema`] at startup (which
+/// opens the database read-write).  The mode persists in the file, so
+/// read-only connections inherit it automatically without needing a write.
 fn open(db_path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;")?;
+    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
     Ok(conn)
 }
 

@@ -23,6 +23,7 @@ ctrlc.workspace = true
 
 # Inference
 tract-tflite.workspace = true
+tract-onnx.workspace = true
 
 # Storage
 rusqlite.workspace = true
