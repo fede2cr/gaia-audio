@@ -37,18 +37,23 @@ RUN touch common/src/lib.rs processing/src/main.rs
 # Build for real
 RUN cargo build --release -p gaia-processing
 
+# ── Python tools stage (tf2onnx + dependencies) ───────────────────
+# Built in a separate stage so we get pre-compiled wheels from the
+# official Python image and avoid compiling onnx C++ from source.
+FROM python:3.12-slim AS pytools
+RUN pip install --no-cache-dir tf2onnx
+
 # ── Runtime stage ──────────────────────────────────────────────────
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 \
     ca-certificates \
-    python3 python3-pip \
-    # Build tools needed by the onnx wheel (removed after pip install)
-    cmake g++ make \
-    && pip install --no-cache-dir --break-system-packages tf2onnx \
-    && apt-get purge -y cmake g++ make && apt-get autoremove -y \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 3.12 + tf2onnx from the pre-built stage
+COPY --from=pytools /usr/local /usr/local
+RUN ldconfig
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 
