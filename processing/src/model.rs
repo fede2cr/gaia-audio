@@ -5,14 +5,24 @@
 //! specifies sample rate, chunk duration, label format, etc.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tract_tflite::prelude::*;
 use tracing::info;
 
 use crate::manifest::ResolvedManifest;
 use gaia_common::config::Config;
+
+// ── constants ────────────────────────────────────────────────────────────
+
+/// TFLite FlatBuffer schema identifier at bytes 4..8.
+const TFLITE_SCHEMA_ID: &[u8; 4] = b"TFL3";
+
+/// Minimum plausible size for a real TFLite model (header + at least one
+/// tensor).  Anything smaller is almost certainly corrupt or truncated.
+const MIN_TFLITE_SIZE: u64 = 1024;
 
 // ── public types ─────────────────────────────────────────────────────────
 
@@ -39,9 +49,117 @@ pub type Prediction = (String, f64);
 
 // ── model loading ────────────────────────────────────────────────────────
 
+/// Validate a TFLite file *before* handing it to tract.
+///
+/// Checks performed (cheapest first):
+///   1. File exists
+///   2. File is not empty / not suspiciously small
+///   3. FlatBuffer identifier bytes == `TFL3`
+///   4. Root offset (first 4 bytes, little-endian u32) points inside the file
+///   5. File is not accidentally a zip archive or HTML error page
+fn validate_tflite_file(path: &Path) -> Result<()> {
+    // 1. existence
+    if !path.exists() {
+        bail!(
+            "TFLite file not found: {}. \
+             Check that the model has been downloaded and extracted correctly.",
+            path.display()
+        );
+    }
+
+    // 2. size
+    let meta = fs::metadata(path)
+        .with_context(|| format!("Cannot stat {}", path.display()))?;
+
+    if meta.len() == 0 {
+        bail!("TFLite file is empty (0 bytes): {}", path.display());
+    }
+    if meta.len() < MIN_TFLITE_SIZE {
+        bail!(
+            "TFLite file is suspiciously small ({} bytes): {}. \
+             Expected at least {} bytes for a valid model.",
+            meta.len(),
+            path.display(),
+            MIN_TFLITE_SIZE,
+        );
+    }
+
+    // Read the first 32 bytes – enough for all header checks.
+    let header = {
+        use std::io::Read;
+        let mut f = fs::File::open(path)
+            .with_context(|| format!("Cannot open {}", path.display()))?;
+        let mut buf = [0u8; 32];
+        let n = f.read(&mut buf)
+            .with_context(|| format!("Cannot read header of {}", path.display()))?;
+        buf[..n].to_vec()
+    };
+
+    if header.len() < 8 {
+        bail!(
+            "TFLite file too short to contain a valid header ({} bytes): {}",
+            header.len(),
+            path.display(),
+        );
+    }
+
+    // 5a. Reject zip archives (PK\x03\x04 magic)
+    if header.starts_with(b"PK\x03\x04") {
+        bail!(
+            "File appears to be a zip archive, not a TFLite model: {}. \
+             The downloaded zip may not have been extracted.",
+            path.display(),
+        );
+    }
+
+    // 5b. Reject HTML error pages
+    if header.starts_with(b"<!") || header.starts_with(b"<h") || header.starts_with(b"<H") {
+        bail!(
+            "File appears to be an HTML page, not a TFLite model: {}. \
+             The download server may have returned an error page.",
+            path.display(),
+        );
+    }
+
+    // 3. FlatBuffer schema identifier at offset 4..8
+    if header[4..8] != *TFLITE_SCHEMA_ID {
+        let id = &header[4..8];
+        bail!(
+            "Invalid TFLite schema identifier in {}: expected {:?} (TFL3), \
+             got {:?}. The file may be corrupt or not a TFLite model.",
+            path.display(),
+            TFLITE_SCHEMA_ID,
+            id,
+        );
+    }
+
+    // 4. Root table offset (bytes 0..4, little-endian u32) must point
+    //    inside the file.
+    let root_offset = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if root_offset as u64 >= meta.len() {
+        bail!(
+            "TFLite root table offset ({}) exceeds file size ({} bytes) in {}. \
+             The file is likely truncated or corrupt.",
+            root_offset,
+            meta.len(),
+            path.display(),
+        );
+    }
+
+    info!(
+        "Validated TFLite file: {} ({:.1} MB)",
+        path.display(),
+        meta.len() as f64 / (1024.0 * 1024.0),
+    );
+    Ok(())
+}
+
 /// Load a model from a resolved manifest.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
     let tflite_path = resolved.tflite_path();
+    validate_tflite_file(&tflite_path)
+        .with_context(|| format!("Pre-flight check failed for {}", tflite_path.display()))?;
+
     info!("Loading model from {}", tflite_path.display());
 
     let runner = tract_tflite::tflite()
@@ -182,6 +300,9 @@ fn load_meta_model(
         Some(p) if p.exists() => p,
         _ => return Ok(None),
     };
+
+    validate_tflite_file(&meta_path)
+        .with_context(|| format!("Pre-flight check failed for metadata model {}", meta_path.display()))?;
 
     info!("Loading metadata model: {}", meta_path.display());
     let runner = tract_tflite::tflite()
@@ -344,5 +465,118 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-5);
         assert!(probs[2] > probs[1]);
         assert!(probs[1] > probs[0]);
+    }
+
+    // ── validate_tflite_file tests ───────────────────────────────────
+
+    #[test]
+    fn test_validate_nonexistent_file() {
+        let r = validate_tflite_file(Path::new("/tmp/does_not_exist_gaia_test.tflite"));
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_empty_file() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("empty.tflite");
+        fs::write(&path, b"").unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("empty"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_too_small() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("tiny.tflite");
+        fs::write(&path, b"hello").unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("suspiciously small"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_zip_file_rejected() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("fake.tflite");
+        // PK\x03\x04 header + padding
+        let mut data = vec![0x50, 0x4B, 0x03, 0x04];
+        data.resize(2048, 0);
+        fs::write(&path, &data).unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("zip archive"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_html_rejected() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("error.tflite");
+        let mut data = b"<!DOCTYPE html><html>403 Forbidden</html>".to_vec();
+        data.resize(2048, 0);
+        fs::write(&path, &data).unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("HTML"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_bad_schema_id() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("bad_id.tflite");
+        // Valid-looking root offset (16) but wrong schema id
+        let mut data = vec![0; 2048];
+        data[0..4].copy_from_slice(&16u32.to_le_bytes()); // root offset
+        data[4..8].copy_from_slice(b"XXXX");               // wrong id
+        fs::write(&path, &data).unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("schema identifier"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_truncated_root_offset() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("truncated.tflite");
+        let mut data = vec![0; 2048];
+        data[0..4].copy_from_slice(&999999u32.to_le_bytes()); // offset past EOF
+        data[4..8].copy_from_slice(b"TFL3");
+        fs::write(&path, &data).unwrap();
+        let r = validate_tflite_file(&path);
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("truncated") || msg.contains("exceeds"), "got: {msg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_good_file() {
+        let dir = std::env::temp_dir().join("gaia_test_validate");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("good.tflite");
+        let mut data = vec![0; 2048];
+        data[0..4].copy_from_slice(&16u32.to_le_bytes()); // valid root offset
+        data[4..8].copy_from_slice(b"TFL3");               // correct schema
+        fs::write(&path, &data).unwrap();
+        assert!(validate_tflite_file(&path).is_ok());
+        let _ = fs::remove_file(&path);
     }
 }

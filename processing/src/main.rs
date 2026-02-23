@@ -62,8 +62,13 @@ fn main() -> Result<()> {
 
     let mut models = Vec::with_capacity(manifests.len());
     for m in &manifests {
-        match model::load_model(m, &config) {
-            Ok(loaded) => {
+        // Wrap in catch_unwind because tract-tflite can panic on
+        // unsupported tensor types (e.g. float16 in the fp16 variant).
+        let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model::load_model(m, &config)
+        }));
+        match load_result {
+            Ok(Ok(loaded)) => {
                 info!(
                     "Model ready: {} (domain={}, sr={}, chunk={}s)",
                     m.manifest.model.name,
@@ -73,8 +78,16 @@ fn main() -> Result<()> {
                 );
                 models.push(loaded);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("Cannot load model {}: {e:#}", m.manifest.model.name);
+            }
+            Err(_) => {
+                tracing::error!(
+                    "Model {} panicked during loading – this usually means the \
+                     TFLite file uses an unsupported tensor type (e.g. float16). \
+                     Set MODEL_VARIANT=fp32 or MODEL_VARIANT=int8 in gaia.conf.",
+                    m.manifest.model.name,
+                );
             }
         }
     }

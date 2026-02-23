@@ -127,15 +127,19 @@ else
 # BirdNET V2.4 – model manifest
 # Model files are downloaded automatically from Zenodo on first start.
 #
-# The [model] defaults match the fp16 variant (the default).  Each
+# The [model] defaults match the fp32 variant (the default).  Each
 # [download.variants.*] section overrides filenames for its variant.
+#
+# NOTE: tract-tflite does not support float16 tensors, so fp32 is the
+# default.  Set MODEL_VARIANT=int8 in gaia.conf for smaller/faster
+# inference on low-end hardware (e.g. Raspberry Pi).
 
 [model]
 name = "BirdNET V2.4"
 domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
-tflite_file = "audio-model-fp16.tflite"
+tflite_file = "audio-model.tflite"
 labels_file = "en_us.txt"
 v1_metadata = false
 apply_softmax = false
@@ -145,10 +149,11 @@ enabled = true
 tflite_file = "meta-model.tflite"
 
 # ── Automatic download from Zenodo ────────────────────────────────────
-# Set MODEL_VARIANT in gaia.conf to choose: fp32, fp16 (default), int8
+# Set MODEL_VARIANT in gaia.conf to choose: fp32 (default), int8
+# NOTE: fp16 is NOT supported by tract-tflite and will cause a panic.
 [download]
 zenodo_record_id = "15050749"
-default_variant = "fp16"
+default_variant = "fp32"
 
 [download.variants.fp32]
 zenodo_file = "BirdNET_v2.4_tflite.zip"
@@ -202,8 +207,6 @@ services:
     pull_policy: always
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      - capture
     volumes:
       - ./gaia.conf:/etc/gaia/gaia.conf:ro
       - ./models:/models
@@ -215,8 +218,6 @@ services:
     pull_policy: always
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      - processing
     volumes:
       - ./data:/data
       - ./backups:/backups
@@ -248,7 +249,7 @@ echo "  3. Open the dashboard:"
 echo "     http://localhost:3000"
 echo ""
 echo "  The BirdNET V2.4 model will be downloaded automatically"
-echo "  from Zenodo on first start (~53 MB for fp16 variant)."
+echo "  from Zenodo on first start (~77 MB for fp32 variant)."
 echo ""
 echo "  To import a BirdNET-Pi backup:"
 echo "     \$ cp ~/backup.tar ${INSTALL_DIR}/backups/"
