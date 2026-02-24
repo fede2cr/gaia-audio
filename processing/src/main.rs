@@ -63,6 +63,10 @@ fn main() -> Result<()> {
         if let Err(e) = download::ensure_onnx_file(m) {
             tracing::warn!("ONNX conversion failed for {}: {e:#}", m.manifest.model.name);
         }
+        // Convert metadata TFLite → ONNX if needed (best-effort, non-fatal).
+        if let Err(e) = download::ensure_meta_onnx_file(m) {
+            tracing::warn!("Metadata ONNX conversion failed for {}: {e:#}", m.manifest.model.name);
+        }
     }
 
     let mut models = Vec::with_capacity(manifests.len());

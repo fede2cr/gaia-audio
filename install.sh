@@ -151,6 +151,7 @@ apply_softmax = false
 [metadata_model]
 enabled = true
 tflite_file = "meta-model.tflite"
+onnx_file = "meta-model.onnx"
 
 # ── Automatic download from Zenodo ────────────────────────────────────
 # Set MODEL_VARIANT in gaia.conf to choose: fp32 (default), int8

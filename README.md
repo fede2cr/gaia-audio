@@ -79,6 +79,7 @@ v1_metadata = false
 [metadata_model]
 enabled = true
 tflite_file = "BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite"
+onnx_file = "meta-model.onnx"     # preferred when present
 ```
 
 > **Why ONNX?** `tract-tflite` does not support every TFLite operator
@@ -183,28 +184,30 @@ podman build -f web/Containerfile -t fede2/gaia-web .
 
 ## Converting Models to ONNX
 
-The BirdNET V2.4 TFLite model uses operators (`SPLIT_V`, `RFFT2D`) not
-supported by `tract-tflite`.  The processing container image handles this
-automatically:
+The BirdNET V2.4 TFLite models use operators (`SPLIT_V`, `RFFT2D`,
+`STRIDED_SLICE` with `shrink_axis_mask`) not supported by `tract-tflite`.
+The processing container image handles this automatically:
 
 - At **build time**, the Containerfile downloads the Keras model from Zenodo,
   extracts the CNN classifier sub-model (removing the RFFT-based mel
-  spectrogram layers), and converts it to ONNX (~49 MB).
+  spectrogram layers), and converts both the classifier (~49 MB) and the
+  metadata model (~28 MB, for location-based species filtering) to ONNX.
 - At **runtime**, the mel-spectrogram preprocessing runs in native Rust
   (`mel.rs`) — no Python or TensorFlow is needed.
-- On first start, `ensure_onnx_file()` copies the baked-in ONNX model from
-  `/usr/local/share/gaia/models/` into the model directory.
+- On first start, `ensure_onnx_file()` and `ensure_meta_onnx_file()` copy
+  the baked-in ONNX models from `/usr/local/share/gaia/models/` into the
+  model directory.
 
 For non-container (bare-metal) installs, you can convert manually:
 
 ```bash
 pip install tensorflow tf_keras tf2onnx onnxruntime
-python scripts/convert_keras_to_onnx.py models/birds/ -o audio-model.onnx
+python scripts/convert_keras_to_onnx.py models/birds/ -o audio-model.onnx --meta
 ```
 
-Then set `onnx_file` in `manifest.toml` (already done in the default
-manifest).  On next start the processing server will load the `.onnx` file
-instead of the `.tflite` one.
+Then set `onnx_file` in both `[model]` and `[metadata_model]` sections of
+`manifest.toml` (already done in the default manifest).  On next start the
+processing server will load the `.onnx` files instead of the `.tflite` ones.
 
 ## Running with Podman/Docker Compose
 

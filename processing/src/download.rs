@@ -193,6 +193,71 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
     convert_tflite_to_onnx(manifest, &onnx_path)
 }
 
+/// Ensure the metadata model ONNX file is present, copying from the
+/// baked-in container path if available, or converting via Python.
+///
+/// Like `ensure_onnx_file()` but for the `[metadata_model].onnx_file`.
+/// Best-effort: logs a warning and returns `Ok(())` on failure.
+pub fn ensure_meta_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
+    let onnx_path = match manifest.metadata_onnx_path() {
+        Some(p) => p,
+        None => return Ok(()), // no metadata onnx_file configured
+    };
+
+    if onnx_path.exists() {
+        info!("ONNX metadata model already present: {}", onnx_path.display());
+        return Ok(());
+    }
+
+    // ── 1. Baked-in model from container image ───────────────────────
+    if let Some(filename) = onnx_path.file_name() {
+        let baked = Path::new(BAKED_MODELS_DIR).join(filename);
+        if baked.exists() {
+            info!(
+                "Copying baked-in ONNX metadata model: {} → {}",
+                baked.display(),
+                onnx_path.display()
+            );
+            std::fs::copy(&baked, &onnx_path).with_context(|| {
+                format!(
+                    "Failed to copy baked ONNX metadata model {} → {}",
+                    baked.display(),
+                    onnx_path.display()
+                )
+            })?;
+            let size = std::fs::metadata(&onnx_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                "ONNX metadata model ready: {} ({:.1} MB)",
+                onnx_path.display(),
+                size as f64 / 1_048_576.0
+            );
+            return Ok(());
+        }
+    }
+
+    // ── 2. Convert via Python if Keras zip is available ──────────────
+    if let Some(download) = &manifest.manifest.download {
+        if let Some(keras_file) = &download.keras_zenodo_file {
+            return convert_meta_keras_to_onnx(
+                manifest,
+                &download.zenodo_record_id,
+                keras_file,
+                download.keras_md5.as_deref(),
+                &onnx_path,
+            );
+        }
+    }
+
+    warn!(
+        "Cannot provide ONNX metadata model at {} — \
+         no baked-in model and no Keras download configured",
+        onnx_path.display()
+    );
+    Ok(())
+}
+
 /// Download the Keras model from Zenodo, extract it, and convert the
 /// classifier sub-model to ONNX.
 fn convert_keras_to_onnx(
@@ -317,6 +382,130 @@ fn convert_keras_to_onnx(
         }
         Err(e) => {
             warn!("Failed to run Keras → ONNX conversion: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Download / reuse the Keras zip and convert the metadata model (meta-model.h5)
+/// to ONNX.  The metadata model is a simple dense network with no custom ops,
+/// so direct `from_keras()` conversion works without sub-model splitting.
+fn convert_meta_keras_to_onnx(
+    manifest: &ResolvedManifest,
+    zenodo_record_id: &str,
+    keras_zenodo_file: &str,
+    keras_md5: Option<&str>,
+    onnx_path: &Path,
+) -> Result<()> {
+    let keras_dir = manifest.base_dir.join(".keras_tmp");
+    std::fs::create_dir_all(&keras_dir)
+        .with_context(|| format!("Cannot create {}", keras_dir.display()))?;
+
+    let meta_h5 = keras_dir.join("meta-model.h5");
+    if !meta_h5.exists() {
+        let url = format!(
+            "{}/{}/files/{}/content",
+            ZENODO_FILES_URL, zenodo_record_id, keras_zenodo_file
+        );
+        info!(
+            "Downloading Keras zip for metadata ONNX conversion: {} → {}",
+            keras_zenodo_file,
+            keras_dir.display()
+        );
+        download_and_extract(&url, &keras_dir, keras_md5)?;
+
+        if !meta_h5.exists() {
+            let available: Vec<String> = std::fs::read_dir(&keras_dir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            warn!(
+                "Downloaded Keras zip but meta-model.h5 not found.\n\
+                 Files present: {available:?}"
+            );
+            return Ok(());
+        }
+    }
+
+    let onnx_filename = onnx_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    info!(
+        "Converting Keras metadata → ONNX: {} → {}",
+        meta_h5.display(),
+        onnx_path.display()
+    );
+
+    let script = ["scripts/convert_keras_to_onnx.py",
+                   "/usr/local/share/gaia/scripts/convert_keras_to_onnx.py"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap_or("scripts/convert_keras_to_onnx.py");
+
+    let output = std::process::Command::new("python3")
+        .args([
+            script,
+            &keras_dir.to_string_lossy(),
+            "--meta",
+            "--meta-output",
+            &onnx_filename,
+            // Dummy -o to satisfy the positional classifier conversion;
+            // we only care about --meta here.
+            "-o", "audio-model.onnx",
+        ])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => {
+            let generated = keras_dir.join(&onnx_filename);
+            if generated.exists() && generated != onnx_path {
+                std::fs::rename(&generated, onnx_path).with_context(|| {
+                    format!(
+                        "Cannot move {} → {}",
+                        generated.display(),
+                        onnx_path.display()
+                    )
+                })?;
+            }
+            let size = std::fs::metadata(onnx_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                "Keras metadata → ONNX conversion complete: {} ({:.1} MB)",
+                onnx_path.display(),
+                size as f64 / 1_048_576.0
+            );
+            let _ = std::fs::remove_dir_all(&keras_dir);
+            Ok(())
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            warn!(
+                "Keras metadata → ONNX conversion failed (exit {}):\n{}\n{}",
+                result.status,
+                stdout.lines().take(10).collect::<Vec<_>>().join("\n"),
+                stderr.lines().take(10).collect::<Vec<_>>().join("\n"),
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "python3 not found — cannot convert metadata Keras model to ONNX."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to run metadata Keras → ONNX conversion: {e}");
             Ok(())
         }
     }

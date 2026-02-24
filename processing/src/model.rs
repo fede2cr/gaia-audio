@@ -186,7 +186,16 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
 
     let labels = load_labels(&resolved.labels_path())?;
 
-    let meta_model = load_meta_model(resolved, &labels, config.sf_thresh)?;
+    let meta_model = match load_meta_model(resolved, &labels, config.sf_thresh) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                "Metadata model failed to load – location-based filtering \
+                 will be disabled: {e:#}"
+            );
+            None
+        }
+    };
 
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
     let adjusted_sensitivity = (1.0 - (sensitivity - 1.0)).clamp(0.5, 1.5);
@@ -358,6 +367,29 @@ fn load_meta_model(
     _labels: &[String],
     sf_thresh: f64,
 ) -> Result<Option<MetaDataModel>> {
+    // ── prefer ONNX when configured and present ──────────────────────
+    if let Some(onnx_path) = resolved.metadata_onnx_path() {
+        if onnx_path.exists() {
+            info!("Loading ONNX metadata model: {}", onnx_path.display());
+            let runner = load_onnx_runner(&onnx_path)
+                .with_context(|| format!("Cannot load ONNX metadata model: {}", onnx_path.display()))?;
+            let labels = load_labels(&resolved.labels_path())?;
+            return Ok(Some(MetaDataModel {
+                runner,
+                labels,
+                sf_thresh,
+                cached_params: None,
+                cached_list: vec![],
+            }));
+        } else {
+            info!(
+                "ONNX metadata model configured but missing ({}), trying TFLite",
+                onnx_path.display()
+            );
+        }
+    }
+
+    // ── fall back to TFLite ──────────────────────────────────────────
     let meta_path = match resolved.metadata_tflite_path() {
         Some(p) if p.exists() => p,
         _ => return Ok(None),

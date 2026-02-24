@@ -81,6 +81,12 @@ pub struct MetadataSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub tflite_file: String,
+    /// Optional ONNX variant of the metadata model.  When present **and**
+    /// the file exists on disk, tract-onnx is used instead of tract-tflite.
+    /// This avoids unsupported-operator issues (e.g. STRIDED_SLICE with
+    /// shrink_axis_mask in BirdNET V2.4's metadata model).
+    #[serde(default)]
+    pub onnx_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,6 +180,16 @@ impl ResolvedManifest {
             .as_ref()
             .filter(|m| m.enabled)
             .map(|m| self.base_dir.join(&m.tflite_file))
+    }
+
+    /// Path to the ONNX metadata model file, if configured.
+    pub fn metadata_onnx_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .metadata_model
+            .as_ref()
+            .filter(|m| m.enabled)
+            .and_then(|m| m.onnx_file.as_ref())
+            .map(|f| self.base_dir.join(f))
     }
 
     pub fn language_dir(&self) -> PathBuf {

@@ -55,6 +55,7 @@ RUN pip install --no-cache-dir 'pycparser<3' && \
 
 WORKDIR /convert
 COPY scripts/convert_keras_to_onnx.py .
+COPY scripts/download_meta_tflite.py .
 
 # Download Keras zip from Zenodo and extract (flatten directory structure).
 # python:3.12-slim does not include curl, so we use urllib instead.
@@ -75,10 +76,22 @@ os.remove('keras.zip'); \
 shutil.rmtree('/convert/keras_raw')" && \
     ls -lh /convert/keras/
 
-# Convert classifier sub-model to ONNX
+# Convert classifier sub-model to ONNX (Keras → split at concatenate → ONNX)
 RUN python3 convert_keras_to_onnx.py /convert/keras -o audio-model.onnx && \
     mv /convert/keras/audio-model.onnx /convert/audio-model.onnx && \
     ls -lh /convert/audio-model.onnx
+
+# Convert metadata model to ONNX.
+# The meta-model.h5 uses a custom MDataLayer that's hard to deserialise
+# in Keras, so we download the TFLite variant and convert it directly
+# with tf2onnx.  STRIDED_SLICE (which tract-tflite can't run) converts
+# to standard ONNX Slice/Gather ops just fine.
+RUN python3 download_meta_tflite.py && \
+    python3 -m tf2onnx.convert \
+        --tflite /convert/meta-model.tflite \
+        --output /convert/meta-model.onnx && \
+    rm /convert/meta-model.tflite && \
+    ls -lh /convert/meta-model.onnx
 
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
@@ -96,6 +109,10 @@ COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-pr
 # At runtime, ensure_onnx_file() copies this to the model directory
 # if the manifest requests audio-model.onnx and it is absent.
 COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/audio-model.onnx
+
+# Pre-converted BirdNET V2.4 metadata ONNX model (~28 MB).
+# Location-based species filtering without tract-tflite STRIDED_SLICE issues.
+COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta-model.onnx
 
 RUN mkdir -p /etc/gaia /data /models
 

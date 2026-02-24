@@ -25,6 +25,7 @@ apply_softmax = false
 [metadata_model]
 enabled = true
 tflite_file = "meta-model.tflite"
+onnx_file = "meta-model.onnx"
 
 [language]
 # Subdirectory containing labels_{lang}.json files
