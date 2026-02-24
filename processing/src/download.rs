@@ -14,6 +14,10 @@ use crate::manifest::ResolvedManifest;
 
 const ZENODO_FILES_URL: &str = "https://zenodo.org/api/records";
 
+/// Directory where pre-converted ONNX models are baked into the container
+/// image at build time (see `processing/Containerfile`, converter stage).
+const BAKED_MODELS_DIR: &str = "/usr/local/share/gaia/models";
+
 /// Name of the marker file used to implement exponential backoff across
 /// container restarts.  The file contains the next retry timestamp.
 const BACKOFF_MARKER: &str = ".download_backoff";
@@ -112,20 +116,27 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
 // ── ONNX auto-conversion ─────────────────────────────────────────────────
 
 /// If the manifest declares an `onnx_file` and the ONNX model does not
-/// already exist, attempt to convert the model to ONNX.
+/// already exist, attempt to provide it through the following strategies
+/// (in order):
 ///
-/// **Preferred path** (BirdNET V2.4+): download the Keras `.h5` model from
-/// Zenodo and convert the *classifier sub-model* (without the RFFT-based
-/// mel spectrogram layers) using `scripts/convert_keras_to_onnx.py`.
-/// The mel preprocessing is handled at runtime in Rust (`mel.rs`).
+/// 1. **Baked-in model** (container builds): check
+///    `/usr/local/share/gaia/models/{name}` — if the file exists (placed
+///    there by the `converter` stage of the Containerfile), copy it into
+///    the model directory.  This is the fastest and most reliable path;
+///    no Python or network access is required at runtime.
 ///
-/// **Fallback**: if no `keras_zenodo_file` is configured, attempt a direct
-/// TFLite → ONNX conversion via `tf2onnx` (works for simple models but
-/// fails on BirdNET V2.4 due to unsupported RFFT/SPLIT_V ops).
+/// 2. **Keras download + classifier extraction**: download the Keras
+///    `.h5` model from Zenodo and convert the *classifier sub-model*
+///    (without the RFFT-based mel spectrogram layers) using
+///    `scripts/convert_keras_to_onnx.py`.  Requires Python + tensorflow.
 ///
-/// This is best-effort: when Python or the required packages are not
-/// installed the function logs a warning and returns `Ok(())` so the server
-/// can still attempt to fall back to TFLite.
+/// 3. **Fallback: TFLite → ONNX via tf2onnx**: direct conversion of the
+///    TFLite model (works for simple models but fails on BirdNET V2.4
+///    due to unsupported RFFT/SPLIT_V ops).
+///
+/// This is best-effort: when none of the strategies succeed the function
+/// logs a warning and returns `Ok(())` so the server can still attempt to
+/// fall back to TFLite.
 pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
     let onnx_path = match manifest.onnx_path() {
         Some(p) => p,
@@ -137,7 +148,35 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         return Ok(());
     }
 
-    // ── Keras-based conversion (preferred) ───────────────────────────
+    // ── 1. Baked-in model from container image ───────────────────────
+    if let Some(filename) = onnx_path.file_name() {
+        let baked = Path::new(BAKED_MODELS_DIR).join(filename);
+        if baked.exists() {
+            info!(
+                "Copying baked-in ONNX model: {} → {}",
+                baked.display(),
+                onnx_path.display()
+            );
+            std::fs::copy(&baked, &onnx_path).with_context(|| {
+                format!(
+                    "Failed to copy baked ONNX model {} → {}",
+                    baked.display(),
+                    onnx_path.display()
+                )
+            })?;
+            let size = std::fs::metadata(&onnx_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                "ONNX model ready: {} ({:.1} MB)",
+                onnx_path.display(),
+                size as f64 / 1_048_576.0
+            );
+            return Ok(());
+        }
+    }
+
+    // ── 2. Keras-based conversion (preferred on hosts with Python) ───
     if let Some(download) = &manifest.manifest.download {
         if let Some(keras_file) = &download.keras_zenodo_file {
             return convert_keras_to_onnx(
@@ -150,7 +189,7 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         }
     }
 
-    // ── Fallback: direct TFLite → ONNX via tf2onnx CLI ──────────────
+    // ── 3. Fallback: direct TFLite → ONNX via tf2onnx CLI ───────────
     convert_tflite_to_onnx(manifest, &onnx_path)
 }
 

@@ -44,7 +44,10 @@ def convert(model_dir: str, output_name: str = "audio-model.onnx") -> str:
 
     # Import heavy deps only after checking the file exists.
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # suppress TF noise
-    import tf_keras as keras
+    try:
+        import tf_keras as keras          # TF 2.16+
+    except ImportError:
+        from tensorflow import keras      # TF ≤ 2.15
     import numpy as np
 
     # Try loading the custom MelSpecLayerSimple if present.
@@ -64,31 +67,36 @@ def convert(model_dir: str, output_name: str = "audio-model.onnx") -> str:
     concat_output = concat_layer.output
     print(f"  Split point: '{concat_layer.name}' → shape {concat_output.shape}")
 
-    # Build classifier sub-model: concat output → final output.
-    classifier_input = keras.layers.Input(
-        shape=concat_output.shape[1:], name="mel_spectrogram"
+    # ── Extract classifier sub-model using Keras graph tracing ────────
+    # BirdNET's classifier has internal branching (inception-style blocks
+    # with POOL_*_CONCAT merge layers), so a naive sequential replay of
+    # layers doesn't work.  Instead we let Keras trace the computational
+    # graph from the concatenate output tensor to the model output.
+    #
+    # Step 1: Build a "raw" sub-model.  Keras.Model() traces the graph
+    #         backward from `outputs` to find every layer between the
+    #         given `inputs` (an intermediate tensor) and `outputs`.
+    # Step 2: Wrap with a proper keras.Input so tf2onnx gets a clean
+    #         single-input model.
+    print("  Extracting classifier sub-model via graph tracing …")
+    classifier_raw = keras.Model(
+        inputs=concat_output,
+        outputs=model.output,
+        name="classifier_raw",
     )
+    print(f"  Raw sub-model: {len(classifier_raw.layers)} layers")
 
-    # Replay the graph from concat → end.
-    x = classifier_input
-    found_concat = False
-    for layer in model.layers:
-        if layer == concat_layer:
-            found_concat = True
-            continue
-        if not found_concat:
-            continue
-        x = layer(x)
-
-    classifier = keras.Model(inputs=classifier_input, outputs=x, name="classifier")
-    print(f"  Classifier sub-model: {len(classifier.layers)} layers, "
+    inp = keras.Input(
+        shape=tuple(concat_output.shape[1:]),
+        name="mel_spectrogram",
+    )
+    out = classifier_raw(inp)
+    classifier = keras.Model(inputs=inp, outputs=out, name="classifier")
+    print(f"  Classifier: {len(classifier.layers)} layers, "
           f"input={classifier.input_shape} → output={classifier.output_shape}")
 
-    # Quick sanity check: run inference with zeros through both models.
-    test_input = np.zeros((1,) + tuple(concat_output.shape[1:]), dtype=np.float32)
-    ref_out = model.layers[-1].output  # we need an extractor for the concat→end path
+    # Quick sanity check — run inference through both paths.
     mel_extractor = keras.Model(inputs=model.input, outputs=concat_output)
-    # Use random audio to check end-to-end equivalence.
     rng = np.random.RandomState(42)
     test_audio = (rng.randn(1, int(model.input_shape[1])) * 0.1).astype(np.float32)
     mel_from_keras = mel_extractor.predict(test_audio, verbose=0)
@@ -103,7 +111,6 @@ def convert(model_dir: str, output_name: str = "audio-model.onnx") -> str:
     import tf2onnx
     onnx_path = os.path.join(model_dir, output_name)
     print(f"Converting to ONNX: {onnx_path} …")
-    spec = (tf2onnx.tf_loader.keras2onnx_spec(classifier),)
     model_proto, _ = tf2onnx.convert.from_keras(
         classifier, output_path=onnx_path
     )

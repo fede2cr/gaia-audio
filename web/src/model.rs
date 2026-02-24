@@ -17,6 +17,25 @@ pub struct WebDetection {
     pub file_name: String,
 }
 
+impl WebDetection {
+    /// Build the URL to the extracted audio clip served by `/extracted/`.
+    ///
+    /// Clips are stored as:
+    ///   `{extracted_dir}/By_Date/{date}/{common_name_safe}/{file_name}`
+    ///
+    /// Returns `None` if `file_name` is empty.
+    pub fn clip_url(&self) -> Option<String> {
+        if self.file_name.is_empty() {
+            return None;
+        }
+        let safe_name = self.common_name.replace('\'', "").replace(' ', "_");
+        Some(format!(
+            "/extracted/By_Date/{}/{}/{}",
+            self.date, safe_name, self.file_name
+        ))
+    }
+}
+
 // ─── Species ─────────────────────────────────────────────────────────────────
 
 /// Aggregated species information (with optional iNaturalist data).

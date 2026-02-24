@@ -37,17 +37,51 @@ RUN touch common/src/lib.rs processing/src/main.rs
 # Build for real
 RUN cargo build --release -p gaia-processing
 
-# ── Python tools stage (Keras → ONNX conversion) ──────────────────
-# Installs tensorflow-cpu + tf_keras + tf2onnx so the server can
-# automatically download and convert the Keras model to a
-# classifier-only ONNX model on first startup.
+# ── Keras → ONNX conversion at build time ─────────────────────────
+# Downloads the BirdNET V2.4 Keras model from Zenodo, splits at the
+# concatenate layer (removing the RFFT-based mel-spectrogram layers),
+# and converts only the CNN classifier to ONNX.
 #
-# The mel-spectrogram preprocessing runs in native Rust at inference
-# time — Python is only needed for the one-time ONNX conversion.
-FROM python:3.12-slim AS pytools
-RUN pip install --no-cache-dir tensorflow tf_keras tf2onnx onnxruntime
+# The resulting ~49 MB ONNX file is baked into the image.  No Python
+# or TensorFlow is needed at runtime — the mel-spectrogram
+# preprocessing runs in native Rust (mel.rs).
+# Use Python 3.11 + TF 2.15 (last release with built-in Keras 2).
+# TF 2.16+ split Keras out to tf_keras, which has deserialization bugs
+# with BirdNET V2.4's MelSpecLayerSimple functional graph.
+FROM python:3.11-slim AS converter
+
+RUN pip install --no-cache-dir 'tensorflow==2.15.*' tf2onnx onnxruntime
+
+WORKDIR /convert
+COPY scripts/convert_keras_to_onnx.py .
+
+# Download Keras zip from Zenodo and extract (flatten directory structure).
+# python:3.12-slim does not include curl, so we use urllib instead.
+RUN python3 -c "\
+import urllib.request, zipfile, os, shutil; \
+print('Downloading BirdNET V2.4 Keras model from Zenodo...'); \
+urllib.request.urlretrieve( \
+    'https://zenodo.org/api/records/15050749/files/BirdNET_v2.4_keras.zip/content', \
+    'keras.zip'); \
+z = zipfile.ZipFile('keras.zip'); \
+z.extractall('/convert/keras_raw'); \
+os.makedirs('/convert/keras', exist_ok=True); \
+[shutil.copy2(os.path.join(r,f), '/convert/keras/'+f) \
+ for r,_,fs in os.walk('/convert/keras_raw') \
+ for f in fs \
+ if not r.endswith('__MACOSX') and not f.startswith('._')]; \
+os.remove('keras.zip'); \
+shutil.rmtree('/convert/keras_raw')" && \
+    ls -lh /convert/keras/
+
+# Convert classifier sub-model to ONNX
+RUN python3 convert_keras_to_onnx.py /convert/keras -o audio-model.onnx && \
+    mv /convert/keras/audio-model.onnx /convert/audio-model.onnx && \
+    ls -lh /convert/audio-model.onnx
 
 # ── Runtime stage ──────────────────────────────────────────────────
+# Minimal image: Rust binary + pre-converted ONNX model.
+# No Python, no TensorFlow — all inference runs in native Rust.
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -55,14 +89,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 3.12 + conversion tools from the pre-built stage
-COPY --from=pytools /usr/local /usr/local
-RUN ldconfig
-
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 
-# Copy Keras → ONNX conversion script
-COPY scripts/convert_keras_to_onnx.py /usr/local/share/gaia/scripts/convert_keras_to_onnx.py
+# Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
+# At runtime, ensure_onnx_file() copies this to the model directory
+# if the manifest requests audio-model.onnx and it is absent.
+COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/audio-model.onnx
 
 RUN mkdir -p /etc/gaia /data /models
 

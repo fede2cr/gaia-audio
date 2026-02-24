@@ -154,6 +154,16 @@ button {
 
 .detection-time { color: var(--text-muted); }
 
+/* Audio player */
+.detection-audio {
+    width: 100%;
+    height: 32px;
+    margin-top: .35rem;
+    border-radius: 4px;
+    opacity: .85;
+}
+.detection-audio:hover { opacity: 1; }
+
 /* Confidence badges */
 .confidence       { padding: .1rem .4rem; border-radius: 4px; font-weight: 600; font-size: .78rem; }
 .confidence.high  { background: rgba(107,203,119,.15); color: var(--success); }

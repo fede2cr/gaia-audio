@@ -156,13 +156,13 @@ tflite_file = "meta-model.tflite"
 # Set MODEL_VARIANT in gaia.conf to choose: fp32 (default), int8
 # NOTE: fp16 is NOT supported by tract-tflite and will cause a panic.
 #
-# After first start (model auto-download), convert TFLite to ONNX:
-#   pip install tf2onnx
-#   python scripts/convert_tflite_to_onnx.py models/birds/
-# The processing server prefers the ONNX file when present.
+# The container image includes a pre-converted ONNX classifier model.
+# When onnx_file is set, the server copies the baked-in ONNX model to
+# the model directory automatically — no Python or TensorFlow needed.
 [download]
 zenodo_record_id = "15050749"
 default_variant = "fp32"
+keras_zenodo_file = "BirdNET_v2.4_keras.zip"
 
 [download.variants.fp32]
 zenodo_file = "BirdNET_v2.4_tflite.zip"
@@ -259,11 +259,8 @@ echo "     http://localhost:3000"
 echo ""
 echo "  The BirdNET V2.4 model will be downloaded automatically"
 echo "  from Zenodo on first start (~77 MB for fp32 variant)."
-echo ""
-echo "  4. Convert the downloaded model to ONNX (one-time, requires Python):"
-echo "     \$ pip install tf2onnx"
-echo "     \$ python scripts/convert_tflite_to_onnx.py ${INSTALL_DIR}/models/birds/"
-echo "     Then restart: ${COMPOSE_CMD} restart processing"
+echo "  The ONNX classifier model is pre-converted in the container"
+echo "  image — no Python or TensorFlow needed at runtime."
 echo ""
 echo "  To import a BirdNET-Pi backup:"
 echo "     \$ cp ~/backup.tar ${INSTALL_DIR}/backups/"

@@ -183,17 +183,23 @@ podman build -f web/Containerfile -t fede2/gaia-web .
 
 ## Converting Models to ONNX
 
-The BirdNET V2.4 TFLite model uses operators (`SPLIT_V`) not supported by
-`tract-tflite`.  Convert the downloaded TFLite model to ONNX once:
+The BirdNET V2.4 TFLite model uses operators (`SPLIT_V`, `RFFT2D`) not
+supported by `tract-tflite`.  The processing container image handles this
+automatically:
+
+- At **build time**, the Containerfile downloads the Keras model from Zenodo,
+  extracts the CNN classifier sub-model (removing the RFFT-based mel
+  spectrogram layers), and converts it to ONNX (~49 MB).
+- At **runtime**, the mel-spectrogram preprocessing runs in native Rust
+  (`mel.rs`) — no Python or TensorFlow is needed.
+- On first start, `ensure_onnx_file()` copies the baked-in ONNX model from
+  `/usr/local/share/gaia/models/` into the model directory.
+
+For non-container (bare-metal) installs, you can convert manually:
 
 ```bash
-pip install tf2onnx
-
-# Convert a single model file
-python scripts/convert_tflite_to_onnx.py path/to/audio-model.tflite
-
-# Or convert all .tflite files in a model directory
-python scripts/convert_tflite_to_onnx.py models/birds/
+pip install tensorflow tf_keras tf2onnx onnxruntime
+python scripts/convert_keras_to_onnx.py models/birds/ -o audio-model.onnx
 ```
 
 Then set `onnx_file` in `manifest.toml` (already done in the default

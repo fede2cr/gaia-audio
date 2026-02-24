@@ -73,6 +73,11 @@ async fn main() {
             "/pkg",
             ServeDir::new(format!("{}/pkg", site_root.to_string())),
         )
+        // Serve extracted audio clips + spectrograms
+        .nest_service(
+            "/extracted",
+            ServeDir::new(extracted_dir.to_string_lossy().to_string()),
+        )
         .fallback(fallback_handler)
         .with_state(leptos_options);
 
@@ -124,6 +129,8 @@ async fn main() {
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "json" => "application/json",
+            "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
             _ => "application/octet-stream",
         }
     }
