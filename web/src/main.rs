@@ -45,6 +45,7 @@ async fn main() {
     let extracted_dir = PathBuf::from(
         std::env::var("GAIA_EXTRACTED_DIR").unwrap_or_else(|_| "data/extracted".into()),
     );
+    let extracted_serve_path = extracted_dir.to_string_lossy().to_string();
 
     let state = AppState {
         db_path,
@@ -76,7 +77,7 @@ async fn main() {
         // Serve extracted audio clips + spectrograms
         .nest_service(
             "/extracted",
-            ServeDir::new(extracted_dir.to_string_lossy().to_string()),
+            ServeDir::new(&extracted_serve_path),
         )
         .fallback(fallback_handler)
         .with_state(leptos_options);
