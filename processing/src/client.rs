@@ -185,24 +185,33 @@ pub fn poll_and_process(
 
 /// Resolve the list of capture server URLs.
 ///
-/// Tries mDNS first; falls back to the config value when mDNS is
-/// unavailable or discovers no capture nodes.
+/// Tries mDNS first (with a retry); falls back to the config value when
+/// mDNS is unavailable or discovers no capture nodes.
 fn resolve_capture_urls(
     discovery: Option<&DiscoveryHandle>,
     config: &Config,
 ) -> Vec<String> {
     if let Some(dh) = discovery {
-        let peers = dh.discover_peers(
-            ServiceRole::Capture,
-            Duration::from_secs(3),
-        );
-        if !peers.is_empty() {
-            let urls: Vec<String> = peers
-                .iter()
-                .filter_map(|p| p.http_url())
-                .collect();
-            info!("mDNS discovered {} capture node(s)", urls.len());
-            return urls;
+        // Try twice: the first scan may miss the capture node if it
+        // registered just moments before us and the mDNS cache hasn't
+        // propagated yet.
+        for attempt in 1..=2 {
+            let timeout = if attempt == 1 { 5 } else { 3 };
+            let peers = dh.discover_peers(
+                ServiceRole::Capture,
+                Duration::from_secs(timeout),
+            );
+            if !peers.is_empty() {
+                let urls: Vec<String> = peers
+                    .iter()
+                    .filter_map(|p| p.http_url())
+                    .collect();
+                info!("mDNS discovered {} capture node(s): {:?}", urls.len(), urls);
+                return urls;
+            }
+            if attempt == 1 {
+                debug!("mDNS scan {attempt}: no peers yet, retrying…");
+            }
         }
         info!("No capture nodes found via mDNS, falling back to config URL");
     }

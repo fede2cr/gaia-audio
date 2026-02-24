@@ -2,10 +2,11 @@
 //!
 //! Reused from `birdnet-server/src/capture.rs`.
 
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use gaia_common::config::Config;
 
@@ -15,11 +16,35 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
+    #[allow(dead_code)]
     pub fn kill(&mut self) -> Result<()> {
         for child in &mut self.children {
             let _ = child.kill();
         }
         Ok(())
+    }
+
+    /// Check whether any child has exited.  Returns `Some(status_msg)` if
+    /// a child died, `None` if all are still running.
+    pub fn check_alive(&mut self) -> Option<String> {
+        for (i, child) in self.children.iter_mut().enumerate() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Some(format!(
+                        "Capture child {} exited with {}",
+                        i, status
+                    ));
+                }
+                Ok(None) => {} // still running
+                Err(e) => {
+                    return Some(format!(
+                        "Cannot check capture child {}: {e}",
+                        i
+                    ));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -121,10 +146,53 @@ fn start_microphone(config: &Config) -> Result<CaptureHandle> {
     cmd.arg(output_pattern.to_str().unwrap());
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
-    let child = cmd.spawn().context("Failed to spawn arecord")?;
     info!(
-        "arecord started (channels={}, card={:?})",
-        config.channels, config.rec_card
+        "Spawning: arecord -f S16_LE -c{} -r48000 -t wav --max-file-time {} --use-strftime {} → {}",
+        config.channels,
+        config.recording_length,
+        config.rec_card.as_deref().unwrap_or("(default)"),
+        output_pattern.display(),
+    );
+
+    let mut child = cmd.spawn().context("Failed to spawn arecord")?;
+
+    // Drain stderr in a background thread so we see any ALSA errors
+    // and the pipe buffer doesn't fill up and block arecord.
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::Builder::new()
+            .name("arecord-stderr".into())
+            .spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if l.is_empty() => {}
+                        Ok(l) => warn!("[arecord] {l}"),
+                        Err(_) => break,
+                    }
+                }
+                debug!("arecord stderr stream ended");
+            })
+            .ok();
+    }
+
+    // Give arecord a moment to fail on bad config before declaring success.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            anyhow::bail!(
+                "arecord exited immediately with {status} — check REC_CARD in gaia.conf \
+                 (run 'arecord -l' on the host to list capture devices)"
+            );
+        }
+        Ok(None) => {} // still running – good
+        Err(e) => warn!("Cannot check arecord status: {e}"),
+    }
+
+    info!(
+        "arecord started (pid={}, channels={}, card={:?})",
+        child.id(),
+        config.channels,
+        config.rec_card
     );
 
     Ok(CaptureHandle {

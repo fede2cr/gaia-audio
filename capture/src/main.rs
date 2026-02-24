@@ -124,15 +124,38 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ── periodic capture health check ────────────────────────────────
+    // Monitor the arecord/ffmpeg child in a background task. If it
+    // dies, log the error so operators can diagnose the problem.
+    let capture_shutdown = Arc::new(AtomicBool::new(false));
+    let capture_shutdown_clone = capture_shutdown.clone();
+    let health_thread = std::thread::Builder::new()
+        .name("capture-health".into())
+        .spawn(move || {
+            while !capture_shutdown_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if let Some(ref mut h) = capture_handle {
+                    if let Some(msg) = h.check_alive() {
+                        tracing::error!(
+                            "{msg}. Recording has stopped — check audio device and restart."
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .ok();
+
     // Wait for the server task (runs until shutdown)
     let _ = server_handle.await;
 
     // Clean up
+    capture_shutdown.store(true, Ordering::Relaxed);
+    if let Some(t) = health_thread {
+        t.join().ok();
+    }
     if let Some(dh) = discovery {
         dh.shutdown();
-    }
-    if let Some(ref mut h) = capture_handle {
-        h.kill().ok();
     }
     info!("Gaia Capture Server stopped");
 

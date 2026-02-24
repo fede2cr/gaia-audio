@@ -13,7 +13,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, ScopedIp};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info, warn};
 
 /// How long to scan for existing peers before claiming an instance number.
@@ -120,6 +120,7 @@ impl DiscoveryHandle {
             }
         };
 
+        debug!("mDNS: browsing for {} (timeout={}s)", role.service_type(), timeout.as_secs());
         let mut peers = Vec::new();
         let deadline = Instant::now() + timeout;
 
@@ -133,24 +134,30 @@ impl DiscoveryHandle {
                     let name = info.get_fullname().to_string();
                     // Don't include ourselves
                     if name == self.fullname {
+                        debug!("mDNS: ignoring self ({})", name);
                         continue;
                     }
                     let addrs: Vec<IpAddr> =
-                        info.get_addresses().iter().map(ScopedIp::to_ip_addr).collect();
+                        info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
                     let port = info.get_port();
-                    debug!("Discovered peer: {} at {:?}:{}", name, addrs, port);
+                    info!("mDNS: discovered peer {} at {:?}:{}", name, addrs, port);
                     peers.push(Peer {
                         instance_name: extract_instance_name(&name),
                         addresses: addrs,
                         port,
                     });
                 }
-                Ok(_) => {}
+                Ok(event) => {
+                    debug!("mDNS: event {:?}", format_event(&event));
+                }
                 Err(_) => break,
             }
         }
 
         let _ = self.daemon.stop_browse(role.service_type());
+        if peers.is_empty() {
+            debug!("mDNS: browse completed, no peers found for {}", role.service_type());
+        }
         peers
     }
 
@@ -216,16 +223,18 @@ pub fn register(role: ServiceRole, port: u16) -> Result<DiscoveryHandle> {
     .context("Cannot create mDNS ServiceInfo")?;
 
     let fullname = service_info.get_fullname().to_string();
+    let registered_addrs = format!("{:?}", service_info.get_addresses());
 
     daemon
         .register(service_info)
         .context("Cannot register mDNS service")?;
 
     info!(
-        "Registered on mDNS as '{}' (type={}, port={})",
+        "Registered on mDNS as '{}' (type={}, port={}, addrs={})",
         instance_name,
         role.service_type(),
-        port
+        port,
+        registered_addrs
     );
 
     Ok(DiscoveryHandle {
@@ -236,6 +245,18 @@ pub fn register(role: ServiceRole, port: u16) -> Result<DiscoveryHandle> {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Format a ServiceEvent for debug logging (without dumping the full struct).
+fn format_event(event: &ServiceEvent) -> String {
+    match event {
+        ServiceEvent::ServiceFound(ty, name) => format!("Found({ty}, {name})"),
+        ServiceEvent::ServiceResolved(info) => format!("Resolved({})", info.get_fullname()),
+        ServiceEvent::ServiceRemoved(ty, name) => format!("Removed({ty}, {name})"),
+        ServiceEvent::SearchStarted(ty) => format!("SearchStarted({ty})"),
+        ServiceEvent::SearchStopped(ty) => format!("SearchStopped({ty})"),
+        _ => format!("Other"),
+    }
+}
 
 /// Extract the instance number from a fullname like
 /// `capture-03._gaia-capture._tcp.local.`
