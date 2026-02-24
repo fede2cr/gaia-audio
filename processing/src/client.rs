@@ -60,6 +60,15 @@ pub fn poll_and_process(
         capture_urls
     );
 
+    // Quick reachability check at startup so operators see a clear
+    // confirmation (or failure) in the logs immediately.
+    for url in &capture_urls {
+        match list_recordings(&client, url) {
+            Ok(r) => info!("[{url}] Reachable – {} recording(s) queued", r.len()),
+            Err(e) => warn!("[{url}] Not reachable at startup: {e:#}"),
+        }
+    }
+
     let mut last_discovery = Instant::now();
 
     loop {

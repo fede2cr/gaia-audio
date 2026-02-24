@@ -148,7 +148,7 @@ pub fn load(path: &Path) -> Result<Config> {
         capture_listen_addr: get("CAPTURE_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:8089".into()),
         capture_server_url: get("CAPTURE_SERVER_URL")
-            .unwrap_or_else(|| "http://capture:8089".into()),
+            .unwrap_or_else(|| "http://localhost:8089".into()),
         poll_interval_secs: get("POLL_INTERVAL_SECS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(5),

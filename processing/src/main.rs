@@ -109,17 +109,31 @@ fn main() -> Result<()> {
     }
 
     // ── mDNS registration + capture discovery ──────────────────────
-    let discovery = match gaia_common::discovery::register(
-        gaia_common::discovery::ServiceRole::Processing,
-        0, // processing doesn't expose an HTTP port
-    ) {
-        Ok(h) => {
-            info!("mDNS: registered as {}", h.instance_name());
-            Some(h)
-        }
-        Err(e) => {
-            tracing::warn!("mDNS registration failed (non-fatal): {e:#}");
-            None
+    // With network_mode: host, mDNS multicast reaches the physical
+    // network and containers discover each other automatically —
+    // even across different machines.
+    //
+    // Setting GAIA_DISABLE_MDNS=1 skips mDNS for environments where
+    // multicast is not available (e.g. bridge networking, CI).
+    let discovery = if std::env::var("GAIA_DISABLE_MDNS").is_ok() {
+        info!(
+            "GAIA_DISABLE_MDNS set – using {} (mDNS skipped)",
+            config.capture_server_url
+        );
+        None
+    } else {
+        match gaia_common::discovery::register(
+            gaia_common::discovery::ServiceRole::Processing,
+            0, // processing doesn't expose an HTTP port
+        ) {
+            Ok(h) => {
+                info!("mDNS: registered as {}", h.instance_name());
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!("mDNS registration failed (non-fatal): {e:#}");
+                None
+            }
         }
     };
 

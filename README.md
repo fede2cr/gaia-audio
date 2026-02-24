@@ -123,12 +123,49 @@ Variant entries can optionally override `tflite_file`, `labels_file`, and
 
 See `examples/birds_manifest.toml` for a complete example.
 
+## Networking & Discovery
+
+All containers use **`network_mode: host`** so they share the host's network
+stack.  This enables **mDNS** (multicast DNS) discovery — containers find each
+other automatically, even across different physical machines on the same LAN.
+
+```
+ Machine A (RPi with mic)            Machine B (GPU server)
+┌─────────────────────────┐         ┌──────────────────────────┐
+│  capture container      │  mDNS   │  processing container    │
+│  network_mode: host     │ ◄─────► │  network_mode: host      │
+│  announces on port 8089 │         │  discovers capture nodes  │
+└─────────────────────────┘         └──────────────────────────┘
+                                    ┌──────────────────────────┐
+                                    │  web container           │
+                                    │  network_mode: host      │
+                                    │  serves on port 3000     │
+                                    └──────────────────────────┘
+```
+
+**How it works:**
+- The capture server registers itself via mDNS as `_gaia-capture._tcp.local.`
+- The processing server browses for `_gaia-capture._tcp.local.` services
+  and polls every discovered node for new recordings
+- Re-discovery runs every 60 s — new capture nodes are picked up automatically
+- If mDNS finds no peers, the processing server falls back to
+  `CAPTURE_SERVER_URL` from `gaia.conf` (`http://localhost:8089` by default)
+
+**Single machine:** Everything works out of the box — all containers share
+`localhost` and mDNS is a fast local lookup.
+
+**Multiple machines:** Run `capture` on the mic host and `processing` + `web`
+on the server.  mDNS broadcasts on the LAN locate the capture node.
+
+> **Note:** If your network blocks multicast (e.g. some cloud VPCs), set
+> `GAIA_DISABLE_MDNS=1` in the environment and configure
+> `CAPTURE_SERVER_URL` explicitly.
+
 ## Configuration
 
 Both servers read the same `birdnet.conf`-style `KEY=VALUE` file
 (default: `/etc/gaia/gaia.conf`).  **Environment variables override**
-config-file values, so you can set `CAPTURE_SERVER_URL` in `compose.yaml`
-without editing `gaia.conf`.
+config-file values.
 
 | Key | Default | Used By | Description |
 |-----|---------|---------|-------------|
@@ -147,7 +184,8 @@ without editing `gaia.conf`.
 | `DATABASE_LANG` | `en` | processing | Language for common names |
 | `RTSP_STREAMS` | | capture | Comma-separated RTSP URLs |
 | `CAPTURE_LISTEN_ADDR` | `0.0.0.0:8089` | capture | Capture HTTP bind address |
-| `CAPTURE_SERVER_URL` | `http://capture:8089` | processing | URL to reach capture server |
+| `CAPTURE_SERVER_URL` | `http://localhost:8089` | processing | Fallback URL to reach capture server (used when mDNS finds no nodes) |
+| `GAIA_DISABLE_MDNS` | | processing | Set to `1` to skip mDNS and use `CAPTURE_SERVER_URL` only |
 | `POLL_INTERVAL_SECS` | `5` | processing | How often to poll for new recordings |
 | `BIRDWEATHER_ID` | | processing | BirdWeather station token |
 | `HEARTBEAT_URL` | | processing | Uptime heartbeat URL |
@@ -254,11 +292,16 @@ gaia/
 ### `compose.yaml`
 
 ```yaml
+# All services use host networking so that mDNS (multicast DNS) works
+# across containers and across separate hosts.  Each service binds
+# directly to the host's network interfaces – no port mapping needed.
+
 services:
   # ── Audio capture ───────────────────────────────────────────────────
   capture:
     image: fede2/gaia-capture
     restart: unless-stopped
+    network_mode: host
     devices:
       - /dev/snd:/dev/snd          # ALSA sound devices
     group_add:
@@ -266,33 +309,25 @@ services:
     # privileged: true              # uncomment if group_add alone is not enough
     volumes:
       - ./gaia.conf:/etc/gaia/gaia.conf:ro
-    ports:
-      - "8089:8089"
 
   # ── Model inference & analysis ──────────────────────────────────────
   processing:
     image: fede2/gaia-processing
     restart: unless-stopped
-    depends_on:
-      - capture
+    network_mode: host
     volumes:
       - ./gaia.conf:/etc/gaia/gaia.conf:ro
-      - ./models:/models:ro        # model dirs with manifest.toml
-      - ./data:/data               # DB + extracted clips (read-write)
-    environment:
-      - CAPTURE_SERVER_URL=http://capture:8089
+      - ./models:/models            # model dirs with manifest.toml
+      - ./data:/data                # DB + extracted clips (read-write)
 
   # ── Web dashboard ──────────────────────────────────────────────────
   web:
     image: fede2/gaia-web
     restart: unless-stopped
-    depends_on:
-      - processing
+    network_mode: host
     volumes:
-      - ./data:/data                          # SQLite WAL needs write access
-      - ./backups:/backups         # BirdNET-Pi backup .tar files for import
-    ports:
-      - "3000:3000"
+      - ./data:/data                # SQLite WAL needs write access
+      - ./backups:/backups          # BirdNET-Pi backup .tar files for import
     environment:
       - GAIA_DB_PATH=/data/birds.db
       - GAIA_EXTRACTED_DIR=/data/extracted
