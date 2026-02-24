@@ -50,7 +50,8 @@ RUN cargo build --release -p gaia-processing
 # with BirdNET V2.4's MelSpecLayerSimple functional graph.
 FROM python:3.11-slim AS converter
 
-RUN pip install --no-cache-dir 'tensorflow==2.15.*' tf2onnx onnxruntime
+RUN pip install --no-cache-dir 'pycparser<3' && \
+    pip install --no-cache-dir 'tensorflow==2.15.*' tf2onnx onnxruntime
 
 WORKDIR /convert
 COPY scripts/convert_keras_to_onnx.py .
