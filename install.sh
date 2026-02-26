@@ -210,6 +210,7 @@ services:
     # privileged: true   # uncomment if group_add alone is not enough
     volumes:
       - ./gaia.conf:/etc/gaia/gaia.conf:ro
+      - /proc/asound:/run/asound:ro
 
   # ── Model inference & analysis ──────────────────────────────────────
   processing:

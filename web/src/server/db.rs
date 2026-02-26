@@ -32,13 +32,15 @@ pub fn recent_detections(
     let conn = open(db_path)?;
     let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
         Some(rid) => (
-            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name \
+            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+             COALESCE(Source_Node, '') \
              FROM detections WHERE rowid > ?1 ORDER BY rowid DESC LIMIT ?2"
                 .into(),
             vec![Box::new(rid), Box::new(limit)],
         ),
         None => (
-            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name \
+            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+             COALESCE(Source_Node, '') \
              FROM detections ORDER BY rowid DESC LIMIT ?1"
                 .into(),
             vec![Box::new(limit)],
@@ -56,6 +58,7 @@ pub fn recent_detections(
             date: row.get(5)?,
             time: row.get(6)?,
             file_name: row.get(7)?,
+            source_node: row.get(8)?,
         })
     })?;
 
@@ -103,7 +106,8 @@ pub fn day_detections(
 ) -> Result<Vec<DayDetectionGroup>, rusqlite::Error> {
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name \
+        "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+         COALESCE(Source_Node, '') \
          FROM detections WHERE Date = ?1 ORDER BY Sci_Name, Time DESC",
     )?;
 
@@ -118,6 +122,7 @@ pub fn day_detections(
                 date: row.get(5)?,
                 time: row.get(6)?,
                 file_name: row.get(7)?,
+                source_node: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

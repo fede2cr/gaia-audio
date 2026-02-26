@@ -147,7 +147,7 @@ pub fn poll_and_process(
 
                 // ── process ──────────────────────────────────────────
                 if let Err(e) =
-                    analysis::process_file(&local_path, models, config, report_tx)
+                    analysis::process_file(&local_path, models, config, report_tx, base_url)
                 {
                     error!("Error processing {}: {e:#}", rec.filename);
                 }

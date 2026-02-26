@@ -9,8 +9,7 @@
 //! even for multi-GB archives.
 
 use std::collections::HashSet;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{params, Connection};
 
@@ -464,7 +463,8 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             Week       INT,
             Sens       FLOAT,
             Overlap    FLOAT,
-            File_Name  VARCHAR(100) NOT NULL
+            File_Name  VARCHAR(100) NOT NULL,
+            Source_Node VARCHAR(200) NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
@@ -472,6 +472,11 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);",
     )
     .map_err(|e| format!("Schema error: {e}"))?;
+
+    // Migration: add Source_Node to existing databases that lack it.
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
+    );
 
     Ok(())
 }

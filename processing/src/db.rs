@@ -34,7 +34,8 @@ pub fn initialize(db_path: &Path) -> Result<()> {
             Week       INT,
             Sens       FLOAT,
             Overlap    FLOAT,
-            File_Name  VARCHAR(100) NOT NULL
+            File_Name  VARCHAR(100) NOT NULL,
+            Source_Node VARCHAR(200) NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
@@ -44,8 +45,20 @@ pub fn initialize(db_path: &Path) -> Result<()> {
     )
     .context("Failed to create detections table")?;
 
+    // Migration: add Source_Node to existing databases that lack it.
+    migrate_add_source_node(&conn);
+
     info!("Database schema verified");
     Ok(())
+}
+
+/// Add the `Source_Node` column if it doesn't exist (idempotent).
+fn migrate_add_source_node(conn: &Connection) {
+    // SQLite's ALTER TABLE ADD COLUMN is a no-op if the column already exists
+    // — except it returns an error. We simply ignore that.
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
+    );
 }
 
 /// Insert a single detection row.
@@ -58,10 +71,11 @@ pub fn insert_detection(
     sensitivity: f64,
     overlap: f64,
     file_name: &str,
+    source_node: &str,
 ) -> Result<()> {
     for attempt in 0..3 {
         match try_insert(
-            db_path, detection, lat, lon, cutoff, sensitivity, overlap, file_name,
+            db_path, detection, lat, lon, cutoff, sensitivity, overlap, file_name, source_node,
         ) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -82,10 +96,13 @@ fn try_insert(
     sensitivity: f64,
     overlap: f64,
     file_name: &str,
+    source_node: &str,
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute(
-        "INSERT INTO detections VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
+         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             d.date,
             d.time,
@@ -100,6 +117,7 @@ fn try_insert(
             sensitivity,
             overlap,
             file_name,
+            source_node,
         ],
     )?;
     Ok(())

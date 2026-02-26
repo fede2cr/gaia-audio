@@ -21,6 +21,7 @@ pub fn process_file(
     models: &[LoadedModel],
     config: &Config,
     report_tx: &std::sync::mpsc::SyncSender<ReportPayload>,
+    source_node: &str,
 ) -> Result<()> {
     // Skip empty files
     let meta = std::fs::metadata(file_path)?;
@@ -45,6 +46,7 @@ pub fn process_file(
         .send(ReportPayload {
             file,
             detections: all_detections,
+            source_node: source_node.to_string(),
         })
         .map_err(|_| anyhow::anyhow!("Reporting channel closed"))?;
 

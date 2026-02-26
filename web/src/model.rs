@@ -15,6 +15,7 @@ pub struct WebDetection {
     pub date: String,
     pub time: String,
     pub file_name: String,
+    pub source_node: String,
 }
 
 impl WebDetection {
@@ -33,6 +34,26 @@ impl WebDetection {
             "/extracted/By_Date/{}/{}/{}",
             self.date, safe_name, self.file_name
         ))
+    }
+
+    /// URL to the spectrogram PNG (generated alongside the audio clip).
+    pub fn spectrogram_url(&self) -> Option<String> {
+        self.clip_url().map(|url| format!("{url}.png"))
+    }
+
+    /// Human-friendly label for the capture node.
+    ///
+    /// Strips the `http://` prefix and trailing port to show just the
+    /// hostname or IP.  Returns `"local"` when no node was recorded.
+    pub fn source_label(&self) -> String {
+        if self.source_node.is_empty() {
+            return "local".to_string();
+        }
+        self.source_node
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .to_string()
     }
 }
 

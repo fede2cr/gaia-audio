@@ -76,6 +76,7 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
             config.sensitivity,
             config.overlap,
             &basename,
+            &payload.source_node,
         ) {
             error!("DB insert failed: {e}");
         }

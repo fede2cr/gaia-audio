@@ -50,6 +50,7 @@ pub fn Home() -> impl IntoView {
 
     // Auto-refresh: poll every 4 seconds for new detections
     let (feed, set_feed) = create_signal::<Vec<WebDetection>>(vec![]);
+    #[allow(unused_variables)] // read only in the hydrate (WASM) build
     let (max_rowid, set_max_rowid) = create_signal::<Option<i64>>(None);
 
     // When initial data loads, populate the feed

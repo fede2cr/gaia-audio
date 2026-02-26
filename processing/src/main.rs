@@ -26,6 +26,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub struct ReportPayload {
     pub file: ParsedFileName,
     pub detections: Vec<Detection>,
+    pub source_node: String,
 }
 
 fn main() -> Result<()> {
