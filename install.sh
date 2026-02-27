@@ -199,7 +199,7 @@ else
 services:
   # ── Audio capture ───────────────────────────────────────────────────
   capture:
-    image: ${REGISTRY}/gaia-capture
+    image: ${REGISTRY}/gaia-audio-capture
     pull_policy: always
     restart: unless-stopped
     network_mode: host
@@ -214,7 +214,7 @@ services:
 
   # ── Model inference & analysis ──────────────────────────────────────
   processing:
-    image: ${REGISTRY}/gaia-processing
+    image: ${REGISTRY}/gaia-audio-processing
     pull_policy: always
     restart: unless-stopped
     network_mode: host
@@ -225,7 +225,7 @@ services:
 
   # ── Web dashboard ──────────────────────────────────────────────────
   web:
-    image: ${REGISTRY}/gaia-web
+    image: ${REGISTRY}/gaia-audio-web
     pull_policy: always
     restart: unless-stopped
     network_mode: host

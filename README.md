@@ -211,13 +211,13 @@ cd web && cargo leptos build --release
 
 ```bash
 # Build capture image
-podman build -f capture/Containerfile -t fede2/gaia-capture .
+podman build -f capture/Containerfile -t fede2/gaia-audio-capture .
 
 # Build processing image
-podman build -f processing/Containerfile -t fede2/gaia-processing .
+podman build -f processing/Containerfile -t fede2/gaia-audio-processing .
 
 # Build web dashboard image
-podman build -f web/Containerfile -t fede2/gaia-web .
+podman build -f web/Containerfile -t fede2/gaia-audio-web .
 ```
 
 ## Converting Models to ONNX
@@ -299,7 +299,7 @@ gaia/
 services:
   # ── Audio capture ───────────────────────────────────────────────────
   capture:
-    image: fede2/gaia-capture
+    image: fede2/gaia-audio-capture
     restart: unless-stopped
     network_mode: host
     devices:
@@ -313,7 +313,7 @@ services:
 
   # ── Model inference & analysis ──────────────────────────────────────
   processing:
-    image: fede2/gaia-processing
+    image: fede2/gaia-audio-processing
     restart: unless-stopped
     network_mode: host
     volumes:
@@ -323,7 +323,7 @@ services:
 
   # ── Web dashboard ──────────────────────────────────────────────────
   web:
-    image: fede2/gaia-web
+    image: fede2/gaia-audio-web
     restart: unless-stopped
     network_mode: host
     volumes:

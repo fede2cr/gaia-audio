@@ -10,7 +10,7 @@ on:
 env:
   REGISTRY: docker.io
   # Override via GitHub repo settings → Secrets
-  IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia
+  IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
 
 jobs:
   build:
