@@ -31,12 +31,12 @@ pub enum ServiceRole {
 
 impl ServiceRole {
     /// mDNS service-type string including domain, e.g.
-    /// `_gaia-capture._tcp.local.`
+    /// `_gaia-audio-capture._tcp.local.`
     pub fn service_type(&self) -> &'static str {
         match self {
-            Self::Capture => "_gaia-capture._tcp.local.",
-            Self::Processing => "_gaia-processing._tcp.local.",
-            Self::Web => "_gaia-web._tcp.local.",
+            Self::Capture => "_gaia-audio-capture._tcp.local.",
+            Self::Processing => "_gaia-audio-processing._tcp.local.",
+            Self::Web => "_gaia-audio-web._tcp.local.",
         }
     }
 
