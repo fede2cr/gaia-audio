@@ -32,7 +32,7 @@ const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// Blocks until `shutdown` is set.
 pub fn poll_and_process(
-    models: &[LoadedModel],
+    models: &mut [LoadedModel],
     config: &Config,
     discovery: Option<&DiscoveryHandle>,
     report_tx: &SyncSender<ReportPayload>,

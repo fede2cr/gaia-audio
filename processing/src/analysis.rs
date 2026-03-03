@@ -19,7 +19,7 @@ use crate::ReportPayload;
 /// Process a single WAV file through all loaded models.
 pub fn process_file(
     file_path: &Path,
-    models: &[LoadedModel],
+    models: &mut [LoadedModel],
     config: &Config,
     report_tx: &std::sync::mpsc::SyncSender<ReportPayload>,
     source_node: &str,
@@ -40,7 +40,7 @@ pub fn process_file(
     // Collect the top raw predictions across models for the live feed.
     let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
-    for model in models {
+    for model in models.iter_mut() {
         let (detections, top_preds) = run_analysis(&file, model, config)?;
         all_detections.extend(detections);
         live_predictions.extend(top_preds);
@@ -86,10 +86,10 @@ pub fn process_file(
 /// Returns the confident detections and the top raw predictions (for live feed).
 fn run_analysis(
     file: &ParsedFileName,
-    model: &LoadedModel,
+    model: &mut LoadedModel,
     config: &Config,
 ) -> Result<(Vec<Detection>, Vec<LivePrediction>)> {
-    let domain = model.domain();
+    let domain = model.domain().to_string();
 
     // ── custom species lists ─────────────────────────────────────────
     let base = std::env::var("GAIA_DIR").unwrap_or_else(|_| "/app".to_string());
@@ -121,8 +121,22 @@ fn run_analysis(
 
     // ── run inference on each chunk ──────────────────────────────────
     let mut raw_detections: Vec<Vec<Prediction>> = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
+    for (i, chunk) in chunks.iter().enumerate() {
         let preds = model.predict(chunk, config.latitude, config.longitude, file.week())?;
+        // Log top-3 raw scores so operators can tell whether the model
+        // produces meaningful output.
+        if let Some(top) = preds.first() {
+            let top3: Vec<String> = preds.iter().take(3)
+                .map(|(name, conf)| format!("{name}={conf:.4}"))
+                .collect();
+            debug!("[{domain}] chunk {i}: top raw = [{}]", top3.join(", "));
+            if top.1 >= config.confidence {
+                info!(
+                    "[{domain}] chunk {i}: {} ({:.1}%) ≥ threshold {:.0}%",
+                    top.0, top.1 * 100.0, config.confidence * 100.0
+                );
+            }
+        }
         raw_detections.push(preds);
     }
 
@@ -142,8 +156,27 @@ fn run_analysis(
         pred_start = pred_end - config.overlap;
     }
 
+    // ── species-range model (location-based filtering) ──────────────
+    let predicted_species_list = model.get_species_list(
+        config.latitude,
+        config.longitude,
+        file.week(),
+    );
+    if !predicted_species_list.is_empty() {
+        info!(
+            "[{domain}] Species range model: {} species expected at ({}, {}) week {}",
+            predicted_species_list.len(),
+            config.latitude,
+            config.longitude,
+            file.week(),
+        );
+    } else if config.latitude != -1.0 && config.longitude != -1.0 {
+        info!(
+            "[{domain}] No species-range model loaded — accepting all species"
+        );
+    }
+
     // ── apply confidence threshold + species filters ─────────────────
-    let predicted_species_list: Vec<String> = vec![];
 
     let mut confident_detections = Vec::new();
     for (start, end, entries) in &labeled {
@@ -181,7 +214,7 @@ fn run_analysis(
             }
 
             let det = Detection::new(
-                domain,
+                &domain,
                 file.file_date,
                 *start,
                 *end,

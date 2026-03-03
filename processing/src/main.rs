@@ -159,7 +159,7 @@ fn main() -> Result<()> {
 
     // ── poll capture server(s) and process files ─────────────────────
     if let Err(e) = client::poll_and_process(
-        &models,
+        &mut models,
         &config,
         discovery.as_ref(),
         &report_tx,
