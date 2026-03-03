@@ -3,6 +3,7 @@
 use leptos::*;
 
 use crate::components::detection_card::DetectionCard;
+use crate::components::live_analysis::LiveAnalysis;
 use crate::components::species_card::SpeciesCard;
 use crate::model::{SpeciesSummary, WebDetection};
 
@@ -93,6 +94,7 @@ pub fn Home() -> impl IntoView {
     view! {
         <div class="home-page">
             <section class="live-feed">
+                <LiveAnalysis/>
                 <h1>"Live Detections"</h1>
                 <div class="feed-list">
                     <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>

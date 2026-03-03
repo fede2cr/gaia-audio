@@ -79,6 +79,13 @@ async fn main() {
             "/extracted",
             ServeDir::new(&extracted_serve_path),
         )
+        // Serve live analysis spectrogram from the shared data volume
+        .nest_service(
+            "/live",
+            ServeDir::new(
+                std::env::var("GAIA_DATA_DIR").unwrap_or_else(|_| "/data".into()),
+            ),
+        )
         .fallback(fallback_handler)
         .with_state(leptos_options);
 

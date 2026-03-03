@@ -5,6 +5,7 @@ mod analysis;
 mod client;
 mod db;
 mod download;
+mod live_status;
 mod manifest;
 mod mel;
 mod model;

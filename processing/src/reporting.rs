@@ -26,16 +26,14 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
 
         // Notify capture server to delete the source file (if local)
         // or delete it ourselves if running mono-node.
+        // When running in split mode (capture ↔ processing), the client
+        // has already deleted the recording from the remote capture
+        // server after processing, so we only clean up local files here.
         let src = &payload.file.file_path;
         if src.exists() {
             if let Err(e) = std::fs::remove_file(src) {
                 warn!("Cannot remove source file {}: {e}", src.display());
             }
-        } else {
-            // File was fetched from capture server and already cleaned up
-            // by the client after processing. Attempt to ask capture server
-            // to delete it.
-            delete_from_capture(config, src);
         }
     }
     info!("Reporting thread finished");
@@ -300,34 +298,6 @@ fn heartbeat(config: &Config) {
         match reqwest::blocking::get(url) {
             Ok(r) => info!("Heartbeat: {}", r.status()),
             Err(e) => error!("Heartbeat failed: {e}"),
-        }
-    }
-}
-
-// ── capture server cleanup ───────────────────────────────────────────────
-
-fn delete_from_capture(config: &Config, file_path: &Path) {
-    let filename = file_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let url = format!(
-        "{}/api/recordings/{}",
-        config.capture_server_url, filename
-    );
-    match reqwest::blocking::Client::new()
-        .delete(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-    {
-        Ok(r) if r.status().is_success() => {
-            info!("Deleted {filename} from capture server");
-        }
-        Ok(r) => {
-            warn!("Capture server DELETE {filename}: {}", r.status());
-        }
-        Err(e) => {
-            warn!("Cannot reach capture server for DELETE {filename}: {e}");
         }
     }
 }

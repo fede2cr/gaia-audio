@@ -12,6 +12,7 @@ use gaia_common::audio;
 use gaia_common::config::Config;
 use gaia_common::detection::{Detection, ParsedFileName};
 
+use crate::live_status::{self, LivePrediction};
 use crate::model::{self, LoadedModel, Prediction};
 use crate::ReportPayload;
 
@@ -36,10 +37,37 @@ pub fn process_file(
         .with_context(|| format!("Cannot parse filename: {}", file_path.display()))?;
 
     let mut all_detections = Vec::new();
+    // Collect the top raw predictions across models for the live feed.
+    let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
     for model in models {
-        let detections = run_analysis(&file, model, config)?;
+        let (detections, top_preds) = run_analysis(&file, model, config)?;
         all_detections.extend(detections);
+        live_predictions.extend(top_preds);
+    }
+
+    // ── Update live analysis status ──────────────────────────────────
+    // Read a short chunk of audio at 24 kHz for the live spectrogram.
+    {
+        let live_sr = 24_000u32;
+        match gaia_common::audio::read_audio(file_path, live_sr, 3.0, 0.0) {
+            Ok(chunks) => {
+                let samples: Vec<f32> = chunks.into_iter().flatten().collect();
+                // Keep only the top 5 predictions by confidence.
+                live_predictions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+                live_predictions.truncate(5);
+                live_status::update(
+                    &file.file_path.file_name().unwrap_or_default().to_string_lossy(),
+                    &samples,
+                    live_sr,
+                    live_predictions,
+                    config.confidence,
+                );
+            }
+            Err(e) => {
+                warn!("Cannot read audio for live spectrogram: {e:#}");
+            }
+        }
     }
 
     report_tx
@@ -54,11 +82,13 @@ pub fn process_file(
 }
 
 /// Core analysis logic for a single model.
+///
+/// Returns the confident detections and the top raw predictions (for live feed).
 fn run_analysis(
     file: &ParsedFileName,
     model: &LoadedModel,
     config: &Config,
-) -> Result<Vec<Detection>> {
+) -> Result<(Vec<Detection>, Vec<LivePrediction>)> {
     let domain = model.domain();
 
     // ── custom species lists ─────────────────────────────────────────
@@ -85,7 +115,7 @@ fn run_analysis(
         Ok(c) => c,
         Err(e) => {
             tracing::error!("[{domain}] Error reading audio: {e}");
-            return Ok(vec![]);
+            return Ok((vec![], vec![]));
         }
     };
 
@@ -168,7 +198,25 @@ fn run_analysis(
         file.file_path.display(),
         confident_detections.len()
     );
-    Ok(confident_detections)
+
+    // Collect top raw predictions for the live feed (all chunks, top
+    // entry per chunk regardless of confidence threshold).
+    let mut top_preds: Vec<LivePrediction> = Vec::new();
+    for (_start, _end, entries) in &labeled {
+        if let Some((sci_name, confidence)) = entries.first() {
+            let com_name = names
+                .get(sci_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| sci_name.clone());
+            top_preds.push(LivePrediction {
+                scientific_name: sci_name.clone(),
+                common_name: com_name,
+                confidence: *confidence,
+            });
+        }
+    }
+
+    Ok((confident_detections, top_preds))
 }
 
 // ── privacy filter ───────────────────────────────────────────────────────

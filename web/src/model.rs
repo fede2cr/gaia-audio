@@ -144,3 +144,23 @@ pub struct ImportResult {
     pub skipped_existing: u64,
     pub errors: Vec<String>,
 }
+
+// ─── Live analysis status ────────────────────────────────────────────────────
+
+/// Snapshot of what the processing server is currently analysing.
+/// Read from `/data/live_status.json` written by the processing container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveStatus {
+    pub timestamp: String,
+    pub filename: String,
+    pub predictions: Vec<LivePrediction>,
+    pub has_detections: bool,
+}
+
+/// One prediction entry in the live status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePrediction {
+    pub scientific_name: String,
+    pub common_name: String,
+    pub confidence: f64,
+}

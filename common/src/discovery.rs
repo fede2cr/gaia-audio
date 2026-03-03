@@ -8,7 +8,7 @@
 //! removing the need for hard-coded URLs or DNS when running containers on
 //! different hardware.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -124,7 +124,9 @@ impl DiscoveryHandle {
         };
 
         debug!("mDNS: browsing for {} (timeout={}s)", role.service_type(), timeout.as_secs());
-        let mut peers = Vec::new();
+        // Collect by instance name so multiple ServiceResolved events
+        // (one per interface / address family) are merged into a single peer.
+        let mut peer_map: HashMap<String, Peer> = HashMap::new();
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -143,12 +145,20 @@ impl DiscoveryHandle {
                     let addrs: Vec<IpAddr> =
                         info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
                     let port = info.get_port();
-                    info!("mDNS: discovered peer {} at {:?}:{}", name, addrs, port);
-                    peers.push(Peer {
-                        instance_name: extract_instance_name(&name),
-                        addresses: addrs,
+                    let instance = extract_instance_name(&name);
+
+                    let peer = peer_map.entry(instance.clone()).or_insert_with(|| Peer {
+                        instance_name: instance,
+                        addresses: Vec::new(),
                         port,
                     });
+                    // Merge addresses, avoiding duplicates.
+                    for addr in addrs {
+                        if !peer.addresses.contains(&addr) {
+                            peer.addresses.push(addr);
+                        }
+                    }
+                    debug!("mDNS: resolved {} – addrs now {:?}", name, peer.addresses);
                 }
                 Ok(event) => {
                     debug!("mDNS: event {:?}", format_event(&event));
@@ -158,8 +168,13 @@ impl DiscoveryHandle {
         }
 
         let _ = self.daemon.stop_browse(role.service_type());
-        if peers.is_empty() {
+        if peer_map.is_empty() {
             debug!("mDNS: browse completed, no peers found for {}", role.service_type());
+        }
+
+        let peers: Vec<Peer> = peer_map.into_values().collect();
+        for p in &peers {
+            info!("mDNS: peer {} at {:?}:{}", p.instance_name, p.addresses, p.port);
         }
         peers
     }

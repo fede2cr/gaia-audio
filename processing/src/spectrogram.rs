@@ -141,6 +141,93 @@ pub fn generate(
     Ok(())
 }
 
+/// Generate a spectrogram as an in-memory PNG buffer (no disk write).
+///
+/// Used by the live-analysis feature to produce a spectrogram of the
+/// currently-analysed chunk without touching the filesystem.
+pub fn generate_to_png_buffer(
+    samples: &[f32],
+    sample_rate: u32,
+    params: &SpectrogramParams,
+) -> Result<Vec<u8>> {
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    use std::io::Cursor;
+
+    let fft_size = params.fft_size;
+    let hop = params.hop_size;
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(fft_size);
+
+    let n_frames = if samples.len() > fft_size {
+        (samples.len() - fft_size) / hop + 1
+    } else {
+        1
+    };
+
+    let n_bins = fft_size / 2 + 1;
+    let max_bin = if params.max_freq > 0.0 {
+        ((params.max_freq / sample_rate as f64) * fft_size as f64)
+            .ceil() as usize
+            + 1
+    } else {
+        n_bins
+    }
+    .min(n_bins);
+
+    let hann = hann_window(fft_size);
+    let mut magnitude = vec![vec![0.0f32; max_bin]; n_frames];
+
+    for (frame_idx, frame_start) in (0..samples.len().saturating_sub(fft_size))
+        .step_by(hop)
+        .enumerate()
+    {
+        if frame_idx >= n_frames {
+            break;
+        }
+        let mut buf: Vec<Complex<f32>> = samples[frame_start..frame_start + fft_size]
+            .iter()
+            .zip(hann.iter())
+            .map(|(&s, &w)| Complex::new(s * w, 0.0))
+            .collect();
+        fft.process(&mut buf);
+        for (bin, val) in buf.iter().take(max_bin).enumerate() {
+            let mag = (val.re * val.re + val.im * val.im).sqrt();
+            magnitude[frame_idx][bin] = 20.0 * (mag + 1e-10).log10();
+        }
+    }
+
+    // Normalise
+    let global_min = magnitude.iter().flat_map(|r| r.iter()).cloned().fold(f32::INFINITY, f32::min);
+    let global_max = magnitude.iter().flat_map(|r| r.iter()).cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = (global_max - global_min).max(1e-6);
+    for row in &mut magnitude {
+        for val in row.iter_mut() {
+            *val = (*val - global_min) / range;
+        }
+    }
+
+    let img_w = params.width;
+    let img_h = params.height;
+    let mut img = ImageBuffer::<Rgb<u8>, _>::new(img_w, img_h);
+    for x in 0..img_w {
+        let src_frame = (x as f64 / img_w as f64 * n_frames as f64) as usize;
+        let src_frame = src_frame.min(n_frames.saturating_sub(1));
+        for y in 0..img_h {
+            let bin = ((img_h - 1 - y) as f64 / img_h as f64 * max_bin as f64) as usize;
+            let bin = bin.min(max_bin.saturating_sub(1));
+            img.put_pixel(x, y, colormap(magnitude[src_frame][bin]));
+        }
+    }
+
+    let mut cursor = Cursor::new(Vec::new());
+    PngEncoder::new(&mut cursor)
+        .write_image(img.as_raw(), img_w, img_h, image::ExtendedColorType::Rgb8)
+        .context("PNG encode")?;
+    Ok(cursor.into_inner())
+}
+
 /// Generate a spectrogram directly from a WAV file.
 pub fn generate_from_wav(
     wav_path: &Path,

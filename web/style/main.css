@@ -118,6 +118,137 @@ button {
     gap: .5rem;
 }
 
+/* ── Live Analysis Panel ────────────────────────────────────────────────── */
+
+.live-analysis {
+    margin-bottom: 1.25rem;
+}
+.live-analysis h2 {
+    margin-bottom: .75rem;
+    font-size: 1.1rem;
+    letter-spacing: .02em;
+}
+
+.live-analysis-empty {
+    padding: 1.5rem;
+    text-align: center;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+.live-analysis-card {
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.live-spectrogram {
+    position: relative;
+    width: 100%;
+    background: #111;
+}
+.live-spectrogram img {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 200px;
+    object-fit: cover;
+}
+
+.live-badge {
+    position: absolute;
+    top: .5rem;
+    right: .5rem;
+    padding: .2rem .65rem;
+    border-radius: 999px;
+    font-size: .75rem;
+    font-weight: 600;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+}
+.live-badge.detection {
+    background: var(--accent, #22c55e);
+    color: #fff;
+    animation: pulse-badge 1.5s ease-in-out infinite;
+}
+.live-badge.listening {
+    background: rgba(255,255,255,.15);
+    color: var(--text-muted, #999);
+    backdrop-filter: blur(4px);
+}
+
+@keyframes pulse-badge {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: .6; }
+}
+
+.live-details {
+    padding: .75rem 1rem;
+}
+
+.live-filename {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    font-size: .82rem;
+    color: var(--text-muted);
+    margin-bottom: .5rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.icon-mic { flex-shrink: 0; color: var(--text-muted); }
+
+/* ── Prediction bars ──────────── */
+
+.prediction-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+}
+
+.prediction-item {
+    display: grid;
+    grid-template-columns: minmax(80px, 1fr) 3fr 40px;
+    gap: .5rem;
+    align-items: center;
+    font-size: .82rem;
+}
+
+.pred-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text);
+}
+
+.pred-bar-track {
+    height: 6px;
+    background: var(--bg-elevated, #1a1a2e);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.pred-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width .3s ease;
+}
+.pred-bar.high   { background: var(--accent, #22c55e); }
+.pred-bar.medium { background: #eab308; }
+.pred-bar.low    { background: #64748b; }
+
+.pred-confidence {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    font-size: .78rem;
+}
+
 /* ── Detection Card ─────────────────────────────────────────────────────── */
 
 .detection-card {
