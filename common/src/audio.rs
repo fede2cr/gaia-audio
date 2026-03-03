@@ -4,6 +4,8 @@
 //! Provides WAV I/O, mono conversion, rubato-based resampling, overlapping
 //! chunking, and clip extraction.
 
+use std::io::Cursor;
+
 use anyhow::{Context, Result};
 use rubato::{FftFixedIn, Resampler};
 use tracing::{debug, info};
@@ -18,8 +20,13 @@ pub fn read_audio(
 ) -> Result<Vec<Vec<f32>>> {
     info!("Reading audio: {}", path.display());
 
-    let reader =
-        hound::WavReader::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    let mut raw = std::fs::read(path)
+        .with_context(|| format!("Cannot read {}", path.display()))?;
+    if fix_wav_data_chunk(&mut raw) {
+        debug!("Fixed WAV data-chunk alignment for {}", path.display());
+    }
+    let reader = hound::WavReader::new(Cursor::new(raw))
+        .with_context(|| format!("Cannot parse WAV: {}", path.display()))?;
     let spec = reader.spec();
     let native_sr = spec.sample_rate;
     let n_channels = spec.channels as usize;
@@ -145,8 +152,11 @@ pub fn extract_clip(
     start_sec: f64,
     stop_sec: f64,
 ) -> Result<()> {
-    let reader = hound::WavReader::open(in_path)
-        .with_context(|| format!("Cannot open {}", in_path.display()))?;
+    let mut raw = std::fs::read(in_path)
+        .with_context(|| format!("Cannot read {}", in_path.display()))?;
+    fix_wav_data_chunk(&mut raw);
+    let reader = hound::WavReader::new(Cursor::new(raw))
+        .with_context(|| format!("Cannot parse WAV: {}", in_path.display()))?;
     let spec = reader.spec();
     let sr = spec.sample_rate as f64;
     let ch = spec.channels as usize;
@@ -183,6 +193,68 @@ pub fn extract_clip(
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// Fix a WAV file whose data-chunk size is not a multiple of the sample
+/// frame size.  This is common with ffmpeg's `-f segment` muxer which may
+/// not perfectly finalize the RIFF/WAV header.
+///
+/// Modifies the bytes in place and returns `true` if a fixup was applied.
+fn fix_wav_data_chunk(raw: &mut [u8]) -> bool {
+    // Minimal RIFF/WAV: 12-byte RIFF header + at least one chunk.
+    if raw.len() < 12 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
+        return false;
+    }
+
+    // First pass: find "fmt " to read block_align.
+    let mut pos = 12usize;
+    let mut block_align: Option<u16> = None;
+    while pos + 8 <= raw.len() {
+        let chunk_size =
+            u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]])
+                as usize;
+        if &raw[pos..pos + 4] == b"fmt " && chunk_size >= 16 && pos + 8 + chunk_size <= raw.len()
+        {
+            // block_align sits at offset 12 inside the fmt payload.
+            block_align = Some(u16::from_le_bytes([
+                raw[pos + 8 + 12],
+                raw[pos + 8 + 13],
+            ]));
+            break;
+        }
+        pos += 8 + chunk_size;
+        if chunk_size % 2 != 0 {
+            pos += 1; // RIFF chunks are word-aligned
+        }
+    }
+
+    let ba = match block_align {
+        Some(ba) if ba > 0 => ba as usize,
+        _ => return false,
+    };
+
+    // Second pass: find "data" chunk and fix its size.
+    pos = 12;
+    while pos + 8 <= raw.len() {
+        let chunk_size =
+            u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]])
+                as usize;
+        if &raw[pos..pos + 4] == b"data" {
+            let remainder = chunk_size % ba;
+            if remainder != 0 {
+                let fixed = (chunk_size - remainder) as u32;
+                raw[pos + 4..pos + 8].copy_from_slice(&fixed.to_le_bytes());
+                return true;
+            }
+            return false; // already aligned
+        }
+        pos += 8 + chunk_size;
+        if chunk_size % 2 != 0 {
+            pos += 1;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
