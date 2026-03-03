@@ -47,41 +47,10 @@ async fn main() {
     );
     let extracted_serve_path = extracted_dir.to_string_lossy().to_string();
 
-    // Station coordinates – used to resolve the iNaturalist place for
-    // establishment means (introduced / native).  Same LATITUDE/LONGITUDE
-    // env vars the processing server reads.
-    let latitude: f64 = std::env::var("LATITUDE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(-1.0);
-    let longitude: f64 = std::env::var("LONGITUDE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(-1.0);
-
-    let place_id_cache = inaturalist::new_place_cache();
-
-    // Eagerly resolve the iNaturalist place_id for the configured coords
-    // so the first species lookup already includes establishment means.
-    if latitude >= -90.0 && latitude <= 90.0 {
-        let pid = inaturalist::resolve_place_id(&place_id_cache, latitude, longitude).await;
-        tracing::info!(
-            "iNaturalist place resolved: lat={latitude}, lon={longitude} → place_id={pid:?}"
-        );
-    } else {
-        tracing::warn!(
-            "LATITUDE/LONGITUDE not set or invalid ({latitude}, {longitude}) – \
-             introduced-species detection disabled"
-        );
-    }
-
     let state = AppState {
         db_path,
         extracted_dir,
         photo_cache: inaturalist::new_cache(),
-        place_id_cache,
-        latitude,
-        longitude,
         leptos_options: leptos_options.clone(),
     };
 

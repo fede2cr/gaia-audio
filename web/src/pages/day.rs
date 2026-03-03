@@ -18,20 +18,12 @@ pub async fn get_day_detections(
     let mut groups = db::day_detections(&state.db_path, &date)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
-    let place_id = inaturalist::resolve_place_id(
-        &state.place_id_cache,
-        state.latitude,
-        state.longitude,
-    ).await;
-
-    // Enrich with images + status
+    // Enrich with images
     for g in groups.iter_mut() {
         if let Some(photo) =
-            inaturalist::lookup(&state.photo_cache, &g.scientific_name, place_id).await
+            inaturalist::lookup(&state.photo_cache, &g.scientific_name).await
         {
             g.image_url = Some(photo.medium_url);
-            g.conservation_status = photo.conservation_status;
-            g.is_introduced = photo.is_introduced;
         }
     }
     Ok(groups)
@@ -92,22 +84,6 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
         group.scientific_name.replace(' ', "%20")
     );
 
-    // Conservation status badge – hidden when Least Concern or absent
-    let conservation_badge = group
-        .conservation_status
-        .as_deref()
-        .filter(|s| *s != "LC")
-        .map(|code| {
-            let css_class = conservation_css_class(code);
-            let label = conservation_short_label(code);
-            view! { <span class={format!("conservation-badge {css_class}")}>{label}</span> }
-        });
-
-    let introduced_badge = group
-        .is_introduced
-        .filter(|&b| b)
-        .map(|_| view! { <span class="introduced-badge">"Introduced"</span> });
-
     view! {
         <div class="day-group">
             <div class="day-group-header">
@@ -118,8 +94,6 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                         " ("{&group.scientific_name}")"
                     </a>
                     <span class="domain-badge">{&group.domain}</span>
-                    {conservation_badge}
-                    {introduced_badge}
                     <span class="confidence">"Best: " {conf}</span>
                     <span class="detection-count">{group.detections.len()}" detections"</span>
                 </div>
@@ -134,32 +108,5 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                 />
             </div>
         </div>
-    }
-}
-
-/// Map IUCN status code to a CSS modifier class.
-fn conservation_css_class(code: &str) -> &'static str {
-    match code {
-        "EX" | "EW" => "extinct",
-        "CR" => "critical",
-        "EN" => "endangered",
-        "VU" => "vulnerable",
-        "NT" => "near-threatened",
-        "DD" => "data-deficient",
-        _ => "unknown",
-    }
-}
-
-/// Short human-readable label for the IUCN code.
-fn conservation_short_label(code: &str) -> &'static str {
-    match code {
-        "EX" => "Extinct",
-        "EW" => "Extinct in Wild",
-        "CR" => "Critically Endangered",
-        "EN" => "Endangered",
-        "VU" => "Vulnerable",
-        "NT" => "Near Threatened",
-        "DD" => "Data Deficient",
-        _ => "At Risk",
     }
 }

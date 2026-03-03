@@ -31,14 +31,12 @@ pub enum ServiceRole {
 
 impl ServiceRole {
     /// mDNS service-type string including domain, e.g.
-    /// `_gaia-aud-cap._tcp.local.`
-    ///
-    /// DNS-SD service names must be ≤ 15 characters (RFC 6763 §7.2).
+    /// `_gaia-audio-capture._tcp.local.`
     pub fn service_type(&self) -> &'static str {
         match self {
-            Self::Capture => "_gaia-aud-cap._tcp.local.",
-            Self::Processing => "_gaia-aud-proc._tcp.local.",
-            Self::Web => "_gaia-aud-web._tcp.local.",
+            Self::Capture => "_gaia-audio-capture._tcp.local.",
+            Self::Processing => "_gaia-audio-processing._tcp.local.",
+            Self::Web => "_gaia-audio-web._tcp.local.",
         }
     }
 
@@ -214,27 +212,11 @@ pub fn register(role: ServiceRole, port: u16) -> Result<DiscoveryHandle> {
     let instance_name = format!("{}-{:02}", role.prefix(), our_number);
     let host = format!("{}.local.", instance_name);
 
-    // Explicitly gather non-loopback IP addresses.  Inside a container
-    // the mdns-sd auto-detect ("") often returns an empty set, which
-    // makes the service invisible to peers like avahi-browse.
-    let my_addrs: Vec<std::net::IpAddr> = if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|iface| !iface.is_loopback())
-        .map(|iface| iface.ip())
-        .collect();
-
-    let addr_str = my_addrs
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
     let service_info = ServiceInfo::new(
         role.service_type(),
         &instance_name,
         &host,
-        addr_str.as_str(),
+        "",   // auto-detect addresses
         port,
         None, // no TXT properties
     )
@@ -310,15 +292,15 @@ mod tests {
     #[test]
     fn test_parse_instance_number() {
         assert_eq!(
-            parse_instance_number("capture-01._gaia-aud-cap._tcp.local.", "capture"),
+            parse_instance_number("capture-01._gaia-capture._tcp.local.", "capture"),
             Some(1)
         );
         assert_eq!(
-            parse_instance_number("processing-12._gaia-aud-proc._tcp.local.", "processing"),
+            parse_instance_number("processing-12._gaia-processing._tcp.local.", "processing"),
             Some(12)
         );
         assert_eq!(
-            parse_instance_number("web-01._gaia-aud-web._tcp.local.", "capture"),
+            parse_instance_number("web-01._gaia-web._tcp.local.", "capture"),
             None
         );
         assert_eq!(
@@ -342,7 +324,7 @@ mod tests {
     #[test]
     fn test_extract_instance_name() {
         assert_eq!(
-            extract_instance_name("capture-01._gaia-aud-cap._tcp.local."),
+            extract_instance_name("capture-01._gaia-capture._tcp.local."),
             "capture-01"
         );
     }

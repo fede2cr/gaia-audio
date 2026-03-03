@@ -19,17 +19,9 @@ pub async fn get_species_info(
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     if let Some(ref mut sp) = info {
-        let place_id = inaturalist::resolve_place_id(
-            &state.place_id_cache,
-            state.latitude,
-            state.longitude,
-        ).await;
-        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &scientific_name, place_id).await {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &scientific_name).await {
             sp.image_url = Some(photo.medium_url);
             sp.wikipedia_url = photo.wikipedia_url;
-            sp.conservation_status = photo.conservation_status;
-            sp.conservation_status_name = photo.conservation_status_name;
-            sp.is_introduced = photo.is_introduced;
         }
     }
     Ok(info)
@@ -107,22 +99,6 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
 
     let wiki_link = species.wikipedia_url.clone();
 
-    // Conservation status badge – hidden when Least Concern or absent
-    let conservation_badge = species
-        .conservation_status
-        .as_deref()
-        .filter(|s| *s != "LC")
-        .map(|code| {
-            let css_class = conservation_css_class(code);
-            let label = conservation_label(code);
-            view! { <span class={format!("conservation-badge {css_class}")}>{label}</span> }
-        });
-
-    let introduced_badge = species
-        .is_introduced
-        .filter(|&b| b)
-        .map(|_| view! { <span class="introduced-badge">"Introduced"</span> });
-
     // Current year for the calendar overlay
     let year = {
         #[cfg(feature = "ssr")]
@@ -144,11 +120,7 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                 <div class="species-hero-info">
                     <h1>{&species.common_name}</h1>
                     <p class="species-sci-name">{&species.scientific_name}</p>
-                    <div class="species-badges">
-                        <span class="domain-badge">{&species.domain}</span>
-                        {conservation_badge}
-                        {introduced_badge}
-                    </div>
+                    <span class="domain-badge">{&species.domain}</span>
                     <div class="species-stats-bar">
                         <div class="stat">
                             <span class="stat-value">{species.total_detections}</span>
@@ -200,32 +172,5 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                 </Suspense>
             </section>
         </div>
-    }
-}
-
-/// Map IUCN status code to a CSS modifier class.
-fn conservation_css_class(code: &str) -> &'static str {
-    match code {
-        "EX" | "EW" => "extinct",
-        "CR" => "critical",
-        "EN" => "endangered",
-        "VU" => "vulnerable",
-        "NT" => "near-threatened",
-        "DD" => "data-deficient",
-        _ => "unknown",
-    }
-}
-
-/// Human-readable label for an IUCN status code.
-fn conservation_label(code: &str) -> &'static str {
-    match code {
-        "EX" => "Extinct",
-        "EW" => "Extinct in Wild",
-        "CR" => "Critically Endangered",
-        "EN" => "Endangered",
-        "VU" => "Vulnerable",
-        "NT" => "Near Threatened",
-        "DD" => "Data Deficient",
-        _ => "At Risk",
     }
 }
