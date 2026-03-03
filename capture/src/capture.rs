@@ -138,10 +138,10 @@ fn start_microphone(config: &Config) -> Result<CaptureHandle> {
         "-hide_banner",
         "-loglevel", "error",
         "-nostdin",
-        // ALSA input
+        // ALSA input — use `-channels` (ALSA demuxer option), not `-ac`
         "-f", "alsa",
-        "-ac", &channels,
-        "-ar", "48000",
+        "-channels", &channels,
+        "-sample_rate", "48000",
         "-i", card,
         // Output codec
         "-acodec", "pcm_s16le",
