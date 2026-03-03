@@ -146,6 +146,8 @@ pub fn day_detections(
                 image_url: None, // filled in later by iNaturalist lookup
                 max_confidence: det.confidence,
                 detections: vec![det],
+                conservation_status: None,
+                is_introduced: None,
             });
         }
     }
@@ -176,6 +178,9 @@ pub fn species_info(
             last_seen: row.get(4)?,
             image_url: None,
             wikipedia_url: None,
+            conservation_status: None,
+            conservation_status_name: None,
+            is_introduced: None,
         })
     })?;
 
@@ -224,6 +229,8 @@ pub fn top_species(
             detection_count: row.get(3)?,
             last_seen: row.get(4)?,
             image_url: None,
+            conservation_status: None,
+            is_introduced: None,
         })
     })?;
 

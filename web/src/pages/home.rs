@@ -28,10 +28,19 @@ pub async fn get_top_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFn
     let mut species = db::top_species(&state.db_path, limit)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
-    // Enrich with iNaturalist images
+    // Resolve the iNaturalist place_id (cached after first call)
+    let place_id = inaturalist::resolve_place_id(
+        &state.place_id_cache,
+        state.latitude,
+        state.longitude,
+    ).await;
+
+    // Enrich with iNaturalist images + status
     for sp in species.iter_mut() {
-        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name, place_id).await {
             sp.image_url = Some(photo.medium_url);
+            sp.conservation_status = photo.conservation_status;
+            sp.is_introduced = photo.is_introduced;
         }
     }
     Ok(species)

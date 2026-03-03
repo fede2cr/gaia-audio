@@ -228,6 +228,44 @@ button {
     color: var(--accent);
 }
 
+/* Conservation status badges (IUCN) */
+.conservation-badge {
+    padding: .1rem .45rem;
+    border-radius: 4px;
+    font-size: .7rem;
+    font-weight: 600;
+    letter-spacing: .03em;
+    white-space: nowrap;
+}
+.conservation-badge.critical    { background: rgba(220,38,38,.15);  color: #ef4444; }
+.conservation-badge.endangered  { background: rgba(234,88,12,.15);  color: #f97316; }
+.conservation-badge.vulnerable  { background: rgba(234,179,8,.15);  color: #eab308; }
+.conservation-badge.near-threatened { background: rgba(132,204,22,.15); color: #a3e635; }
+.conservation-badge.extinct     { background: rgba(127,29,29,.2);   color: #fca5a5; }
+.conservation-badge.data-deficient  { background: rgba(156,163,175,.15); color: #9ca3af; }
+.conservation-badge.unknown     { background: rgba(156,163,175,.12); color: #9ca3af; }
+
+/* Introduced species badge */
+.introduced-badge {
+    padding: .1rem .45rem;
+    border-radius: 4px;
+    font-size: .7rem;
+    font-weight: 600;
+    letter-spacing: .03em;
+    background: rgba(168,85,247,.15);
+    color: #c084fc;
+    white-space: nowrap;
+}
+
+/* Species detail badge row */
+.species-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem;
+    align-items: center;
+    margin-top: .25rem;
+}
+
 /* ── Species Card ───────────────────────────────────────────────────────── */
 
 .species-grid {

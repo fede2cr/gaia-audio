@@ -21,6 +21,9 @@ pub struct AppState {
     pub db_path: std::path::PathBuf,
     pub extracted_dir: std::path::PathBuf,
     pub photo_cache: crate::server::inaturalist::PhotoCache,
+    pub place_id_cache: crate::server::inaturalist::PlaceIdCache,
+    pub latitude: f64,
+    pub longitude: f64,
     pub leptos_options: leptos::LeptosOptions,
 }
 
