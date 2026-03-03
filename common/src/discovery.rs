@@ -219,11 +219,12 @@ pub fn register(role: ServiceRole, port: u16) -> Result<DiscoveryHandle> {
         role.service_type(),
         &instance_name,
         &host,
-        "",   // auto-detect addresses
+        "",   // filled automatically by enable_addr_auto()
         port,
         None, // no TXT properties
     )
-    .context("Cannot create mDNS ServiceInfo")?;
+    .context("Cannot create mDNS ServiceInfo")?
+    .enable_addr_auto();
 
     let fullname = service_info.get_fullname().to_string();
     let registered_addrs = format!("{:?}", service_info.get_addresses());
