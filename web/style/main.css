@@ -142,6 +142,7 @@ button {
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     overflow: hidden;
+    transition: box-shadow .3s ease;
 }
 
 .live-spectrogram {
@@ -149,12 +150,19 @@ button {
     width: 100%;
     background: #111;
 }
-.live-spectrogram img {
+.live-spectrogram-img {
     display: block;
     width: 100%;
     height: auto;
     max-height: 200px;
     object-fit: cover;
+    /* Smooth crossfade when the src changes */
+    animation: fade-in .5s ease;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
 }
 
 .live-badge {
@@ -167,6 +175,7 @@ button {
     font-weight: 600;
     letter-spacing: .03em;
     text-transform: uppercase;
+    transition: background .4s ease, color .4s ease;
 }
 .live-badge.detection {
     background: var(--accent, #22c55e);
@@ -186,6 +195,12 @@ button {
 
 .live-details {
     padding: .75rem 1rem;
+    animation: slide-up .35s ease;
+}
+
+@keyframes slide-up {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
 }
 
 .live-filename {
@@ -218,7 +233,14 @@ button {
     gap: .5rem;
     align-items: center;
     font-size: .82rem;
+    animation: slide-up .35s ease;
+    animation-fill-mode: both;
 }
+.prediction-item:nth-child(1) { animation-delay: 0s; }
+.prediction-item:nth-child(2) { animation-delay: .06s; }
+.prediction-item:nth-child(3) { animation-delay: .12s; }
+.prediction-item:nth-child(4) { animation-delay: .18s; }
+.prediction-item:nth-child(5) { animation-delay: .24s; }
 
 .pred-name {
     white-space: nowrap;
@@ -236,7 +258,7 @@ button {
 .pred-bar {
     height: 100%;
     border-radius: 3px;
-    transition: width .3s ease;
+    transition: width .5s cubic-bezier(.4, 0, .2, 1), background .3s ease;
 }
 .pred-bar.high   { background: var(--accent, #22c55e); }
 .pred-bar.medium { background: #eab308; }
@@ -740,6 +762,97 @@ button {
     color: var(--text-dim);
     margin: 0.5rem 0 1rem;
 }
+
+/* ── Urban Noise Panel ──────────────────────────────────────────────────── */
+
+.urban-noise {
+    margin-top: 1.25rem;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: .75rem 1rem;
+    animation: slide-up .35s ease;
+}
+
+.urban-noise-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: .5rem;
+}
+
+.urban-noise-header h3 {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    font-size: .95rem;
+    margin: 0;
+    font-weight: 600;
+}
+
+.icon-noise { flex-shrink: 0; color: var(--text-muted); }
+
+.urban-noise-totals {
+    display: flex;
+    gap: .75rem;
+}
+
+.noise-stat {
+    font-size: .75rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.urban-noise-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: .2rem;
+}
+
+.noise-item {
+    display: grid;
+    grid-template-columns: 1.5rem 1fr 2.5rem 2.5rem 2.5rem;
+    gap: .35rem;
+    align-items: center;
+    font-size: .82rem;
+    padding: .25rem 0;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,.06));
+}
+.noise-item:last-child { border-bottom: none; }
+
+.noise-icon {
+    text-align: center;
+    font-size: .9rem;
+}
+
+.noise-category {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.noise-count {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-size: .78rem;
+}
+.noise-count.today { color: var(--accent, #22c55e); font-weight: 600; }
+.noise-count.week  { color: var(--text, #ccc); }
+.noise-count.total { color: var(--text-muted, #888); }
+
+.noise-legend {
+    display: grid;
+    grid-template-columns: 1fr 2.5rem 2.5rem 2.5rem;
+    gap: .35rem;
+    padding-top: .35rem;
+    font-size: .68rem;
+    color: var(--text-muted, #666);
+    text-align: right;
+}
+.noise-legend span:first-child { grid-column: 3; }
 .import-actions {
     margin-top: 1rem;
 }

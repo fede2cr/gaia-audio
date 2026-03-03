@@ -34,11 +34,13 @@ pub fn read_audio(
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
             .into_samples::<i32>()
-            .map(|s| s.unwrap_or(0) as f32 / i32::MAX as f32)
+            .take_while(|s| s.is_ok())
+            .map(|s| s.unwrap() as f32 / i32::MAX as f32)
             .collect(),
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
+            .take_while(|s| s.is_ok())
+            .map(|s| s.unwrap())
             .collect(),
     };
 
@@ -165,10 +167,15 @@ pub fn extract_clip(
     let stop_sample = (stop_sec * sr) as usize * ch;
 
     let all_samples: Vec<i16> = match spec.sample_format {
-        hound::SampleFormat::Int => reader.into_samples::<i16>().map(|s| s.unwrap_or(0)).collect(),
+        hound::SampleFormat::Int => reader
+            .into_samples::<i16>()
+            .take_while(|s| s.is_ok())
+            .map(|s| s.unwrap())
+            .collect(),
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
-            .map(|s| (s.unwrap_or(0.0) * i16::MAX as f32) as i16)
+            .take_while(|s| s.is_ok())
+            .map(|s| (s.unwrap() * i16::MAX as f32) as i16)
             .collect(),
     };
 
@@ -222,10 +229,12 @@ fn fix_wav_data_chunk(raw: &mut [u8]) -> bool {
             ]));
             break;
         }
-        pos += 8 + chunk_size;
-        if chunk_size % 2 != 0 {
-            pos += 1; // RIFF chunks are word-aligned
-        }
+        let next = pos.checked_add(8 + chunk_size);
+        let next = match next {
+            Some(n) => n,
+            None => break,
+        };
+        pos = if chunk_size % 2 != 0 { next + 1 } else { next };
     }
 
     let ba = match block_align {
@@ -240,18 +249,25 @@ fn fix_wav_data_chunk(raw: &mut [u8]) -> bool {
             u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]])
                 as usize;
         if &raw[pos..pos + 4] == b"data" {
-            let remainder = chunk_size % ba;
-            if remainder != 0 {
-                let fixed = (chunk_size - remainder) as u32;
+            // Cap to the bytes actually present after the chunk header.
+            // ffmpeg -f segment often writes 0xFFFFFFFF ("unknown length").
+            let available = raw.len().saturating_sub(pos + 8);
+            let effective = chunk_size.min(available);
+            let remainder = effective % ba;
+            let fixed = (effective - remainder) as u32;
+            if fixed != chunk_size as u32 {
                 raw[pos + 4..pos + 8].copy_from_slice(&fixed.to_le_bytes());
                 return true;
             }
-            return false; // already aligned
+            return false; // already correct
         }
-        pos += 8 + chunk_size;
-        if chunk_size % 2 != 0 {
-            pos += 1;
-        }
+        // Guard against huge/bogus chunk sizes that would overflow `pos`.
+        let next = pos.checked_add(8 + chunk_size);
+        let next = match next {
+            Some(n) => n,
+            None => break,
+        };
+        pos = if chunk_size % 2 != 0 { next + 1 } else { next };
     }
 
     false

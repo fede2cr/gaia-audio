@@ -10,6 +10,31 @@ use tracing::info;
 
 use gaia_common::detection::Detection;
 
+/// Labels that the BirdNET model emits which are not actual bird species.
+/// These are counted in the `urban_noise` table instead of `detections`.
+pub const URBAN_NOISE_LABELS: &[&str] = &[
+    "Engine",
+    "Dog",
+    "Human",
+    "Human vocal",
+    "Human whistle",
+    "Human_Human",
+    "Power tools",
+    "Siren",
+    "Gun",
+    "Fireworks",
+    "Noise",
+    "Environmental",
+];
+
+/// Returns `true` if the given scientific name is a known non-bird /
+/// urban-noise label.
+pub fn is_urban_noise(sci_name: &str) -> bool {
+    URBAN_NOISE_LABELS
+        .iter()
+        .any(|&label| sci_name.eq_ignore_ascii_case(label))
+}
+
 /// Create the `detections` table (and indices) if it doesn't exist.
 pub fn initialize(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
@@ -41,9 +66,18 @@ pub fn initialize(db_path: &Path) -> Result<()> {
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
         CREATE INDEX IF NOT EXISTS detections_Domain      ON detections (Domain);
         CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);
+
+        CREATE TABLE IF NOT EXISTS urban_noise (
+            Date       DATE    NOT NULL,
+            Hour       INT     NOT NULL,
+            Category   VARCHAR(50) NOT NULL,
+            Count      INT     NOT NULL DEFAULT 1,
+            UNIQUE(Date, Hour, Category)
+        );
+        CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);
     ",
     )
-    .context("Failed to create detections table")?;
+    .context("Failed to create tables")?;
 
     // Migration: add Source_Node to existing databases that lack it.
     migrate_add_source_node(&conn);
@@ -154,4 +188,33 @@ fn _count(db_path: &Path, sql: &str) -> u32 {
         .ok()
         .and_then(|conn| conn.query_row(sql, [], |row| row.get::<_, u32>(0)).ok())
         .unwrap_or(0)
+}
+
+/// Increment the urban-noise counter for a category / date / hour.
+///
+/// Uses `INSERT OR REPLACE` with an UPSERT pattern so a single row is
+/// stored per (Date, Hour, Category) tuple.
+pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    let result = conn.execute(
+        "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
+         ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
+        params![date, hour, category],
+    );
+
+    if let Err(_) = result {
+        // Fallback for older schemas without the UNIQUE constraint.
+        let updated = conn.execute(
+            "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
+            params![date, hour, category],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
+                params![date, hour, category],
+            )?;
+        }
+    }
+
+    Ok(())
 }

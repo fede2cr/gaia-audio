@@ -1,6 +1,11 @@
 //! Live analysis panel – shows the spectrogram currently being processed
 //! and the top model predictions (even when no detection crosses the
 //! confidence threshold).
+//!
+//! The component polls `/api/GetLiveStatus` and **only updates the DOM when
+//! the `timestamp` field changes**, preventing the UI from blinking when
+//! there is nothing new to show.  Spectrogram image and prediction bars
+//! crossfade smoothly via CSS transitions.
 
 use leptos::*;
 
@@ -29,17 +34,45 @@ pub async fn get_live_status() -> Result<Option<LiveStatus>, ServerFnError> {
 // ─── Component ───────────────────────────────────────────────────────────────
 
 /// Live analysis panel that polls the processing server's current state.
+///
+/// DOM is only updated when `live_status.json` has a new timestamp, so
+/// when nothing is being processed the card stays perfectly still.
 #[component]
 pub fn LiveAnalysis() -> impl IntoView {
+    // Reactive signals that drive the view.
     let (status, set_status) = create_signal::<Option<LiveStatus>>(None);
-    #[allow(unused_variables)]
-    let (tick, set_tick) = create_signal(0u64);
+    let (img_url, set_img_url) = create_signal(String::new());
+
+    // Track the last-seen timestamp so we can skip no-op updates.
+    let last_ts = store_value(String::new());
+
+    // Helper: only push to signals when the timestamp actually changed.
+    let apply_update = move |new: Option<LiveStatus>| {
+        match &new {
+            Some(st) if st.timestamp != last_ts.get_value() => {
+                last_ts.set_value(st.timestamp.clone());
+                // Cache-bust image URL with the timestamp itself.
+                set_img_url.set(format!(
+                    "/live/live_spectrogram.png?t={}",
+                    st.timestamp.replace([':', ' '], "-")
+                ));
+                set_status.set(Some(st.clone()));
+            }
+            Some(_) => { /* same timestamp – do nothing */ }
+            None => {
+                if !last_ts.get_value().is_empty() {
+                    last_ts.set_value(String::new());
+                    set_status.set(None);
+                }
+            }
+        }
+    };
 
     // Initial load
     let initial = create_resource(|| (), |_| async { get_live_status().await });
     create_effect(move |_| {
         if let Some(Ok(s)) = initial.get() {
-            set_status.set(s);
+            apply_update(s);
         }
     });
 
@@ -48,10 +81,9 @@ pub fn LiveAnalysis() -> impl IntoView {
     {
         set_interval_with_handle(
             move || {
-                set_tick.update(|t| *t += 1);
                 spawn_local(async move {
                     if let Ok(s) = get_live_status().await {
-                        set_status.set(s);
+                        apply_update(s);
                     }
                 });
             },
@@ -71,9 +103,7 @@ pub fn LiveAnalysis() -> impl IntoView {
                         </div>
                     }.into_view(),
                     Some(st) => {
-                        // Cache-bust the image URL with a tick counter.
-                        let t = tick.get();
-                        let img_url = format!("/live/live_spectrogram.png?t={t}");
+                        let url = img_url.get();
                         let filename = st.filename.clone();
                         let has_det = st.has_detections;
                         let preds = st.predictions.clone();
@@ -81,7 +111,7 @@ pub fn LiveAnalysis() -> impl IntoView {
                         view! {
                             <div class="live-analysis-card">
                                 <div class="live-spectrogram">
-                                    <img src={img_url} alt="Live spectrogram"/>
+                                    <img class="live-spectrogram-img" src={url} alt="Live spectrogram"/>
                                     {if has_det {
                                         view! { <span class="live-badge detection">"Detection!"</span> }.into_view()
                                     } else {

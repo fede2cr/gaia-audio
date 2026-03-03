@@ -42,9 +42,18 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
 fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> Result<()> {
     let file = &payload.file;
 
+    // Separate urban-noise detections (Engine, Dog, Human, …) from real
+    // species.  Noise detections are counted but NOT stored in the main
+    // detections table.
+    let (species_dets, noise_dets): (Vec<&Detection>, Vec<&Detection>) = payload
+        .detections
+        .iter()
+        .partition(|d| !db::is_urban_noise(&d.scientific_name));
+
     write_json_file(file, &payload.detections, config)?;
 
-    for detection in &payload.detections {
+    // ── real species detections ──────────────────────────────────────
+    for detection in &species_dets {
         let extracted_path = extract_detection(file, detection, config)?;
 
         let spec_path = format!("{}.png", extracted_path.display());
@@ -78,6 +87,46 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
         ) {
             error!("DB insert failed: {e}");
         }
+    }
+
+    // ── urban noise detections ───────────────────────────────────────
+    for detection in &noise_dets {
+        // For non-Human noise (Engine, Dog, …) we still extract the clip
+        // so the operator can review.  Human recordings are skipped for
+        // privacy reasons.
+        let is_human = detection.scientific_name.contains("Human");
+
+        if !is_human {
+            if let Err(e) = extract_detection(file, detection, config) {
+                warn!("Noise clip extraction failed: {e}");
+            }
+        }
+
+        // Normalise the category: "Human vocal" / "Human whistle" → "Human"
+        let category = if is_human {
+            "Human"
+        } else {
+            &detection.scientific_name
+        };
+
+        let hour: u32 = detection
+            .time
+            .split(':')
+            .next()
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(0);
+
+        if let Err(e) = db::increment_urban_noise(db_path, &detection.date, hour, category) {
+            error!("Urban noise DB update failed: {e}");
+        }
+
+        info!(
+            "[urban-noise] {}: {} ({:.1}%) at {}",
+            detection.date,
+            category,
+            detection.confidence * 100.0,
+            detection.time,
+        );
     }
 
     if config.birdweather_id.is_some() {

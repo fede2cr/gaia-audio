@@ -164,3 +164,14 @@ pub struct LivePrediction {
     pub common_name: String,
     pub confidence: f64,
 }
+
+// ─── Urban noise ─────────────────────────────────────────────────────────────
+
+/// Aggregated urban-noise counts for a single category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrbanNoiseSummary {
+    pub category: String,
+    pub today_count: u32,
+    pub week_count: u32,
+    pub total_count: u32,
+}

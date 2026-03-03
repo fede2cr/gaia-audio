@@ -5,6 +5,7 @@ use leptos::*;
 use crate::components::detection_card::DetectionCard;
 use crate::components::live_analysis::LiveAnalysis;
 use crate::components::species_card::SpeciesCard;
+use crate::components::urban_noise::UrbanNoise;
 use crate::model::{SpeciesSummary, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ pub fn Home() -> impl IntoView {
                         }.into_view(),
                     })}
                 </Suspense>
+                <UrbanNoise/>
             </aside>
         </div>
     }

@@ -469,7 +469,16 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
         CREATE INDEX IF NOT EXISTS detections_Domain      ON detections (Domain);
-        CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);",
+        CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);
+
+        CREATE TABLE IF NOT EXISTS urban_noise (
+            Date       DATE    NOT NULL,
+            Hour       INT     NOT NULL,
+            Category   VARCHAR(50) NOT NULL,
+            Count      INT     NOT NULL DEFAULT 1,
+            UNIQUE(Date, Hour, Category)
+        );
+        CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);",
     )
     .map_err(|e| format!("Schema error: {e}"))?;
 

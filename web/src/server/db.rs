@@ -6,7 +6,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::model::{CalendarDay, DayDetectionGroup, SpeciesInfo, SpeciesSummary, WebDetection};
+use crate::model::{CalendarDay, DayDetectionGroup, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection};
 
 /// Open a read-only connection with a busy timeout.
 ///
@@ -224,6 +224,37 @@ pub fn top_species(
             detection_count: row.get(3)?,
             last_seen: row.get(4)?,
             image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
+// ─── Urban noise ─────────────────────────────────────────────────────────────
+
+/// Aggregated urban-noise counts per category (today, last 7 days, all time).
+pub fn urban_noise_summary(
+    db_path: &Path,
+) -> Result<Vec<UrbanNoiseSummary>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let mut stmt = conn.prepare(
+        "SELECT Category,
+                COALESCE(SUM(Count), 0) AS total,
+                COALESCE(SUM(CASE WHEN Date = ?1 THEN Count ELSE 0 END), 0) AS today,
+                COALESCE(SUM(CASE WHEN Date >= DATE(?1, '-7 day') THEN Count ELSE 0 END), 0) AS week
+         FROM urban_noise
+         GROUP BY Category
+         ORDER BY total DESC",
+    )?;
+
+    let rows = stmt.query_map(params![today], |row| {
+        Ok(UrbanNoiseSummary {
+            category: row.get(0)?,
+            total_count: row.get(1)?,
+            today_count: row.get(2)?,
+            week_count: row.get(3)?,
         })
     })?;
 
