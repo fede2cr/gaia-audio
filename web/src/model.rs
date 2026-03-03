@@ -70,6 +70,12 @@ pub struct SpeciesInfo {
     pub total_detections: u64,
     pub first_seen: Option<String>,
     pub last_seen: Option<String>,
+    /// IUCN conservation status code (e.g. "VU", "EN", "CR").  `None` or
+    /// `Some("LC")` means "Least Concern" and is hidden in the UI.
+    pub conservation_status: Option<String>,
+    pub conservation_status_name: Option<String>,
+    /// Whether the species is introduced (non-native) at the observed place.
+    pub is_introduced: Option<bool>,
 }
 
 // ─── Calendar ────────────────────────────────────────────────────────────────
@@ -91,6 +97,8 @@ pub struct DayDetectionGroup {
     pub image_url: Option<String>,
     pub detections: Vec<WebDetection>,
     pub max_confidence: f64,
+    pub conservation_status: Option<String>,
+    pub is_introduced: Option<bool>,
 }
 
 // ─── iNaturalist API response subset ─────────────────────────────────────────
@@ -101,6 +109,12 @@ pub struct SpeciesPhoto {
     pub medium_url: String,
     pub attribution: String,
     pub wikipedia_url: Option<String>,
+    /// IUCN conservation status code (e.g. "VU", "EN", "CR").
+    pub conservation_status: Option<String>,
+    /// Human-readable name (e.g. "vulnerable", "endangered").
+    pub conservation_status_name: Option<String>,
+    /// Whether the species is introduced (non-native) at the observed place.
+    pub is_introduced: Option<bool>,
 }
 
 // ─── Species summary (for species list) ──────────────────────────────────────
@@ -114,6 +128,8 @@ pub struct SpeciesSummary {
     pub detection_count: u32,
     pub last_seen: Option<String>,
     pub image_url: Option<String>,
+    pub conservation_status: Option<String>,
+    pub is_introduced: Option<bool>,
 }
 
 // ─── Import (BirdNET-Pi backup) ──────────────────────────────────────────────
