@@ -155,8 +155,10 @@ pub fn poll_and_process(
                     error!("Error processing {}: {e:#}", rec.filename);
                 }
 
-                // ── clean up local temp file ─────────────────────────
-                std::fs::remove_file(&local_path).ok();
+                // NOTE: do NOT delete the temp file here — the reporting
+                // thread still needs it for clip extraction and spectrogram
+                // generation.  It is cleaned up in reporting::handle_queue
+                // after processing is complete.
 
                 // ── ask capture server to delete ─────────────────────
                 if let Err(e) = delete_recording(&client, base_url, &rec.filename) {
