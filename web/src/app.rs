@@ -8,6 +8,7 @@ use crate::components::nav::Nav;
 use crate::pages::{
     calendar::CalendarPage,
     day::DayView,
+    excluded::ExcludedPage,
     home::Home,
     import::ImportPage,
     settings::SettingsPage,
@@ -51,6 +52,7 @@ pub fn App() -> impl IntoView {
                     <Route path="/calendar/:date" view=DayView/>
                     <Route path="/species" view=SpeciesListPage/>
                     <Route path="/species/:name" view=SpeciesPage/>
+                    <Route path="/excluded" view=ExcludedPage/>
                     <Route path="/import" view=ImportPage/>
                     <Route path="/settings" view=SettingsPage/>
                 </Routes>

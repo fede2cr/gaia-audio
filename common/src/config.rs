@@ -55,6 +55,10 @@ pub struct Config {
     // ── database (processing) ────────────────────────────────────────
     pub db_path: PathBuf,
 
+    // ── display (processing / web) ───────────────────────────────────
+    /// Spectrogram colour-map name ("default", "coolwarm", "magma", "viridis", "grayscale").
+    pub colormap: String,
+
     // ── network (capture ↔ processing) ───────────────────────────────
     /// Address the capture HTTP server listens on.
     pub capture_listen_addr: String,
@@ -144,6 +148,8 @@ pub fn load(path: &Path) -> Result<Config> {
         heartbeat_url: get("HEARTBEAT_URL").filter(|s| !s.is_empty()),
 
         db_path: PathBuf::from(get("DB_PATH").unwrap_or_else(|| "/data/birds.db".into())),
+
+        colormap: get("COLORMAP").unwrap_or_else(|| "default".into()),
 
         capture_listen_addr: get("CAPTURE_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:8089".into()),

@@ -60,7 +60,8 @@ pub fn initialize(db_path: &Path) -> Result<()> {
             Sens       FLOAT,
             Overlap    FLOAT,
             File_Name  VARCHAR(100) NOT NULL,
-            Source_Node VARCHAR(200) NOT NULL DEFAULT ''
+            Source_Node VARCHAR(200) NOT NULL DEFAULT '',
+            Excluded   INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
@@ -80,12 +81,20 @@ pub fn initialize(db_path: &Path) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS exclusion_overrides (
+            Sci_Name      VARCHAR(100) PRIMARY KEY,
+            overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
+            notes         TEXT NOT NULL DEFAULT ''
+        );
     ",
     )
     .context("Failed to create tables")?;
 
     // Migration: add Source_Node to existing databases that lack it.
     migrate_add_source_node(&conn);
+    // Migration: add Excluded column to existing databases.
+    migrate_add_excluded(&conn);
 
     info!("Database schema verified");
     Ok(())
@@ -97,6 +106,13 @@ fn migrate_add_source_node(conn: &Connection) {
     // — except it returns an error. We simply ignore that.
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
+    );
+}
+
+/// Add the `Excluded` column if it doesn't exist (idempotent).
+fn migrate_add_excluded(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
     );
 }
 
@@ -140,8 +156,8 @@ fn try_insert(
     let conn = Connection::open(db_path)?;
     conn.execute(
         "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
-         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             d.date,
             d.time,
@@ -157,6 +173,7 @@ fn try_insert(
             overlap,
             file_name,
             source_node,
+            d.excluded as i32,
         ],
     )?;
     Ok(())
@@ -262,4 +279,27 @@ pub fn apply_settings_overrides(config: &mut gaia_common::config::Config) {
     if let Some(v) = get_setting_f64(db, "overlap") {
         config.overlap = v;
     }
+    if let Some(v) = get_setting(db, "colormap") {
+        config.colormap = v;
+    }
+}
+
+/// Load all scientific names from the `exclusion_overrides` table.
+///
+/// These species have been manually confirmed by an ornithologist and
+/// should bypass the species-range occurrence-threshold filter.
+pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    let mut stmt = match conn.prepare("SELECT Sci_Name FROM exclusion_overrides") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
 }

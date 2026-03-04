@@ -3,11 +3,59 @@
 //! Reused from `birdnet-server/src/spectrogram.rs`.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use image::{ImageBuffer, Rgb};
 use rustfft::{num_complex::Complex, FftPlanner};
 use tracing::debug;
+
+/// Available colour palettes for spectrograms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colormap {
+    /// Green-yellow-red "hot" palette (original Gaia default).
+    Default,
+    /// Blue → white → red (similar to BirdNET-Pi / Matplotlib coolwarm).
+    Coolwarm,
+    /// Black → purple → orange → yellow (Matplotlib magma).
+    Magma,
+    /// Dark blue → cyan → yellow (Matplotlib viridis).
+    Viridis,
+    /// Black → white (grayscale).
+    Grayscale,
+}
+
+impl Default for Colormap {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl FromStr for Colormap {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "default" | "" => Ok(Self::Default),
+            "coolwarm" | "birdnet" => Ok(Self::Coolwarm),
+            "magma" => Ok(Self::Magma),
+            "viridis" => Ok(Self::Viridis),
+            "grayscale" | "gray" => Ok(Self::Grayscale),
+            _ => Ok(Self::Default),
+        }
+    }
+}
+
+impl std::fmt::Display for Colormap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::Coolwarm => write!(f, "coolwarm"),
+            Self::Magma => write!(f, "magma"),
+            Self::Viridis => write!(f, "viridis"),
+            Self::Grayscale => write!(f, "grayscale"),
+        }
+    }
+}
 
 /// Parameters for spectrogram rendering.
 pub struct SpectrogramParams {
@@ -17,6 +65,8 @@ pub struct SpectrogramParams {
     pub max_freq: f64,
     pub width: u32,
     pub height: u32,
+    /// Colour palette.
+    pub colormap: Colormap,
 }
 
 impl Default for SpectrogramParams {
@@ -27,6 +77,7 @@ impl Default for SpectrogramParams {
             max_freq: 12000.0,
             width: 800,
             height: 256,
+            colormap: Colormap::default(),
         }
     }
 }
@@ -126,7 +177,7 @@ pub fn generate(
             let bin = bin.min(max_bin.saturating_sub(1));
 
             let val = magnitude[src_frame][bin];
-            let pixel = colormap(val);
+            let pixel = apply_colormap(params.colormap, val);
             img.put_pixel(x, y, pixel);
         }
     }
@@ -217,7 +268,7 @@ pub fn generate_to_png_buffer(
         for y in 0..img_h {
             let bin = ((img_h - 1 - y) as f64 / img_h as f64 * max_bin as f64) as usize;
             let bin = bin.min(max_bin.saturating_sub(1));
-            img.put_pixel(x, y, colormap(magnitude[src_frame][bin]));
+            img.put_pixel(x, y, apply_colormap(params.colormap, magnitude[src_frame][bin]));
         }
     }
 
@@ -293,8 +344,20 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn colormap(val: f32) -> Rgb<u8> {
+/// Apply the selected colourmap to a normalised [0, 1] value.
+fn apply_colormap(cm: Colormap, val: f32) -> Rgb<u8> {
     let v = val.clamp(0.0, 1.0);
+    match cm {
+        Colormap::Default => cm_default(v),
+        Colormap::Coolwarm => cm_coolwarm(v),
+        Colormap::Magma => cm_magma(v),
+        Colormap::Viridis => cm_viridis(v),
+        Colormap::Grayscale => cm_grayscale(v),
+    }
+}
+
+/// Original green-yellow-red "hot" palette.
+fn cm_default(v: f32) -> Rgb<u8> {
     let r = (255.0 * (3.0 * v - 1.0).clamp(0.0, 1.0)) as u8;
     let g = (255.0
         * (3.0 * v - 0.0)
@@ -302,4 +365,76 @@ fn colormap(val: f32) -> Rgb<u8> {
             .min((3.0 - 3.0 * v).clamp(0.0, 1.0))) as u8;
     let b = (255.0 * (1.0 - 3.0 * v + 1.0).clamp(0.0, 1.0)) as u8;
     Rgb([r, g, b])
+}
+
+/// Blue → white → red (BirdNET-Pi style coolwarm).
+fn cm_coolwarm(v: f32) -> Rgb<u8> {
+    let (r, g, b) = if v < 0.5 {
+        let t = v * 2.0; // 0..1 over the blue half
+        (
+            (59.0 + t * 196.0),   // 59 → 255
+            (76.0 + t * 179.0),   // 76 → 255
+            (192.0 + t * 63.0),   // 192 → 255
+        )
+    } else {
+        let t = (v - 0.5) * 2.0; // 0..1 over the red half
+        (
+            255.0,                // 255
+            (255.0 - t * 195.0),  // 255 → 60
+            (255.0 - t * 195.0),  // 255 → 60
+        )
+    };
+    Rgb([r as u8, g as u8, b as u8])
+}
+
+/// Dark → purple → orange → yellow (magma-inspired).
+fn cm_magma(v: f32) -> Rgb<u8> {
+    // 5-stop gradient: black → dark purple → hot pink → orange → pale yellow
+    let (r, g, b) = if v < 0.25 {
+        let t = v * 4.0;
+        lerp3((0.0, 0.0, 4.0), (50.0, 10.0, 80.0), t)
+    } else if v < 0.5 {
+        let t = (v - 0.25) * 4.0;
+        lerp3((50.0, 10.0, 80.0), (180.0, 30.0, 100.0), t)
+    } else if v < 0.75 {
+        let t = (v - 0.5) * 4.0;
+        lerp3((180.0, 30.0, 100.0), (245.0, 150.0, 40.0), t)
+    } else {
+        let t = (v - 0.75) * 4.0;
+        lerp3((245.0, 150.0, 40.0), (252.0, 253.0, 191.0), t)
+    };
+    Rgb([r as u8, g as u8, b as u8])
+}
+
+/// Dark blue → teal → green → yellow (viridis-inspired).
+fn cm_viridis(v: f32) -> Rgb<u8> {
+    let (r, g, b) = if v < 0.25 {
+        let t = v * 4.0;
+        lerp3((68.0, 1.0, 84.0), (59.0, 82.0, 139.0), t)
+    } else if v < 0.5 {
+        let t = (v - 0.25) * 4.0;
+        lerp3((59.0, 82.0, 139.0), (33.0, 145.0, 140.0), t)
+    } else if v < 0.75 {
+        let t = (v - 0.5) * 4.0;
+        lerp3((33.0, 145.0, 140.0), (94.0, 201.0, 98.0), t)
+    } else {
+        let t = (v - 0.75) * 4.0;
+        lerp3((94.0, 201.0, 98.0), (253.0, 231.0, 37.0), t)
+    };
+    Rgb([r as u8, g as u8, b as u8])
+}
+
+/// Simple grayscale (black → white).
+fn cm_grayscale(v: f32) -> Rgb<u8> {
+    let c = (v * 255.0) as u8;
+    Rgb([c, c, c])
+}
+
+/// Linear interpolation between two RGB triples.
+fn lerp3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
+    (
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
 }

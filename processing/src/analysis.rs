@@ -62,6 +62,7 @@ pub fn process_file(
                     live_sr,
                     live_predictions,
                     config.confidence,
+                    &config.colormap,
                 );
             }
             Err(e) => {
@@ -97,8 +98,18 @@ fn run_analysis(
         model::load_species_list(Path::new(&base).join("include_species_list.txt").as_path());
     let exclude_list =
         model::load_species_list(Path::new(&base).join("exclude_species_list.txt").as_path());
-    let whitelist =
+    let mut whitelist =
         model::load_species_list(Path::new(&base).join("whitelist_species_list.txt").as_path());
+
+    // Merge in DB-based exclusion overrides (species confirmed via the
+    // web UI by an ornithologist).  These bypass the occurrence threshold
+    // just like the file-based whitelist.
+    let db_overrides = crate::db::load_exclusion_overrides(&config.db_path);
+    for sp in db_overrides {
+        if !whitelist.contains(&sp) {
+            whitelist.push(sp);
+        }
+    }
 
     // ── language map ─────────────────────────────────────────────────
     let names =
@@ -205,15 +216,22 @@ fn run_analysis(
                 warn!("[{domain}] Excluded (in exclude list): {sci_name}");
                 continue;
             }
-            if !predicted_species_list.is_empty()
+
+            // Species-range filter: if the location model says this species
+            // is unlikely here, still record the detection but flag it as
+            // excluded so an ornithologist can review it later.
+            let excluded = !predicted_species_list.is_empty()
                 && !predicted_species_list.contains(sci_name)
-                && !whitelist.contains(sci_name)
-            {
-                warn!("[{domain}] Excluded (below occurrence threshold): {sci_name}");
-                continue;
+                && !whitelist.contains(sci_name);
+
+            if excluded {
+                warn!(
+                    "[{domain}] Recording excluded detection (below occurrence threshold): {sci_name} ({:.1}%)",
+                    confidence * 100.0
+                );
             }
 
-            let det = Detection::new(
+            let mut det = Detection::new(
                 &domain,
                 file.file_date,
                 *start,
@@ -222,12 +240,15 @@ fn run_analysis(
                 &com_name,
                 *confidence,
             );
+            det.excluded = excluded;
             confident_detections.push(det);
         }
     }
 
+    let included = confident_detections.iter().filter(|d| !d.excluded).count();
+    let excluded = confident_detections.iter().filter(|d| d.excluded).count();
     info!(
-        "[{domain}] {}: {} confident detection(s)",
+        "[{domain}] {}: {} detection(s) ({included} included, {excluded} excluded)",
         file.file_path.display(),
         confident_detections.len()
     );

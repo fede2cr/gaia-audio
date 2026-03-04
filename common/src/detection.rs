@@ -21,6 +21,11 @@ pub struct Detection {
     pub scientific_name: String,
     pub common_name: String,
     pub common_name_safe: String,
+    /// `true` when the species-range model says this species is unlikely
+    /// at the configured location.  The detection is still stored so an
+    /// ornithologist can review and override it.
+    #[serde(default)]
+    pub excluded: bool,
     /// Populated after extraction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name_extr: Option<String>,
@@ -57,6 +62,7 @@ impl Detection {
             scientific_name: scientific_name.to_string(),
             common_name: common_name.to_string(),
             common_name_safe,
+            excluded: false,
             file_name_extr: None,
         }
     }

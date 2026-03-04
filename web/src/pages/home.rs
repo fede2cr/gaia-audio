@@ -15,11 +15,19 @@ pub async fn get_recent_detections(
     limit: u32,
     after_rowid: Option<i64>,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::recent_detections(&state.db_path, limit, after_rowid)
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+    let mut detections = db::recent_detections(&state.db_path, limit, after_rowid)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    // Enrich with iNaturalist species photos
+    for det in detections.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &det.scientific_name).await {
+            det.image_url = Some(photo.medium_url);
+        }
+    }
+    Ok(detections)
 }
 
 #[server(GetTopSpecies, "/api")]

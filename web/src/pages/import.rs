@@ -2,9 +2,41 @@
 
 use leptos::*;
 
-use crate::model::{ImportReport, ImportResult};
+use crate::model::{BackupFile, ImportReport, ImportResult};
 
 // ─── Server functions ────────────────────────────────────────────────────────
+
+/// Scan the `/backups` volume for `.tar` files.
+#[server(ListBackups, "/api")]
+pub async fn list_backups() -> Result<Vec<BackupFile>, ServerFnError> {
+    use std::path::Path;
+
+    let dir = Path::new("/backups");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut files: Vec<BackupFile> = std::fs::read_dir(dir)
+        .map_err(|e| ServerFnError::new(format!("Cannot read /backups: {e}")))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".tar") || name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+                let meta = entry.metadata().ok()?;
+                Some(BackupFile {
+                    path: entry.path().to_string_lossy().to_string(),
+                    name,
+                    size_bytes: meta.len(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
 
 /// Analyse a BirdNET-Pi backup tar without importing.
 #[server(AnalyseBackup, "/api")]
@@ -66,11 +98,24 @@ pub fn ImportPage() -> impl IntoView {
     let (importing, set_importing) = create_signal(false);
     let (error_msg, set_error_msg) = create_signal::<Option<String>>(None);
 
+    // Auto-discover backup archives in /backups
+    let backups = create_resource(|| (), |_| async move { list_backups().await.ok() });
+
+    // When a backup is selected in the dropdown, update tar_path
+    let on_select = move |ev: leptos::ev::Event| {
+        let val = event_target_value(&ev);
+        set_tar_path.set(val);
+        // Reset previous analysis / import results
+        set_report.set(None);
+        set_import_result.set(None);
+        set_error_msg.set(None);
+    };
+
     // Analyse button handler
     let on_analyse = move |_| {
         let path = tar_path.get();
         if path.is_empty() {
-            set_error_msg.set(Some("Please enter a backup file path.".into()));
+            set_error_msg.set(Some("Please select a backup file.".into()));
             return;
         }
         set_error_msg.set(None);
@@ -112,27 +157,50 @@ pub fn ImportPage() -> impl IntoView {
         <div class="import-page">
             <h1>"Import BirdNET-Pi Backup"</h1>
             <p class="import-desc">
-                "Enter the path to a BirdNET-Pi backup "
+                "Place backup "
                 <code>".tar"</code>
-                " file on the server. The backup will be analysed first so you "
-                "can review its contents before importing."
+                " files in the "
+                <code>"/backups"</code>
+                " volume (mapped to "
+                <code>"./backups/"</code>
+                " on the host). They will be detected automatically."
             </p>
 
-            // ── Path input + Analyse ─────────────────────────────────────
+            // ── Backup picker + Analyse ──────────────────────────────────
             <div class="import-input-row">
-                <input
-                    type="text"
-                    class="import-path-input"
-                    placeholder="/path/to/backup.tar"
-                    prop:value=move || tar_path.get()
-                    on:input=move |ev| {
-                        set_tar_path.set(event_target_value(&ev));
-                    }
-                />
+                <Suspense fallback=move || view! { <span>"Scanning for backups…"</span> }>
+                    {move || {
+                        let files = backups.get().flatten().unwrap_or_default();
+                        let is_empty = files.is_empty();
+                        view! {
+                            <select
+                                class="import-select"
+                                on:change=on_select
+                                prop:value=move || tar_path.get()
+                            >
+                                <option value="" disabled=true selected=true>
+                                    {if is_empty {
+                                        "No backups found in /backups"
+                                    } else {
+                                        "Select a backup archive…"
+                                    }}
+                                </option>
+                                {files.into_iter().map(|f| {
+                                    let size_mb = f.size_bytes as f64 / (1024.0 * 1024.0);
+                                    let label = format!("{} ({:.1} MB)", f.name, size_mb);
+                                    let path = f.path.clone();
+                                    view! {
+                                        <option value=path>{label}</option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </select>
+                        }
+                    }}
+                </Suspense>
                 <button
                     class="btn btn-primary"
                     on:click=on_analyse
-                    disabled=move || analysing.get()
+                    disabled=move || analysing.get() || tar_path.get().is_empty()
                 >
                     {move || if analysing.get() { "Analysing…" } else { "Analyse Backup" }}
                 </button>

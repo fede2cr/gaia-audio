@@ -464,7 +464,8 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             Sens       FLOAT,
             Overlap    FLOAT,
             File_Name  VARCHAR(100) NOT NULL,
-            Source_Node VARCHAR(200) NOT NULL DEFAULT ''
+            Source_Node VARCHAR(200) NOT NULL DEFAULT '',
+            Excluded   INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
         CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
@@ -483,6 +484,12 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS exclusion_overrides (
+            Sci_Name      VARCHAR(100) PRIMARY KEY,
+            overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
+            notes         TEXT NOT NULL DEFAULT ''
         );",
     )
     .map_err(|e| format!("Schema error: {e}"))?;
@@ -490,6 +497,10 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     // Migration: add Source_Node to existing databases that lack it.
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
+    );
+    // Migration: add Excluded column to existing databases.
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
     );
 
     Ok(())

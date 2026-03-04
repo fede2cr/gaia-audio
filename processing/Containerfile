@@ -129,7 +129,7 @@ DB_PATH=/data/detections.db\n\
 CAPTURE_SERVER_URL=http://capture:8089\n\
 POLL_INTERVAL_SECS=5\n\
 RECS_DIR=/data\n\
-EXTRACTED=/data/Extracted\n' > /etc/gaia/gaia.conf
+EXTRACTED=/data/extracted\n' > /etc/gaia/gaia.conf
 
 VOLUME ["/data", "/models"]
 

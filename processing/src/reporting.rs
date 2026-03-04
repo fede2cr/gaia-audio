@@ -14,13 +14,18 @@ use gaia_common::config::Config;
 use gaia_common::detection::{Detection, ParsedFileName};
 
 use crate::db;
-use crate::spectrogram::{self, SpectrogramParams};
+use crate::spectrogram::{self, Colormap, SpectrogramParams};
 use crate::ReportPayload;
 
 /// Run the reporting loop on its own thread.
 pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path) {
+    let mut config = config.clone();
     while let Ok(payload) = rx.recv() {
-        if let Err(e) = process_report(&payload, config, db_path) {
+        // Refresh settings (colormap, thresholds) from the DB so web UI
+        // changes are picked up without restarting the container.
+        db::apply_settings_overrides(&mut config);
+
+        if let Err(e) = process_report(&payload, &config, db_path) {
             error!("Reporting error: {e:#}");
         }
 
@@ -57,10 +62,14 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
         let extracted_path = extract_detection(file, detection, config)?;
 
         let spec_path = format!("{}.png", extracted_path.display());
+        let spec_params = SpectrogramParams {
+            colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
+            ..SpectrogramParams::default()
+        };
         if let Err(e) = spectrogram::generate_from_wav(
             &extracted_path,
             Path::new(&spec_path),
-            &SpectrogramParams::default(),
+            &spec_params,
         ) {
             warn!("Spectrogram failed for {}: {e}", extracted_path.display());
         }
@@ -270,10 +279,10 @@ fn bird_weather(
         _ => return Ok(()),
     };
 
-    // Only POST bird detections to BirdWeather
+    // Only POST non-excluded bird detections to BirdWeather
     let bird_dets: Vec<&Detection> = detections
         .iter()
-        .filter(|d| d.domain == "birds")
+        .filter(|d| d.domain == "birds" && !d.excluded)
         .collect();
     if bird_dets.is_empty() {
         return Ok(());

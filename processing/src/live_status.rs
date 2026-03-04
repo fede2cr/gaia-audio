@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use crate::spectrogram::{self, SpectrogramParams};
+use crate::spectrogram::{self, Colormap, SpectrogramParams};
 
 /// JSON written to `<data_dir>/live_status.json`.
 #[derive(Debug, Serialize)]
@@ -58,7 +58,7 @@ pub fn write_status(status: &LiveStatus) -> Result<()> {
 /// Generate and write the live spectrogram PNG for the current audio chunk.
 ///
 /// `samples` should be mono f32 audio at `sample_rate` Hz.
-pub fn write_spectrogram(samples: &[f32], sample_rate: u32) -> Result<()> {
+pub fn write_spectrogram(samples: &[f32], sample_rate: u32, colormap: &str) -> Result<()> {
     let dir = live_dir();
     std::fs::create_dir_all(&dir)?;
 
@@ -68,6 +68,7 @@ pub fn write_spectrogram(samples: &[f32], sample_rate: u32) -> Result<()> {
         max_freq: 12_000.0,
         width: 800,
         height: 256,
+        colormap: colormap.parse::<Colormap>().unwrap_or_default(),
     };
 
     let png_bytes = spectrogram::generate_to_png_buffer(samples, sample_rate, &params)?;
@@ -89,6 +90,7 @@ pub fn update(
     sample_rate: u32,
     predictions: Vec<LivePrediction>,
     confidence_threshold: f64,
+    colormap: &str,
 ) {
     let has_detections = predictions.iter().any(|p| p.confidence >= confidence_threshold);
 
@@ -99,7 +101,7 @@ pub fn update(
         has_detections,
     };
 
-    if let Err(e) = write_spectrogram(samples, sample_rate) {
+    if let Err(e) = write_spectrogram(samples, sample_rate, colormap) {
         warn!("Failed to write live spectrogram: {e:#}");
     }
     if let Err(e) = write_status(&status) {

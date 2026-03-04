@@ -1,0 +1,233 @@
+//! Excluded species page – lists species excluded by the occurrence threshold
+//! filter, with the ability for an ornithologist to override the exclusion.
+
+use leptos::*;
+
+use crate::model::ExcludedSpecies;
+
+// ─── Server functions ────────────────────────────────────────────────────────
+
+#[server(GetExcludedSpecies, "/api")]
+pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnError> {
+    use crate::server::{db, inaturalist};
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    let mut species = db::excluded_species(&state.db_path)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    // Enrich with iNaturalist images
+    for sp in species.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+            sp.image_url = Some(photo.medium_url);
+        }
+    }
+    Ok(species)
+}
+
+#[server(OverrideExclusion, "/api")]
+pub async fn override_exclusion(
+    scientific_name: String,
+    notes: String,
+) -> Result<(), ServerFnError> {
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    crate::server::db::add_exclusion_override(&state.db_path, &scientific_name, &notes)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    Ok(())
+}
+
+#[server(RemoveOverride, "/api")]
+pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnError> {
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    crate::server::db::remove_exclusion_override(&state.db_path, &scientific_name)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    Ok(())
+}
+
+// ─── Page component ──────────────────────────────────────────────────────────
+
+/// Excluded species page with override controls.
+#[component]
+pub fn ExcludedPage() -> impl IntoView {
+    let (version, set_version) = create_signal(0u32);
+    let species = create_resource(
+        move || version.get(),
+        |_| async { get_excluded_species().await },
+    );
+
+    view! {
+        <div class="excluded-page">
+            <h1>"Excluded Species"</h1>
+            <p class="page-desc">
+                "These species were detected with sufficient confidence but excluded by the "
+                "species-range model (occurrence threshold). Audio and spectrograms are preserved. "
+                "If you can confirm the identification, click "
+                <strong>"Confirm Override"</strong>
+                " to include the species in the main Species list and future detections."
+            </p>
+
+            <Suspense fallback=move || view! { <p class="loading">"Loading excluded species…"</p> }>
+                {move || species.get().map(|res| match res {
+                    Ok(list) if list.is_empty() => view! {
+                        <div class="empty-state">
+                            <p>"No excluded detections yet."</p>
+                        </div>
+                    }.into_view(),
+                    Ok(list) => {
+                        let overridden: Vec<ExcludedSpecies> = list.iter().filter(|s| s.overridden).cloned().collect();
+                        let pending: Vec<ExcludedSpecies> = list.iter().filter(|s| !s.overridden).cloned().collect();
+
+                        view! {
+                            {if !pending.is_empty() {
+                                view! {
+                                    <h2 class="section-heading">"Pending Review"</h2>
+                                    <div class="excluded-grid">
+                                        <For
+                                            each=move || pending.clone()
+                                            key=|s| s.scientific_name.clone()
+                                            children=move |sp: ExcludedSpecies| {
+                                                view! { <ExcludedCard species=sp version=set_version/> }
+                                            }
+                                        />
+                                    </div>
+                                }.into_view()
+                            } else {
+                                view! {}.into_view()
+                            }}
+                            {if !overridden.is_empty() {
+                                view! {
+                                    <h2 class="section-heading">"Confirmed (Overridden)"</h2>
+                                    <div class="excluded-grid">
+                                        <For
+                                            each=move || overridden.clone()
+                                            key=|s| s.scientific_name.clone()
+                                            children=move |sp: ExcludedSpecies| {
+                                                view! { <ExcludedCard species=sp version=set_version/> }
+                                            }
+                                        />
+                                    </div>
+                                }.into_view()
+                            } else {
+                                view! {}.into_view()
+                            }}
+                        }.into_view()
+                    },
+                    Err(e) => view! {
+                        <p class="error">"Error: " {e.to_string()}</p>
+                    }.into_view(),
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+/// Card for a single excluded species.
+#[component]
+fn ExcludedCard(
+    species: ExcludedSpecies,
+    version: WriteSignal<u32>,
+) -> impl IntoView {
+    let sci_name = species.scientific_name.clone();
+    let sci_name_action = sci_name.clone();
+    let is_overridden = species.overridden;
+
+    let (busy, set_busy) = create_signal(false);
+
+    let on_override = move |_| {
+        set_busy.set(true);
+        let name = sci_name_action.clone();
+        spawn_local(async move {
+            let _ = override_exclusion(name, String::new()).await;
+            set_busy.set(false);
+            version.update(|v| *v += 1);
+        });
+    };
+
+    let sci_name_undo = sci_name.clone();
+    let on_undo = move |_| {
+        set_busy.set(true);
+        let name = sci_name_undo.clone();
+        spawn_local(async move {
+            let _ = remove_override(name).await;
+            set_busy.set(false);
+            version.update(|v| *v += 1);
+        });
+    };
+
+    let confidence_pct = format!("{:.0}%", species.max_confidence * 100.0);
+    let count_label = format!(
+        "{} detection{}",
+        species.detection_count,
+        if species.detection_count == 1 { "" } else { "s" }
+    );
+    let species_href = format!(
+        "/species/{}",
+        species.scientific_name.replace(' ', "%20")
+    );
+
+    let card_class = if is_overridden {
+        "excluded-card overridden"
+    } else {
+        "excluded-card"
+    };
+
+    view! {
+        <div class={card_class}>
+            <div class="excluded-thumb">
+                {match &species.image_url {
+                    Some(url) => view! {
+                        <img class="species-thumb" src={url.clone()} alt={species.common_name.clone()} loading="lazy"/>
+                    }.into_view(),
+                    None => view! {
+                        <div class="species-thumb-placeholder">
+                            <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 3c-1.5 2-4 3-6 3 0 4 1.5 8 6 11 4.5-3 6-7 6-11-2 0-4.5-1-6-3z"/>
+                            </svg>
+                        </div>
+                    }.into_view(),
+                }}
+            </div>
+
+            <div class="excluded-info">
+                <a href={species_href} class="excluded-species-name">
+                    <span class="common-name">{&species.common_name}</span>
+                    <span class="sci-name">{&species.scientific_name}</span>
+                </a>
+                <div class="excluded-meta">
+                    <span class="domain-badge">{&species.domain}</span>
+                    <span class="confidence high">{confidence_pct}</span>
+                    <span class="count-label">{count_label}</span>
+                    {species.last_seen.as_ref().map(|d| view! {
+                        <span class="last-seen">"Last: " {d.clone()}</span>
+                    })}
+                </div>
+
+                <div class="excluded-actions">
+                    {if is_overridden {
+                        view! {
+                            <span class="override-badge">"✓ Confirmed"</span>
+                            <button
+                                class="btn btn-sm btn-outline"
+                                on:click=on_undo
+                                disabled=move || busy.get()
+                            >
+                                {move || if busy.get() { "…" } else { "Undo" }}
+                            </button>
+                        }.into_view()
+                    } else {
+                        view! {
+                            <button
+                                class="btn btn-sm btn-confirm"
+                                on:click=on_override
+                                disabled=move || busy.get()
+                            >
+                                {move || if busy.get() { "Confirming…" } else { "Confirm Override" }}
+                            </button>
+                        }.into_view()
+                    }}
+                </div>
+            </div>
+        </div>
+    }
+}

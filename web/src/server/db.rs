@@ -6,7 +6,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::model::{CalendarDay, DayDetectionGroup, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection};
+use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection};
 
 /// Open a read-only connection with a busy timeout.
 ///
@@ -33,14 +33,14 @@ pub fn recent_detections(
     let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
         Some(rid) => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-             COALESCE(Source_Node, '') \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
              FROM detections WHERE rowid > ?1 ORDER BY rowid DESC LIMIT ?2"
                 .into(),
             vec![Box::new(rid), Box::new(limit)],
         ),
         None => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-             COALESCE(Source_Node, '') \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
              FROM detections ORDER BY rowid DESC LIMIT ?1"
                 .into(),
             vec![Box::new(limit)],
@@ -59,6 +59,8 @@ pub fn recent_detections(
             time: row.get(6)?,
             file_name: row.get(7)?,
             source_node: row.get(8)?,
+            excluded: row.get::<_, i32>(9)? != 0,
+            image_url: None,
         })
     })?;
 
@@ -83,7 +85,11 @@ pub fn calendar_data(
 
     let mut stmt = conn.prepare(
         "SELECT Date, COUNT(*) AS cnt, COUNT(DISTINCT Sci_Name) AS spp \
-         FROM detections WHERE Date >= ?1 AND Date < ?2 GROUP BY Date ORDER BY Date",
+         FROM detections \
+         WHERE Date >= ?1 AND Date < ?2 \
+           AND (COALESCE(Excluded, 0) = 0 \
+                OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY Date ORDER BY Date",
     )?;
 
     let rows = stmt.query_map(params![start, end], |row| {
@@ -107,7 +113,7 @@ pub fn day_detections(
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-         COALESCE(Source_Node, '') \
+         COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
          FROM detections WHERE Date = ?1 ORDER BY Sci_Name, Time DESC",
     )?;
 
@@ -123,6 +129,8 @@ pub fn day_detections(
                 time: row.get(6)?,
                 file_name: row.get(7)?,
                 source_node: row.get(8)?,
+                excluded: row.get::<_, i32>(9)? != 0,
+                image_url: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -155,6 +163,8 @@ pub fn day_detections(
 // ─── Species detail ──────────────────────────────────────────────────────────
 
 /// Aggregate species statistics.
+///
+/// Includes excluded detections only if the species has been overridden.
 pub fn species_info(
     db_path: &Path,
     scientific_name: &str,
@@ -163,7 +173,11 @@ pub fn species_info(
     let mut stmt = conn.prepare(
         "SELECT Domain, Com_Name, COUNT(*) AS cnt, \
          MIN(Date) AS first_seen, MAX(Date) AS last_seen \
-         FROM detections WHERE Sci_Name = ?1 GROUP BY Domain, Com_Name LIMIT 1",
+         FROM detections \
+         WHERE Sci_Name = ?1 \
+           AND (COALESCE(Excluded, 0) = 0 \
+                OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY Domain, Com_Name LIMIT 1",
     )?;
 
     let mut rows = stmt.query_map(params![scientific_name], |row| {
@@ -206,14 +220,21 @@ pub fn species_active_dates(
 }
 
 /// Top species (for species list on home page).
+///
+/// Excluded detections are omitted unless the species has been overridden
+/// in the `exclusion_overrides` table.
 pub fn top_species(
     db_path: &Path,
     limit: u32,
 ) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT Sci_Name, Com_Name, Domain, COUNT(*) AS cnt, MAX(Date || ' ' || Time) AS last \
-         FROM detections GROUP BY Sci_Name, Domain ORDER BY cnt DESC LIMIT ?1",
+        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+         MAX(d.Date || ' ' || d.Time) AS last \
+         FROM detections d \
+         WHERE (COALESCE(d.Excluded, 0) = 0 \
+                OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?1",
     )?;
 
     let rows = stmt.query_map(params![limit], |row| {
@@ -309,4 +330,68 @@ pub fn urban_noise_summary(
     })?;
 
     rows.collect()
+}
+
+// ─── Excluded species ────────────────────────────────────────────────────────
+
+/// List species that have at least one excluded detection.
+pub fn excluded_species(db_path: &Path) -> Result<Vec<ExcludedSpecies>, rusqlite::Error> {
+    let conn = open(db_path)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT d.Sci_Name, d.Com_Name, d.Domain, \
+                COUNT(*) AS cnt, \
+                MAX(d.Date || ' ' || d.Time) AS last, \
+                MAX(d.Confidence) AS max_conf, \
+                CASE WHEN eo.Sci_Name IS NOT NULL THEN 1 ELSE 0 END AS overridden \
+         FROM detections d \
+         LEFT JOIN exclusion_overrides eo ON d.Sci_Name = eo.Sci_Name \
+         WHERE COALESCE(d.Excluded, 0) = 1 \
+         GROUP BY d.Sci_Name, d.Domain \
+         ORDER BY overridden ASC, cnt DESC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(ExcludedSpecies {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            domain: row.get(2)?,
+            detection_count: row.get(3)?,
+            last_seen: row.get(4)?,
+            max_confidence: row.get(5)?,
+            image_url: None,
+            overridden: row.get::<_, i32>(6)? != 0,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Add an exclusion override (ornithologist confirms the species is real).
+pub fn add_exclusion_override(
+    db_path: &Path,
+    scientific_name: &str,
+    notes: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = open_rw(db_path)?;
+    conn.execute(
+        "INSERT INTO exclusion_overrides (Sci_Name, overridden_at, notes) \
+         VALUES (?1, datetime('now'), ?2) \
+         ON CONFLICT(Sci_Name) DO UPDATE SET overridden_at = datetime('now'), notes = excluded.notes",
+        params![scientific_name, notes],
+    )?;
+    Ok(())
+}
+
+/// Remove an exclusion override (undo confirmation).
+pub fn remove_exclusion_override(
+    db_path: &Path,
+    scientific_name: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = open_rw(db_path)?;
+    conn.execute(
+        "DELETE FROM exclusion_overrides WHERE Sci_Name = ?1",
+        params![scientific_name],
+    )?;
+    Ok(())
 }

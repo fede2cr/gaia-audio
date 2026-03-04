@@ -10,6 +10,7 @@ const DEFAULT_SENSITIVITY: f64 = 1.25;
 const DEFAULT_CONFIDENCE: f64 = 0.7;
 const DEFAULT_SF_THRESH: f64 = 0.03;
 const DEFAULT_OVERLAP: f64 = 0.0;
+const DEFAULT_COLORMAP: &str = "default";
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
         confidence: f("confidence", DEFAULT_CONFIDENCE),
         sf_thresh: f("sf_thresh", DEFAULT_SF_THRESH),
         overlap: f("overlap", DEFAULT_OVERLAP),
+        colormap: map.get("colormap").cloned().unwrap_or_else(|| DEFAULT_COLORMAP.to_string()),
     })
 }
 
@@ -44,6 +46,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
     let conf = settings.confidence.to_string();
     let sf = settings.sf_thresh.to_string();
     let ovlp = settings.overlap.to_string();
+    let cmap = settings.colormap.clone();
 
     crate::server::db::save_settings(
         &state.db_path,
@@ -52,6 +55,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
             ("confidence", &conf),
             ("sf_thresh", &sf),
             ("overlap", &ovlp),
+            ("colormap", &cmap),
         ],
     )
     .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
@@ -76,6 +80,7 @@ pub fn SettingsPage() -> impl IntoView {
     let (confidence, set_confidence) = create_signal(DEFAULT_CONFIDENCE);
     let (sf_thresh, set_sf_thresh) = create_signal(DEFAULT_SF_THRESH);
     let (overlap, set_overlap) = create_signal(DEFAULT_OVERLAP);
+    let (colormap, set_colormap) = create_signal(DEFAULT_COLORMAP.to_string());
 
     // Sync resource → local signals once loaded.
     create_effect(move |_| {
@@ -84,6 +89,7 @@ pub fn SettingsPage() -> impl IntoView {
             set_confidence.set(s.confidence);
             set_sf_thresh.set(s.sf_thresh);
             set_overlap.set(s.overlap);
+            set_colormap.set(s.colormap);
         }
     });
 
@@ -97,6 +103,7 @@ pub fn SettingsPage() -> impl IntoView {
             confidence: confidence.get(),
             sf_thresh: sf_thresh.get(),
             overlap: overlap.get(),
+            colormap: colormap.get(),
         };
 
         spawn_local(async move {
@@ -241,6 +248,30 @@ pub fn SettingsPage() -> impl IntoView {
                             <span>"0s (no overlap)"</span>
                             <span>"2.5s (heavy)"</span>
                         </div>
+                    </div>
+
+                    // ── Colormap ─────────────────────────────────
+                    <div class="setting-group">
+                        <label class="setting-label" for="colormap">
+                            "Spectrogram Colormap"
+                        </label>
+                        <p class="setting-help">
+                            "Colour palette used for spectrogram images. "
+                            "Changes apply to newly generated spectrograms."
+                        </p>
+                        <select
+                            id="colormap"
+                            class="setting-select"
+                            on:change=move |ev| {
+                                set_colormap.set(event_target_value(&ev));
+                            }
+                        >
+                            <option value="default"  selected=move || colormap.get() == "default">"Default (green → yellow → red)"</option>
+                            <option value="coolwarm" selected=move || colormap.get() == "coolwarm">"Coolwarm (blue → red)"</option>
+                            <option value="magma"    selected=move || colormap.get() == "magma">"Magma (black → magenta → yellow)"</option>
+                            <option value="viridis"  selected=move || colormap.get() == "viridis">"Viridis (purple → green → yellow)"</option>
+                            <option value="grayscale" selected=move || colormap.get() == "grayscale">"Grayscale"</option>
+                        </select>
                     </div>
 
                     // ── Save button + messages ───────────────────

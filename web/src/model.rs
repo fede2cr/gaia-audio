@@ -16,6 +16,12 @@ pub struct WebDetection {
     pub time: String,
     pub file_name: String,
     pub source_node: String,
+    /// `true` when the detection was excluded by the species-range model.
+    #[serde(default)]
+    pub excluded: bool,
+    /// Species photo URL from iNaturalist (populated server-side).
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 impl WebDetection {
@@ -145,6 +151,17 @@ pub struct ImportResult {
     pub errors: Vec<String>,
 }
 
+/// A discovered backup archive in the /backups volume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupFile {
+    /// Full path inside the container (e.g. `/backups/my-backup.tar`).
+    pub path: String,
+    /// Filename only.
+    pub name: String,
+    /// Size in bytes.
+    pub size_bytes: u64,
+}
+
 // ─── Live analysis status ────────────────────────────────────────────────────
 
 /// Snapshot of what the processing server is currently analysing.
@@ -176,6 +193,23 @@ pub struct UrbanNoiseSummary {
     pub total_count: u32,
 }
 
+// ─── Excluded species ────────────────────────────────────────────────────────
+
+/// A species that has been excluded by the occurrence-threshold filter,
+/// aggregated for the "Excluded" page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedSpecies {
+    pub scientific_name: String,
+    pub common_name: String,
+    pub domain: String,
+    pub detection_count: u32,
+    pub last_seen: Option<String>,
+    pub max_confidence: f64,
+    pub image_url: Option<String>,
+    /// `true` if an ornithologist has overridden the exclusion.
+    pub overridden: bool,
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 /// Detection settings editable from the web UI.
@@ -185,4 +219,11 @@ pub struct DetectionSettings {
     pub confidence: f64,
     pub sf_thresh: f64,
     pub overlap: f64,
+    /// Spectrogram colour palette name ("default", "coolwarm", "magma", "viridis", "grayscale").
+    #[serde(default = "default_colormap")]
+    pub colormap: String,
+}
+
+fn default_colormap() -> String {
+    "default".to_string()
 }

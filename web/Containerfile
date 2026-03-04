@@ -43,6 +43,7 @@ RUN touch common/src/lib.rs web/src/lib.rs web/src/main.rs
 COPY web/public web/public
 
 # Build with cargo-leptos (compiles SSR binary + WASM hydration bundle)
+ENV LEPTOS_WASM_OPT_VERSION=version_126
 RUN cd web && cargo leptos build --release
 
 # ── Runtime stage ──────────────────────────────────────────────────
@@ -64,6 +65,7 @@ RUN mkdir -p /data
 ENV LEPTOS_SITE_ROOT=/srv/site
 ENV LEPTOS_SITE_ADDR=0.0.0.0:3000
 ENV GAIA_DB_PATH=/data/detections.db
+ENV GAIA_EXTRACTED_DIR=/data/extracted
 
 EXPOSE 3000
 
