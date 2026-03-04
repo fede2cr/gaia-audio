@@ -10,6 +10,7 @@ use crate::pages::{
     day::DayView,
     home::Home,
     import::ImportPage,
+    settings::SettingsPage,
     species::SpeciesPage,
     species_list::SpeciesListPage,
 };
@@ -51,6 +52,7 @@ pub fn App() -> impl IntoView {
                     <Route path="/species" view=SpeciesListPage/>
                     <Route path="/species/:name" view=SpeciesPage/>
                     <Route path="/import" view=ImportPage/>
+                    <Route path="/settings" view=SettingsPage/>
                 </Routes>
             </main>
         </Router>

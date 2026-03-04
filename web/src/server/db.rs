@@ -230,6 +230,56 @@ pub fn top_species(
     rows.collect()
 }
 
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+
+/// Read all rows from the `settings` table as a key-value map.
+pub fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    // The table may not exist in older databases.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+    );
+    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for r in rows {
+        let (k, v) = r?;
+        map.insert(k, v);
+    }
+    Ok(map)
+}
+
+/// Open a read-write connection with a busy timeout.
+fn open_rw(db_path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+    Ok(conn)
+}
+
+/// Save multiple settings in one transaction.
+pub fn save_settings(db_path: &Path, entries: &[(&str, &str)]) -> Result<(), rusqlite::Error> {
+    let conn = open_rw(db_path)?;
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+    );
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )?;
+        for (k, v) in entries {
+            stmt.execute(params![k, v])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 // ─── Urban noise ─────────────────────────────────────────────────────────────
 
 /// Aggregated urban-noise counts per category (today, last 7 days, all time).

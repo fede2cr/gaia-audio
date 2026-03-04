@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| gaia_common::config::Config::default_path().to_string());
-    let config =
+    let mut config =
         gaia_common::config::load(&PathBuf::from(&config_path)).context("Config load failed")?;
 
     info!(
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
     // ── poll capture server(s) and process files ─────────────────────
     if let Err(e) = client::poll_and_process(
         &mut models,
-        &config,
+        &mut config,
         discovery.as_ref(),
         &report_tx,
         &SHUTDOWN,

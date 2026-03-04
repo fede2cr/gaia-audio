@@ -33,7 +33,7 @@ const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 /// Blocks until `shutdown` is set.
 pub fn poll_and_process(
     models: &mut [LoadedModel],
-    config: &Config,
+    config: &mut Config,
     discovery: Option<&DiscoveryHandle>,
     report_tx: &SyncSender<ReportPayload>,
     shutdown: &AtomicBool,
@@ -82,6 +82,9 @@ pub fn poll_and_process(
             std::thread::sleep(poll_interval);
             continue;
         }
+
+        // ── refresh settings from DB ─────────────────────────────
+        crate::db::apply_settings_overrides(config);
 
         // ── periodic mDNS re-discovery ───────────────────────────────
         if last_discovery.elapsed() >= REDISCOVERY_INTERVAL {

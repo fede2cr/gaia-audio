@@ -175,3 +175,14 @@ pub struct UrbanNoiseSummary {
     pub week_count: u32,
     pub total_count: u32,
 }
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+/// Detection settings editable from the web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionSettings {
+    pub sensitivity: f64,
+    pub confidence: f64,
+    pub sf_thresh: f64,
+    pub overlap: f64,
+}

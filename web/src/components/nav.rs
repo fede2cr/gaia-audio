@@ -16,6 +16,7 @@ pub fn Nav() -> impl IntoView {
                 <A href="/calendar" class="nav-link">"Calendar"</A>
                 <A href="/species" class="nav-link">"Species"</A>
                 <A href="/import" class="nav-link">"Import"</A>
+                <A href="/settings" class="nav-link">"Settings"</A>
             </div>
         </nav>
     }

@@ -874,3 +874,106 @@ button {
     font-size: 0.85rem;
     color: var(--text-dim);
 }
+
+/* ─── Settings page ───────────────────────────────────────────────────────── */
+.settings-page {
+    max-width: 700px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+.settings-page h1 {
+    margin-bottom: 0.25rem;
+}
+.settings-desc {
+    color: var(--text-muted);
+    margin-bottom: 2rem;
+    line-height: 1.5;
+}
+.settings-form {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
+.setting-group {
+    background: var(--bg-card);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+}
+.setting-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-weight: 600;
+    font-size: 1rem;
+    margin-bottom: 0.25rem;
+}
+.setting-value {
+    font-family: 'Fira Code', 'Cascadia Code', monospace;
+    color: var(--accent);
+    font-size: 0.95rem;
+}
+.setting-help {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    margin-bottom: 0.75rem;
+}
+.setting-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--bg-elevated);
+    outline: none;
+    cursor: pointer;
+}
+.setting-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: 2px solid var(--bg);
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+}
+.setting-slider::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: 2px solid var(--bg);
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+}
+.setting-range-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.35rem;
+}
+
+.settings-actions {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+}
+.settings-success {
+    background: rgba(107, 203, 119, 0.15);
+    color: var(--success);
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+.settings-error {
+    background: #f871714d;
+    color: #fca5a5;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+}

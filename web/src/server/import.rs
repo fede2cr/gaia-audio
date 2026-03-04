@@ -478,7 +478,12 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             Count      INT     NOT NULL DEFAULT 1,
             UNIQUE(Date, Hour, Category)
         );
-        CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);",
+        CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
     )
     .map_err(|e| format!("Schema error: {e}"))?;
 

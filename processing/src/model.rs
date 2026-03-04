@@ -197,15 +197,17 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         }
     };
 
+    // BirdNET-Analyzer uses SIGMOID_SENSITIVITY (default 1.0) directly
+    // as the slope of flat_sigmoid: 1/(1+exp(-sensitivity * clip(x,-20,20))).
+    // Higher values → steeper sigmoid → higher reported confidences.
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
-    let adjusted_sensitivity = (1.0 - (sensitivity - 1.0)).clamp(0.5, 1.5);
 
     Ok(LoadedModel {
         runner,
         meta_model,
         labels,
         manifest: resolved.clone(),
-        sensitivity: adjusted_sensitivity,
+        sensitivity,
         onnx_classifier,
     })
 }
@@ -331,11 +333,19 @@ impl LoadedModel {
         Ok(predictions)
     }
 
-    /// Apply sigmoid scaling with sensitivity adjustment.
+    /// Apply sigmoid scaling with sensitivity.
+    ///
+    /// Matches BirdNET-Analyzer `flat_sigmoid`:
+    ///   `1 / (1 + exp(-sensitivity * clip(x, -20, 20)))`
+    /// where `sensitivity` = `cfg.SIGMOID_SENSITIVITY` (default 1.0).
     fn scale_logits(&self, logits: &[f32]) -> Vec<f32> {
+        let s = self.sensitivity as f32;
         logits
             .iter()
-            .map(|&x| 1.0 / (1.0 + (-self.sensitivity as f32 * x).exp()))
+            .map(|&x| {
+                let clamped = x.clamp(-20.0, 20.0);
+                1.0 / (1.0 + (-s * clamped).exp())
+            })
             .collect()
     }
 
@@ -444,18 +454,12 @@ impl MetaDataModel {
             }
         };
 
-        // The meta model outputs raw logits — apply sigmoid to obtain
-        // occurrence probabilities before comparing to sf_thresh.
-        // This matches BirdNET Analyzer's `custom_sigmoid(prediction)`.
-        let filter: Vec<f32> = output
-            .iter()
-            .map(|&x| {
-                let clamped = x.clamp(-15.0, 15.0);
-                1.0 / (1.0 + (-clamped).exp())
-            })
-            .collect();
+        // BirdNET-Analyzer's explore() compares the meta-model output
+        // DIRECTLY to LOCATION_FILTER_THRESHOLD (no sigmoid).  The model
+        // already outputs occurrence probabilities in [0, 1].
+        let raw: Vec<f32> = output.iter().copied().collect();
 
-        let mut scored: Vec<(f32, &str)> = filter
+        let mut scored: Vec<(f32, &str)> = raw
             .iter()
             .zip(self.labels.iter())
             .map(|(&score, label)| (score, label.as_str()))
@@ -465,9 +469,9 @@ impl MetaDataModel {
         // Log the value range and top/bottom species for diagnostics.
         if let (Some(top), Some(bot)) = (scored.first(), scored.last()) {
             tracing::info!(
-                "Meta-model output: {}/{} labels, sigmoid range [{:.4}, {:.4}], \
-                 top={} ({:.4}), bottom={} ({:.4})",
-                filter.len(),
+                "Meta-model raw output: {}/{} labels, range [{:.6}, {:.6}], \
+                 top={} ({:.6}), bottom={} ({:.6})",
+                raw.len(),
                 self.labels.len(),
                 bot.0,
                 top.0,

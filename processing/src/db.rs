@@ -75,6 +75,11 @@ pub fn initialize(db_path: &Path) -> Result<()> {
             UNIQUE(Date, Hour, Category)
         );
         CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     ",
     )
     .context("Failed to create tables")?;
@@ -217,4 +222,44 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
     }
 
     Ok(())
+}
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+/// Read a single setting from the `settings` table.
+/// Returns `None` if the table or key doesn't exist.
+pub fn get_setting(db_path: &Path, key: &str) -> Option<String> {
+    let conn = Connection::open(db_path).ok()?;
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Read a setting as `f64`, returning `None` on missing / parse error.
+pub fn get_setting_f64(db_path: &Path, key: &str) -> Option<f64> {
+    get_setting(db_path, key).and_then(|v| v.parse().ok())
+}
+
+/// Refresh a `Config` with any overrides stored in the settings table.
+///
+/// This is called on each poll cycle so that changes made via the web UI
+/// take effect without restarting the processing container.
+pub fn apply_settings_overrides(config: &mut gaia_common::config::Config) {
+    let db = &config.db_path.clone();
+    if let Some(v) = get_setting_f64(db, "sensitivity") {
+        config.sensitivity = v;
+    }
+    if let Some(v) = get_setting_f64(db, "confidence") {
+        config.confidence = v;
+    }
+    if let Some(v) = get_setting_f64(db, "sf_thresh") {
+        config.sf_thresh = v;
+    }
+    if let Some(v) = get_setting_f64(db, "overlap") {
+        config.overlap = v;
+    }
 }
