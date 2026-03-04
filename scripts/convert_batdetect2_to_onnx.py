@@ -116,12 +116,10 @@ def main():
         onnx_path,
         input_names=["spectrogram"],
         output_names=["detection_prob", "detection_size", "class_prob"],
-        dynamic_axes={
-            "spectrogram": {0: "batch", 3: "time"},
-            "detection_prob": {0: "batch", 3: "time"},
-            "detection_size": {0: "batch", 3: "time"},
-            "class_prob": {0: "batch", 3: "time"},
-        },
+        # Fixed dimensions — no dynamic axes.  BatDetect2's U-Net uses
+        # Resize (upsample) ops whose output-shape inference in tract
+        # fails when dimensions are symbolic.  The processing pipeline
+        # tiles audio into fixed-length chunks anyway.
         opset_version=17,
         do_constant_folding=True,
     )
