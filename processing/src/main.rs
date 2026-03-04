@@ -58,6 +58,11 @@ fn main() -> Result<()> {
 
     // ── auto-download models from Zenodo if needed ───────────────────
     for m in &mut manifests {
+        // Download individual files (e.g. ONNX from HuggingFace)
+        if let Err(e) = download::ensure_direct_files(m) {
+            tracing::warn!("Direct file download failed for {}: {e:#}", m.manifest.model.name);
+        }
+        // Download variant-based files from Zenodo
         if let Some(variant) = m.effective_variant(config.model_variant.as_deref()) {
             download::ensure_model_files(m, &variant)?;
         }

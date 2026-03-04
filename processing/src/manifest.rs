@@ -58,6 +58,10 @@ pub struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelSection {
     pub name: String,
+    /// Short machine-friendly identifier (e.g. `"birdnet"`).  Derived
+    /// from `name` when not explicitly set in the manifest.
+    #[serde(default)]
+    pub slug: Option<String>,
     pub domain: String,
     pub sample_rate: u32,
     pub chunk_duration: f64,
@@ -74,6 +78,12 @@ pub struct ModelSection {
     /// Whether to apply softmax to raw logits (e.g. Perch).
     #[serde(default)]
     pub apply_softmax: bool,
+    /// When `true`, the ONNX model is a classifier sub-model that expects
+    /// a precomputed mel-spectrogram input `[1, 96, 511, 2]` instead of
+    /// raw audio `[1, N]`.  Only BirdNET V2.4's extracted classifier needs
+    /// this; most ONNX models (e.g. Perch) accept raw audio directly.
+    #[serde(default)]
+    pub onnx_is_classifier: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,15 +106,19 @@ pub struct LanguageSection {
     pub dir: String,
 }
 
-/// Zenodo download configuration – allows automatic model fetching.
+/// Download configuration – automatic model fetching from Zenodo or
+/// direct URLs (e.g. HuggingFace).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadSection {
-    /// Zenodo record ID (e.g. "15050749").
-    pub zenodo_record_id: String,
+    /// Zenodo record ID (e.g. "15050749").  Required for Zenodo downloads;
+    /// omit for models using only `direct_files`.
+    #[serde(default)]
+    pub zenodo_record_id: Option<String>,
     /// Default variant if `MODEL_VARIANT` is not set (e.g. "fp16").
     #[serde(default = "default_variant")]
     pub default_variant: String,
-    /// Map of variant name → download info.
+    /// Map of variant name → download info.  Empty for non-Zenodo models.
+    #[serde(default)]
     pub variants: HashMap<String, VariantInfo>,
     /// Optional Keras zip filename on Zenodo for ONNX conversion.
     /// When specified, `ensure_onnx_file()` will download this zip,
@@ -115,6 +129,18 @@ pub struct DownloadSection {
     /// Expected MD5 hex digest of the Keras zip file.
     #[serde(default)]
     pub keras_md5: Option<String>,
+    /// Direct file downloads: maps local filename → remote URL.
+    ///
+    /// Files are downloaded individually (not from a Zenodo zip).  Useful
+    /// for models hosted on HuggingFace or other direct-download sources.
+    ///
+    /// ```toml
+    /// [download.direct_files]
+    /// "model.onnx" = "https://huggingface.co/org/repo/resolve/main/model.onnx"
+    /// "labels.csv" = "https://huggingface.co/org/repo/resolve/main/labels.csv"
+    /// ```
+    #[serde(default)]
+    pub direct_files: HashMap<String, String>,
 }
 
 /// Information about a single model variant available on Zenodo.
@@ -206,6 +232,43 @@ impl ResolvedManifest {
         &self.manifest.model.domain
     }
 
+    /// Short machine-friendly identifier for the model.
+    ///
+    /// Uses the explicit `slug` from the manifest when present, otherwise
+    /// derives one from the model name (lower-case, non-alphanumeric
+    /// characters replaced with `-`, collapsed, trimmed).
+    pub fn slug(&self) -> String {
+        if let Some(ref s) = self.manifest.model.slug {
+            if !s.is_empty() {
+                return s.clone();
+            }
+        }
+        // Derive from name: "BirdNET V2.4" → "birdnet-v2-4"
+        let raw: String = self
+            .manifest
+            .model
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        // Collapse consecutive dashes and trim leading/trailing
+        let mut slug = String::with_capacity(raw.len());
+        let mut prev_dash = true; // suppress leading dash
+        for c in raw.chars() {
+            if c == '-' {
+                if !prev_dash {
+                    slug.push('-');
+                }
+                prev_dash = true;
+            } else {
+                slug.push(c);
+                prev_dash = false;
+            }
+        }
+        slug.trim_end_matches('-').to_string()
+    }
+
     /// Apply variant overrides from the `[download]` section.
     ///
     /// If the selected variant provides `tflite_file`, `labels_file`, or
@@ -216,6 +279,12 @@ impl ResolvedManifest {
             Some(d) => d.clone(),
             None => return Ok(()),
         };
+
+        // Models with only direct_files (no Zenodo variants) skip
+        // variant resolution entirely — there's nothing to override.
+        if download.variants.is_empty() {
+            return Ok(());
+        }
 
         let variant = download
             .variants
@@ -399,7 +468,7 @@ tflite_file = "model_int8.tflite"
 "#;
         let m: Manifest = toml::from_str(toml).unwrap();
         let dl = m.download.as_ref().unwrap();
-        assert_eq!(dl.zenodo_record_id, "15050749");
+        assert_eq!(dl.zenodo_record_id.as_deref(), Some("15050749"));
         assert_eq!(dl.default_variant, "fp16");
         assert_eq!(dl.variants.len(), 3);
         assert_eq!(dl.variants["fp32"].zenodo_file, "BirdNET_v2.4_tflite.zip");

@@ -1,0 +1,48 @@
+# Example model manifest for Google Perch 2.0
+#
+# Place this file as manifest.toml inside a model directory, e.g.:
+#   /models/perch/manifest.toml
+#
+# The processing server auto-discovers all subdirectories of MODEL_DIR
+# that contain a manifest.toml.
+#
+# If model files are missing and a [download] section is present, the
+# server will automatically download them from HuggingFace.
+
+[model]
+name = "Google Perch 2.0"
+slug = "perch"
+domain = "wildlife"
+sample_rate = 32000
+chunk_duration = 5.0
+# Perch is ONNX-only — no TFLite file needed for inference.
+# Set to a placeholder; the ONNX path takes priority when present.
+tflite_file = "model.tflite"
+onnx_file = "model.onnx"
+labels_file = "labels.csv"
+# Perch does not use V1-style metadata input
+v1_metadata = false
+# Perch outputs raw logits — softmax converts them to probabilities
+apply_softmax = true
+# Perch's ONNX model accepts raw audio [1, N], NOT mel spectrograms.
+# Only BirdNET's extracted classifier sub-model needs this set to true.
+onnx_is_classifier = false
+
+# ── Automatic download from HuggingFace ──────────────────────────────
+#
+# The processing server downloads individual files on first start.
+# No Zenodo record or variant system — Perch has a single ONNX model.
+#
+# Source: https://huggingface.co/google/bird-vocalization-classifier
+#         (ONNX export by justinchuby/Perch-onnx)
+#
+# Species coverage: ~15,000 species including birds, frogs, crickets,
+# grasshoppers, and mammals.
+
+[download]
+# No Zenodo variants — files are downloaded directly from HuggingFace.
+default_variant = "default"
+
+[download.direct_files]
+"model.onnx" = "https://huggingface.co/google/bird-vocalization-classifier/resolve/main/model.onnx"
+"labels.csv" = "https://huggingface.co/google/bird-vocalization-classifier/resolve/main/labels.csv"

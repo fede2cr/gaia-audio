@@ -502,6 +502,13 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
     );
+    // Migration: add model tracking columns.
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Model_Slug VARCHAR(100) NOT NULL DEFAULT '';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Model_Name VARCHAR(200) NOT NULL DEFAULT '';",
+    );
 
     Ok(())
 }

@@ -91,6 +91,8 @@ fn run_analysis(
     config: &Config,
 ) -> Result<(Vec<Detection>, Vec<LivePrediction>)> {
     let domain = model.domain().to_string();
+    let model_slug = model.manifest.slug();
+    let model_name = model.manifest.manifest.model.name.clone();
 
     // ── custom species lists ─────────────────────────────────────────
     let base = std::env::var("GAIA_DIR").unwrap_or_else(|_| "/app".to_string());
@@ -241,6 +243,8 @@ fn run_analysis(
                 *confidence,
             );
             det.excluded = excluded;
+            det.model_slug = model_slug.clone();
+            det.model_name = model_name.clone();
             confident_detections.push(det);
         }
     }

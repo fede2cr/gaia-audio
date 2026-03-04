@@ -18,6 +18,7 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
 
     let datetime = format!("{} {}", &detection.date, &detection.time);
     let source_label = detection.source_label();
+    let model_label = detection.model_label();
     let is_excluded = detection.excluded;
 
     // URLs for the extracted audio clip and its spectrogram
@@ -61,6 +62,7 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
                 <div class="detection-meta">
                     <span class="domain-badge">{&detection.domain}</span>
                     <span class={confidence_class}>{confidence_pct}</span>
+                    <span class="model-badge" title="Detection model">"🧠 " {model_label}</span>
                     {if is_excluded {
                         view! { <span class="excluded-badge">"Excluded"</span> }.into_view()
                     } else {

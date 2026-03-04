@@ -1,9 +1,14 @@
 //! Excluded species page – lists species excluded by the occurrence threshold
 //! filter, with the ability for an ornithologist to override the exclusion.
+//!
+//! Each species card can be expanded to show the individual excluded
+//! detections with spectrograms and audio playback, so the user can
+//! listen before deciding whether to confirm the override.
 
 use leptos::*;
 
-use crate::model::ExcludedSpecies;
+use crate::components::detection_card::DetectionCard;
+use crate::model::{ExcludedSpecies, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
@@ -43,6 +48,25 @@ pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnErro
     crate::server::db::remove_exclusion_override(&state.db_path, &scientific_name)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(())
+}
+
+#[server(GetExcludedDetections, "/api")]
+pub async fn get_excluded_detections(
+    scientific_name: String,
+) -> Result<Vec<WebDetection>, ServerFnError> {
+    use crate::server::{db, inaturalist};
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    let mut detections = db::excluded_detections_for_species(&state.db_path, &scientific_name, 20)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    // Enrich with iNaturalist images
+    for det in detections.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &det.scientific_name).await {
+            det.image_url = Some(photo.medium_url);
+        }
+    }
+    Ok(detections)
 }
 
 // ─── Page component ──────────────────────────────────────────────────────────
@@ -172,6 +196,20 @@ fn ExcludedCard(
         "excluded-card"
     };
 
+    // ── expandable detections drawer ─────────────────────────────────
+    let (expanded, set_expanded) = create_signal(false);
+    let sci_name_det = sci_name.clone();
+    let detections = create_resource(
+        move || (expanded.get(), sci_name_det.clone()),
+        move |(open, name)| async move {
+            if open {
+                get_excluded_detections(name).await
+            } else {
+                Ok(vec![])
+            }
+        },
+    );
+
     view! {
         <div class={card_class}>
             <div class="excluded-thumb">
@@ -204,6 +242,12 @@ fn ExcludedCard(
                 </div>
 
                 <div class="excluded-actions">
+                    <button
+                        class="btn btn-sm btn-review"
+                        on:click=move |_| set_expanded.update(|v| *v = !*v)
+                    >
+                        {move || if expanded.get() { "Hide Recordings ▲" } else { "Review Recordings ▼" }}
+                    </button>
                     {if is_overridden {
                         view! {
                             <span class="override-badge">"✓ Confirmed"</span>
@@ -227,6 +271,37 @@ fn ExcludedCard(
                         }.into_view()
                     }}
                 </div>
+
+                // Expanded detections drawer
+                {move || if expanded.get() {
+                    view! {
+                        <div class="excluded-detections">
+                            <Suspense fallback=move || view! { <p class="loading">"Loading recordings…"</p> }>
+                                {move || detections.get().map(|res| match res {
+                                    Ok(dets) if dets.is_empty() => view! {
+                                        <p class="no-detections">"No audio clips available for this species."</p>
+                                    }.into_view(),
+                                    Ok(dets) => view! {
+                                        <div class="excluded-detection-list">
+                                            <For
+                                                each=move || dets.clone()
+                                                key=|d| d.id
+                                                children=move |det: WebDetection| {
+                                                    view! { <DetectionCard detection=det/> }
+                                                }
+                                            />
+                                        </div>
+                                    }.into_view(),
+                                    Err(e) => view! {
+                                        <p class="error">"Error: " {e.to_string()}</p>
+                                    }.into_view(),
+                                })}
+                            </Suspense>
+                        </div>
+                    }.into_view()
+                } else {
+                    view! {}.into_view()
+                }}
             </div>
         </div>
     }

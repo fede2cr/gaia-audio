@@ -171,8 +171,13 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     // ── choose format ────────────────────────────────────────────────
     let (runner, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
-            info!("Loading ONNX classifier from {}", onnx_path.display());
-            (load_onnx_runner(&onnx_path)?, true)
+            let is_classifier = resolved.manifest.model.onnx_is_classifier;
+            info!(
+                "Loading ONNX model from {} (classifier={})",
+                onnx_path.display(),
+                is_classifier
+            );
+            (load_onnx_runner(&onnx_path)?, is_classifier)
         } else {
             info!(
                 "ONNX file configured but missing ({}), falling back to TFLite",
@@ -506,23 +511,48 @@ impl MetaDataModel {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Load label file.  Each line is one label.
-/// Labels of the form `Sci Name_Common Name` are normalised to `Sci Name`.
+/// Load label file.
+///
+/// Supports two formats:
+///   - **Plain text** (`.txt`): one label per line.
+///     Labels of the form `Sci Name_Common Name` are normalised to `Sci Name`.
+///   - **CSV** (`.csv`): comma-separated values.  The first column is used
+///     as the label; an optional header row starting with `ebird` or
+///     `species` is skipped.
 fn load_labels(label_path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(label_path)
         .with_context(|| format!("Cannot read labels: {}", label_path.display()))?;
 
-    let labels: Vec<String> = text
-        .lines()
-        .map(|line| {
-            let line = line.trim();
-            if line.matches('_').count() == 1 {
-                line.split('_').next().unwrap_or(line).to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
+    let is_csv = label_path
+        .extension()
+        .map_or(false, |ext| ext.eq_ignore_ascii_case("csv"));
+
+    let labels: Vec<String> = if is_csv {
+        text.lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            // Skip header rows (e.g. "ebird_code,..." or "species,...")
+            .filter(|line| {
+                let lower = line.to_lowercase();
+                !lower.starts_with("ebird") && !lower.starts_with("species")
+            })
+            .map(|line| {
+                // Take the first CSV column
+                line.split(',').next().unwrap_or(line).trim().to_string()
+            })
+            .collect()
+    } else {
+        text.lines()
+            .map(|line| {
+                let line = line.trim();
+                if line.matches('_').count() == 1 {
+                    line.split('_').next().unwrap_or(line).to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    };
 
     info!("Loaded {} labels from {}", labels.len(), label_path.display());
     Ok(labels)

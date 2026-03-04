@@ -29,6 +29,13 @@ pub struct Detection {
     /// Populated after extraction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name_extr: Option<String>,
+    /// Short identifier for the model that produced this detection
+    /// (e.g. `"birdnet"`, `"perch"`).
+    #[serde(default)]
+    pub model_slug: String,
+    /// Human-readable model name (e.g. `"BirdNET V2.4"`).
+    #[serde(default)]
+    pub model_name: String,
 }
 
 impl Detection {
@@ -64,6 +71,8 @@ impl Detection {
             common_name_safe,
             excluded: false,
             file_name_extr: None,
+            model_slug: String::new(),
+            model_name: String::new(),
         }
     }
 

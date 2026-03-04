@@ -33,14 +33,16 @@ pub fn recent_detections(
     let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
         Some(rid) => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-             COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+             COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
              FROM detections WHERE rowid > ?1 ORDER BY rowid DESC LIMIT ?2"
                 .into(),
             vec![Box::new(rid), Box::new(limit)],
         ),
         None => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-             COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+             COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
              FROM detections ORDER BY rowid DESC LIMIT ?1"
                 .into(),
             vec![Box::new(limit)],
@@ -61,6 +63,8 @@ pub fn recent_detections(
             source_node: row.get(8)?,
             excluded: row.get::<_, i32>(9)? != 0,
             image_url: None,
+            model_slug: row.get(10)?,
+            model_name: row.get(11)?,
         })
     })?;
 
@@ -113,7 +117,8 @@ pub fn day_detections(
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
-         COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
+         COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
          FROM detections WHERE Date = ?1 ORDER BY Sci_Name, Time DESC",
     )?;
 
@@ -131,6 +136,8 @@ pub fn day_detections(
                 source_node: row.get(8)?,
                 excluded: row.get::<_, i32>(9)? != 0,
                 image_url: None,
+                model_slug: row.get(10)?,
+                model_name: row.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -361,6 +368,46 @@ pub fn excluded_species(db_path: &Path) -> Result<Vec<ExcludedSpecies>, rusqlite
             max_confidence: row.get(5)?,
             image_url: None,
             overridden: row.get::<_, i32>(6)? != 0,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Return individual excluded detections for a given species, newest first.
+///
+/// Used by the Excluded page so the user can listen to / inspect the
+/// recordings before confirming an override.
+pub fn excluded_detections_for_species(
+    db_path: &Path,
+    scientific_name: &str,
+    limit: u32,
+) -> Result<Vec<WebDetection>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+         COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         FROM detections \
+         WHERE Sci_Name = ?1 AND COALESCE(Excluded, 0) = 1 \
+         ORDER BY Date DESC, Time DESC LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![scientific_name, limit], |row| {
+        Ok(WebDetection {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+            scientific_name: row.get(2)?,
+            common_name: row.get(3)?,
+            confidence: row.get(4)?,
+            date: row.get(5)?,
+            time: row.get(6)?,
+            file_name: row.get(7)?,
+            source_node: row.get(8)?,
+            excluded: row.get::<_, i32>(9)? != 0,
+            image_url: None,
+            model_slug: row.get(10)?,
+            model_name: row.get(11)?,
         })
     })?;
 

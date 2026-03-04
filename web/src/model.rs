@@ -22,6 +22,12 @@ pub struct WebDetection {
     /// Species photo URL from iNaturalist (populated server-side).
     #[serde(default)]
     pub image_url: Option<String>,
+    /// Short identifier for the model that produced this detection.
+    #[serde(default)]
+    pub model_slug: String,
+    /// Human-readable model name (e.g. `"BirdNET V2.4"`).
+    #[serde(default)]
+    pub model_name: String,
 }
 
 impl WebDetection {
@@ -60,6 +66,20 @@ impl WebDetection {
             .trim_start_matches("https://")
             .trim_end_matches('/')
             .to_string()
+    }
+
+    /// Display label for the model that produced this detection.
+    ///
+    /// Prefers `model_name` (human-readable) but falls back to
+    /// `model_slug` or `"Unknown model"`.
+    pub fn model_label(&self) -> String {
+        if !self.model_name.is_empty() {
+            self.model_name.clone()
+        } else if !self.model_slug.is_empty() {
+            self.model_slug.clone()
+        } else {
+            "Unknown model".to_string()
+        }
     }
 }
 

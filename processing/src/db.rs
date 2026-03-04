@@ -95,6 +95,8 @@ pub fn initialize(db_path: &Path) -> Result<()> {
     migrate_add_source_node(&conn);
     // Migration: add Excluded column to existing databases.
     migrate_add_excluded(&conn);
+    // Migration: add Model_Slug and Model_Name columns.
+    migrate_add_model_columns(&conn);
 
     info!("Database schema verified");
     Ok(())
@@ -113,6 +115,16 @@ fn migrate_add_source_node(conn: &Connection) {
 fn migrate_add_excluded(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
+    );
+}
+
+/// Add model tracking columns if they don't exist (idempotent).
+fn migrate_add_model_columns(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Model_Slug VARCHAR(100) NOT NULL DEFAULT '';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE detections ADD COLUMN Model_Name VARCHAR(200) NOT NULL DEFAULT '';",
     );
 }
 
@@ -156,8 +168,9 @@ fn try_insert(
     let conn = Connection::open(db_path)?;
     conn.execute(
         "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
-         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
+         Model_Slug, Model_Name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             d.date,
             d.time,
@@ -174,6 +187,8 @@ fn try_insert(
             file_name,
             source_node,
             d.excluded as i32,
+            d.model_slug,
+            d.model_name,
         ],
     )?;
     Ok(())
