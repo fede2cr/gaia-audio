@@ -444,7 +444,16 @@ impl MetaDataModel {
             }
         };
 
-        let filter: Vec<f32> = output.iter().copied().collect();
+        // The meta model outputs raw logits — apply sigmoid to obtain
+        // occurrence probabilities before comparing to sf_thresh.
+        // This matches BirdNET Analyzer's `custom_sigmoid(prediction)`.
+        let filter: Vec<f32> = output
+            .iter()
+            .map(|&x| {
+                let clamped = x.clamp(-15.0, 15.0);
+                1.0 / (1.0 + (-clamped).exp())
+            })
+            .collect();
 
         let mut scored: Vec<(f32, &str)> = filter
             .iter()
@@ -453,11 +462,37 @@ impl MetaDataModel {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Log the value range and top/bottom species for diagnostics.
+        if let (Some(top), Some(bot)) = (scored.first(), scored.last()) {
+            tracing::info!(
+                "Meta-model output: {}/{} labels, sigmoid range [{:.4}, {:.4}], \
+                 top={} ({:.4}), bottom={} ({:.4})",
+                filter.len(),
+                self.labels.len(),
+                bot.0,
+                top.0,
+                top.1,
+                top.0,
+                bot.1,
+                bot.0,
+            );
+        }
+
         let list: Vec<String> = scored
             .iter()
             .filter(|(score, _)| *score >= self.sf_thresh as f32)
             .map(|(_, label)| label.split('_').next().unwrap_or(label).to_string())
             .collect();
+
+        tracing::info!(
+            "Species range filter: {} of {} species pass sf_thresh={:.3} at ({}, {}) week {}",
+            list.len(),
+            self.labels.len(),
+            self.sf_thresh,
+            lat,
+            lon,
+            week,
+        );
 
         self.cached_params = Some(params);
         self.cached_list = list.clone();
