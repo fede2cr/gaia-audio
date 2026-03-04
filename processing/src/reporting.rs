@@ -59,24 +59,34 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
 
     // ── real species detections ──────────────────────────────────────
     for detection in &species_dets {
-        let extracted_path = extract_detection(file, detection, config)?;
-
-        let spec_path = format!("{}.png", extracted_path.display());
-        let spec_params = SpectrogramParams {
-            colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
-            ..SpectrogramParams::default()
+        // Attempt audio clip extraction.  Extraction failure MUST NOT
+        // prevent the detection from being recorded in the database.
+        let extracted = match extract_detection(file, detection, config) {
+            Ok(path) => {
+                let spec_path = format!("{}.png", path.display());
+                let spec_params = SpectrogramParams {
+                    colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
+                    ..SpectrogramParams::default()
+                };
+                if let Err(e) = spectrogram::generate_from_wav(
+                    &path,
+                    Path::new(&spec_path),
+                    &spec_params,
+                ) {
+                    warn!("Spectrogram failed for {}: {e}", path.display());
+                }
+                Some(path)
+            }
+            Err(e) => {
+                warn!("Clip extraction failed (detection will still be recorded): {e:#}");
+                None
+            }
         };
-        if let Err(e) = spectrogram::generate_from_wav(
-            &extracted_path,
-            Path::new(&spec_path),
-            &spec_params,
-        ) {
-            warn!("Spectrogram failed for {}: {e}", extracted_path.display());
-        }
 
         let summary = format_summary(detection, config);
-        let basename = extracted_path
-            .file_name()
+        let basename = extracted
+            .as_ref()
+            .and_then(|p| p.file_name())
             .unwrap_or_default()
             .to_string_lossy();
         info!("{summary};{basename}");
@@ -159,12 +169,18 @@ fn extract_detection(
     let safe_start = (detection.start - spacer).max(0.0);
     let safe_stop = (detection.stop + spacer).min(config.recording_length as f64);
 
+    let model_tag = if detection.model_slug.is_empty() {
+        "unknown"
+    } else {
+        &detection.model_slug
+    };
     let new_name = format!(
-        "{}-{}-{}-{}-birdnet-{}{}.wav",
+        "{}-{}-{}-{}-{}-{}{}.wav",
         detection.domain,
         detection.common_name_safe,
         detection.confidence_pct(),
         detection.date,
+        model_tag,
         file.rtsp_id,
         detection.time,
     );

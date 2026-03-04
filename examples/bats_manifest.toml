@@ -1,18 +1,42 @@
-# Example model manifest for a bat detection model.
+# Model manifest for BatDetect2
 #
-# This is a hypothetical example showing how to configure a non-bird model.
-# Adjust tflite_file, labels_file, and parameters for your actual model.
+# Place this file as manifest.toml inside a model directory, e.g.:
+#   /models/bats/manifest.toml
+#
+# BatDetect2 is a deep-learning bat echolocation call detector and
+# species classifier developed by the Biodiversity Research team at
+# the Alan Turing Institute.
+#
+# Source: https://github.com/macaodha/batdetect2
+# ONNX: https://huggingface.co/macaodha/batdetect2
 
 [model]
 name = "BatDetect2"
+slug = "batdetect2"
 domain = "bats"
-# Bat echolocation is ultrasonic — models typically need high sample rates
+# Bat echolocation is ultrasonic — BatDetect2 expects 256 kHz audio.
 sample_rate = 256000
 chunk_duration = 1.0
 tflite_file = "batdetect2.tflite"
-labels_file = "bat_labels.txt"
+onnx_file = "batdetect2.onnx"
+labels_file = "labels.csv"
 v1_metadata = false
+# BatDetect2 outputs raw logits — softmax converts them to probabilities
 apply_softmax = true
+# Accepts raw audio waveform, not mel spectrograms
+onnx_is_classifier = false
 
 # No metadata model for bats
 # [metadata_model]
+
+# ── Automatic download from HuggingFace ──────────────────────────────
+#
+# The processing server downloads individual files on first start.
+# No Zenodo variants — BatDetect2 has a single ONNX model.
+
+[download]
+default_variant = "default"
+
+[download.direct_files]
+"batdetect2.onnx" = "https://huggingface.co/macaodha/batdetect2/resolve/main/batdetect2.onnx"
+"labels.csv" = "https://huggingface.co/macaodha/batdetect2/resolve/main/labels.csv"
