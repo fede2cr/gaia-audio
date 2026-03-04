@@ -33,8 +33,12 @@ onnx_is_classifier = false
 # The processing server downloads individual files on first start.
 # No Zenodo record or variant system — Perch has a single ONNX model.
 #
-# Source: https://huggingface.co/google/bird-vocalization-classifier
-#         (ONNX export by justinchuby/Perch-onnx)
+# Source: https://huggingface.co/justinchuby/Perch-onnx  (ONNX model, public)
+#         https://huggingface.co/cgeorgiaw/Perch          (labels, public)
+#
+# The Google repo (google/bird-vocalization-classifier) is gated and
+# requires authentication.  These community mirrors are Apache-2.0
+# licensed and publicly accessible without login.
 #
 # Species coverage: ~15,000 species including birds, frogs, crickets,
 # grasshoppers, and mammals.
@@ -44,5 +48,5 @@ onnx_is_classifier = false
 default_variant = "default"
 
 [download.direct_files]
-"model.onnx" = "https://huggingface.co/google/bird-vocalization-classifier/resolve/main/model.onnx"
-"labels.csv" = "https://huggingface.co/google/bird-vocalization-classifier/resolve/main/labels.csv"
+"model.onnx" = "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2_no_dft.onnx"
+"labels.csv" = "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv"

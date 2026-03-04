@@ -1,14 +1,25 @@
 # Model manifest for BatDetect2
 #
 # Place this file as manifest.toml inside a model directory, e.g.:
-#   /models/bats/manifest.toml
+#   /models/batdetect2/manifest.toml
 #
 # BatDetect2 is a deep-learning bat echolocation call detector and
 # species classifier developed by the Biodiversity Research team at
 # the Alan Turing Institute.
 #
 # Source: https://github.com/macaodha/batdetect2
-# ONNX: https://huggingface.co/macaodha/batdetect2
+#
+# STATUS: Experimental.  The processing infrastructure (container,
+# manifest seeding, MODEL_SLUGS filtering) is in place, but the
+# model itself requires PyTorch → ONNX conversion before it can be
+# loaded by gaia-processing's tract runtime.  See MODELS.md for
+# details.
+#
+# The PyTorch weights (Net2DFast_UK_same.pth.tar, ~7.6 MB) are
+# publicly available in the GitHub repo and can be downloaded with:
+#   pip install batdetect2
+# or directly from:
+#   https://raw.githubusercontent.com/macaodha/batdetect2/main/batdetect2/models/Net2DFast_UK_same.pth.tar
 
 [model]
 name = "BatDetect2"
@@ -29,14 +40,16 @@ onnx_is_classifier = false
 # No metadata model for bats
 # [metadata_model]
 
-# ── Automatic download from HuggingFace ──────────────────────────────
+# ── Manual download required ─────────────────────────────────────────
 #
-# The processing server downloads individual files on first start.
-# No Zenodo variants — BatDetect2 has a single ONNX model.
-
-[download]
-default_variant = "default"
-
-[download.direct_files]
-"batdetect2.onnx" = "https://huggingface.co/macaodha/batdetect2/resolve/main/batdetect2.onnx"
-"labels.csv" = "https://huggingface.co/macaodha/batdetect2/resolve/main/labels.csv"
+# BatDetect2 ships as a PyTorch checkpoint (.pth.tar) and needs to be
+# exported to ONNX before use.  The HuggingFace repo (macaodha/batdetect2)
+# is gated and requires authentication.
+#
+# To prepare the model:
+#   1. pip install batdetect2
+#   2. Export to ONNX (script TBD)
+#   3. Place batdetect2.onnx and labels.csv in /models/batdetect2/
+#
+# PyTorch weights (public):
+#   https://raw.githubusercontent.com/macaodha/batdetect2/main/batdetect2/models/Net2DFast_UK_same.pth.tar

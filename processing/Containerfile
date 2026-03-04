@@ -114,6 +114,13 @@ COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/aud
 # Location-based species filtering without tract-tflite STRIDED_SLICE issues.
 COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta-model.onnx
 
+# Bundle all model manifests so the entrypoint can seed them into the
+# models volume automatically.  Each manifest goes into its own
+# subdirectory matching the slug used at runtime.
+COPY examples/birds_manifest.toml /usr/local/share/gaia/manifests/birdnet/manifest.toml
+COPY examples/perch_manifest.toml /usr/local/share/gaia/manifests/perch/manifest.toml
+COPY examples/bats_manifest.toml  /usr/local/share/gaia/manifests/batdetect2/manifest.toml
+
 RUN mkdir -p /etc/gaia /data /models
 
 # Default config — override by mounting your own
@@ -131,7 +138,12 @@ POLL_INTERVAL_SECS=5\n\
 RECS_DIR=/data\n\
 EXTRACTED=/data/extracted\n' > /etc/gaia/gaia.conf
 
+# Entrypoint script seeds bundled manifests into the models volume
+# (no-clobber) before starting the processing server.
+COPY processing/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 VOLUME ["/data", "/models"]
 
-ENTRYPOINT ["gaia-processing"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/etc/gaia/gaia.conf"]

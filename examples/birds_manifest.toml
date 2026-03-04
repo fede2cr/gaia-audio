@@ -11,6 +11,7 @@
 
 [model]
 name = "BirdNET V2.4"
+slug = "birdnet"
 domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
