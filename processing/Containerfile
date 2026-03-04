@@ -93,6 +93,21 @@ RUN python3 download_meta_tflite.py && \
     rm /convert/meta-model.tflite && \
     ls -lh /convert/meta-model.onnx
 
+# ── BatDetect2 PyTorch → ONNX conversion at build time ────────────
+# Downloads the batdetect2 pip package (includes the ~7.6 MB PyTorch
+# checkpoint), exports the model to ONNX using torch.onnx.export,
+# and extracts the species class labels.
+#
+# Uses a separate stage with PyTorch to keep the runtime image lean.
+FROM python:3.11-slim AS batconverter
+
+RUN pip install --no-cache-dir batdetect2 onnxruntime
+
+WORKDIR /convert
+COPY scripts/convert_batdetect2_to_onnx.py .
+RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
+    ls -lh /convert/batdetect2.onnx /convert/labels.csv
+
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
 # No Python, no TensorFlow — all inference runs in native Rust.
@@ -114,12 +129,22 @@ COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/aud
 # Location-based species filtering without tract-tflite STRIDED_SLICE issues.
 COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta-model.onnx
 
+# Pre-converted BatDetect2 ONNX model (~7.6 MB) + species labels.
+# The PyTorch checkpoint is exported to ONNX at build time in the
+# batconverter stage, so no Python/PyTorch is needed at runtime.
+COPY --from=batconverter /convert/batdetect2.onnx  /usr/local/share/gaia/models/batdetect2.onnx
+COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models/batdetect2-labels.csv
+
 # Bundle all model manifests so the entrypoint can seed them into the
 # models volume automatically.  Each manifest goes into its own
 # subdirectory matching the slug used at runtime.
 COPY examples/birds_manifest.toml /usr/local/share/gaia/manifests/birdnet/manifest.toml
 COPY examples/perch_manifest.toml /usr/local/share/gaia/manifests/perch/manifest.toml
 COPY examples/bats_manifest.toml  /usr/local/share/gaia/manifests/batdetect2/manifest.toml
+
+# Seed batdetect2 labels alongside the manifest so entrypoint.sh copies
+# them into /models/batdetect2/ (no-clobber) at container start.
+COPY --from=batconverter /convert/labels.csv /usr/local/share/gaia/manifests/batdetect2/labels.csv
 
 RUN mkdir -p /etc/gaia /data /models
 

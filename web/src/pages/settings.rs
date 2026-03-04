@@ -11,6 +11,7 @@ const DEFAULT_CONFIDENCE: f64 = 0.7;
 const DEFAULT_SF_THRESH: f64 = 0.03;
 const DEFAULT_OVERLAP: f64 = 0.0;
 const DEFAULT_COLORMAP: &str = "default";
+const DEFAULT_TZ_OFFSET: i32 = 0;
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
@@ -34,6 +35,7 @@ pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
         sf_thresh: f("sf_thresh", DEFAULT_SF_THRESH),
         overlap: f("overlap", DEFAULT_OVERLAP),
         colormap: map.get("colormap").cloned().unwrap_or_else(|| DEFAULT_COLORMAP.to_string()),
+        tz_offset: map.get("tz_offset").and_then(|v| v.parse::<i32>().ok()).unwrap_or(DEFAULT_TZ_OFFSET),
     })
 }
 
@@ -47,6 +49,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
     let sf = settings.sf_thresh.to_string();
     let ovlp = settings.overlap.to_string();
     let cmap = settings.colormap.clone();
+    let tz = settings.tz_offset.to_string();
 
     crate::server::db::save_settings(
         &state.db_path,
@@ -56,6 +59,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
             ("sf_thresh", &sf),
             ("overlap", &ovlp),
             ("colormap", &cmap),
+            ("tz_offset", &tz),
         ],
     )
     .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
@@ -81,6 +85,7 @@ pub fn SettingsPage() -> impl IntoView {
     let (sf_thresh, set_sf_thresh) = create_signal(DEFAULT_SF_THRESH);
     let (overlap, set_overlap) = create_signal(DEFAULT_OVERLAP);
     let (colormap, set_colormap) = create_signal(DEFAULT_COLORMAP.to_string());
+    let (tz_offset, set_tz_offset) = create_signal(DEFAULT_TZ_OFFSET);
 
     // Sync resource → local signals once loaded.
     create_effect(move |_| {
@@ -90,6 +95,7 @@ pub fn SettingsPage() -> impl IntoView {
             set_sf_thresh.set(s.sf_thresh);
             set_overlap.set(s.overlap);
             set_colormap.set(s.colormap);
+            set_tz_offset.set(s.tz_offset);
         }
     });
 
@@ -104,6 +110,7 @@ pub fn SettingsPage() -> impl IntoView {
             sf_thresh: sf_thresh.get(),
             overlap: overlap.get(),
             colormap: colormap.get(),
+            tz_offset: tz_offset.get(),
         };
 
         spawn_local(async move {
@@ -271,6 +278,56 @@ pub fn SettingsPage() -> impl IntoView {
                             <option value="magma"    selected=move || colormap.get() == "magma">"Magma (black → magenta → yellow)"</option>
                             <option value="viridis"  selected=move || colormap.get() == "viridis">"Viridis (purple → green → yellow)"</option>
                             <option value="grayscale" selected=move || colormap.get() == "grayscale">"Grayscale"</option>
+                        </select>
+                    </div>
+
+                    // ── Timezone offset ──────────────────────────
+                    <div class="setting-group">
+                        <label class="setting-label" for="tz_offset">
+                            "Timezone"
+                            <span class="setting-value">{move || {
+                                let h = tz_offset.get();
+                                if h >= 0 { format!("UTC+{h}") } else { format!("UTC{h}") }
+                            }}</span>
+                        </label>
+                        <p class="setting-help">
+                            "Offset from UTC for displayed timestamps (no DST). "
+                            "Recordings are always stored in UTC; this only affects the web interface."
+                        </p>
+                        <select
+                            id="tz_offset"
+                            class="setting-select"
+                            on:change=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<i32>() {
+                                    set_tz_offset.set(v);
+                                }
+                            }
+                        >
+                            <option value="-12" selected=move || tz_offset.get() == -12>"UTC−12"</option>
+                            <option value="-11" selected=move || tz_offset.get() == -11>"UTC−11"</option>
+                            <option value="-10" selected=move || tz_offset.get() == -10>"UTC−10 (Hawaii)"</option>
+                            <option value="-9"  selected=move || tz_offset.get() == -9>"UTC−9 (Alaska)"</option>
+                            <option value="-8"  selected=move || tz_offset.get() == -8>"UTC−8 (Pacific)"</option>
+                            <option value="-7"  selected=move || tz_offset.get() == -7>"UTC−7 (Mountain)"</option>
+                            <option value="-6"  selected=move || tz_offset.get() == -6>"UTC−6 (Central)"</option>
+                            <option value="-5"  selected=move || tz_offset.get() == -5>"UTC−5 (Eastern)"</option>
+                            <option value="-4"  selected=move || tz_offset.get() == -4>"UTC−4 (Atlantic)"</option>
+                            <option value="-3"  selected=move || tz_offset.get() == -3>"UTC−3"</option>
+                            <option value="-2"  selected=move || tz_offset.get() == -2>"UTC−2"</option>
+                            <option value="-1"  selected=move || tz_offset.get() == -1>"UTC−1"</option>
+                            <option value="0"   selected=move || tz_offset.get() == 0>"UTC+0 (UTC)"</option>
+                            <option value="1"   selected=move || tz_offset.get() == 1>"UTC+1 (CET)"</option>
+                            <option value="2"   selected=move || tz_offset.get() == 2>"UTC+2 (EET)"</option>
+                            <option value="3"   selected=move || tz_offset.get() == 3>"UTC+3 (Moscow)"</option>
+                            <option value="4"   selected=move || tz_offset.get() == 4>"UTC+4"</option>
+                            <option value="5"   selected=move || tz_offset.get() == 5>"UTC+5"</option>
+                            <option value="6"   selected=move || tz_offset.get() == 6>"UTC+6"</option>
+                            <option value="7"   selected=move || tz_offset.get() == 7>"UTC+7"</option>
+                            <option value="8"   selected=move || tz_offset.get() == 8>"UTC+8"</option>
+                            <option value="9"   selected=move || tz_offset.get() == 9>"UTC+9 (Japan)"</option>
+                            <option value="10"  selected=move || tz_offset.get() == 10>"UTC+10 (AEST)"</option>
+                            <option value="11"  selected=move || tz_offset.get() == 11>"UTC+11"</option>
+                            <option value="12"  selected=move || tz_offset.get() == 12>"UTC+12 (NZST)"</option>
                         </select>
                     </div>
 

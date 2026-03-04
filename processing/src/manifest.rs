@@ -348,6 +348,9 @@ pub fn load_manifest(dir: &Path) -> Result<ResolvedManifest> {
 /// Auto-discover all model manifests under `root_dir`.
 ///
 /// Each immediate subdirectory that contains a `manifest.toml` is loaded.
+/// When multiple directories yield the same slug (e.g. an old `birds/` and
+/// a new `birdnet/`), only the first one found is kept — duplicates are
+/// logged and skipped.
 pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     let mut manifests = Vec::new();
 
@@ -367,6 +370,7 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     }
 
     // Otherwise scan subdirectories
+    let mut seen_slugs = std::collections::HashSet::new();
     for entry in std::fs::read_dir(root_dir)
         .with_context(|| format!("Cannot read {}", root_dir.display()))?
     {
@@ -374,7 +378,19 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
         let path = entry.path();
         if path.is_dir() && path.join("manifest.toml").exists() {
             match load_manifest(&path) {
-                Ok(m) => manifests.push(m),
+                Ok(m) => {
+                    let slug = m.slug();
+                    if seen_slugs.contains(&slug) {
+                        tracing::warn!(
+                            "Duplicate slug '{}' in {} — skipping (already loaded from another directory)",
+                            slug,
+                            path.display(),
+                        );
+                    } else {
+                        seen_slugs.insert(slug);
+                        manifests.push(m);
+                    }
+                }
                 Err(e) => tracing::warn!("Skipping {}: {e}", path.display()),
             }
         }

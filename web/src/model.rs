@@ -28,6 +28,14 @@ pub struct WebDetection {
     /// Human-readable model name (e.g. `"BirdNET V2.4"`).
     #[serde(default)]
     pub model_name: String,
+    /// Timezone-adjusted date for display (YYYY-MM-DD).
+    /// Same as `date` when tz_offset is 0 or unset.
+    /// Kept separate so `clip_url()` always uses the UTC `date` for file paths.
+    #[serde(default)]
+    pub display_date: String,
+    /// Timezone-adjusted time for display (HH:MM:SS).
+    #[serde(default)]
+    pub display_time: String,
 }
 
 impl WebDetection {
@@ -242,6 +250,10 @@ pub struct DetectionSettings {
     /// Spectrogram colour palette name ("default", "coolwarm", "magma", "viridis", "grayscale").
     #[serde(default = "default_colormap")]
     pub colormap: String,
+    /// Timezone offset from UTC in hours (e.g. -6 for UTC-6).
+    /// Used to convert UTC timestamps for display in the web UI.
+    #[serde(default)]
+    pub tz_offset: i32,
 }
 
 fn default_colormap() -> String {

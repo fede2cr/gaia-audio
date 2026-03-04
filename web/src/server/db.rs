@@ -1,12 +1,60 @@
 //! SQLite read-only queries for the web dashboard.
 //!
 //! Uses the same `detections` table written by the processing server.
+//!
+//! All timestamps in the database are stored in UTC.  The `tz_offset`
+//! setting (hours from UTC, e.g. -6) is applied at read time to populate
+//! `display_date` / `display_time` on [`WebDetection`] for the UI.
 
 use std::path::Path;
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration};
 use rusqlite::{params, Connection};
 
 use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection};
+
+// ─── Timezone helpers ────────────────────────────────────────────────────────
+
+/// Read the `tz_offset` value (hours) from the settings table.
+/// Returns 0 (UTC) if unset or on any error.
+fn read_tz_offset(conn: &Connection) -> i32 {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'tz_offset'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<i32>().ok())
+    .unwrap_or(0)
+}
+
+/// Apply a timezone offset (hours) to UTC `date` (YYYY-MM-DD) and `time`
+/// (HH:MM:SS) strings, returning `(display_date, display_time)`.
+///
+/// If parsing fails the original strings are returned unchanged.
+fn apply_tz(date: &str, time: &str, offset_hours: i32) -> (String, String) {
+    if offset_hours == 0 {
+        return (date.to_string(), time.to_string());
+    }
+    let Ok(d) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+        return (date.to_string(), time.to_string());
+    };
+    let Ok(t) = NaiveTime::parse_from_str(time, "%H:%M:%S") else {
+        return (date.to_string(), time.to_string());
+    };
+    let dt = NaiveDateTime::new(d, t) + Duration::hours(offset_hours as i64);
+    (
+        dt.format("%Y-%m-%d").to_string(),
+        dt.format("%H:%M:%S").to_string(),
+    )
+}
+
+/// Fill `display_date` / `display_time` on a `WebDetection` in-place.
+fn stamp(det: &mut WebDetection, offset: i32) {
+    let (dd, dt) = apply_tz(&det.date, &det.time, offset);
+    det.display_date = dd;
+    det.display_time = dt;
+}
 
 /// Open a read-only connection with a busy timeout.
 ///
@@ -49,6 +97,7 @@ pub fn recent_detections(
         ),
     };
 
+    let tz = read_tz_offset(&conn);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
         Ok(WebDetection {
@@ -65,10 +114,14 @@ pub fn recent_detections(
             image_url: None,
             model_slug: row.get(10)?,
             model_name: row.get(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
         })
     })?;
 
-    rows.collect()
+    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
+    for d in &mut dets { stamp(d, tz); }
+    Ok(dets)
 }
 
 // ─── Calendar data ───────────────────────────────────────────────────────────
@@ -115,6 +168,7 @@ pub fn day_detections(
     date: &str,
 ) -> Result<Vec<DayDetectionGroup>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
     let mut stmt = conn.prepare(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
@@ -138,9 +192,12 @@ pub fn day_detections(
                 image_url: None,
                 model_slug: row.get(10)?,
                 model_name: row.get(11)?,
+                display_date: String::new(),
+                display_time: String::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<WebDetection> = rows.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
 
     // Group by (scientific_name, domain)
     let mut groups: Vec<DayDetectionGroup> = Vec::new();
@@ -384,6 +441,7 @@ pub fn excluded_detections_for_species(
     limit: u32,
 ) -> Result<Vec<WebDetection>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
     let mut stmt = conn.prepare(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
@@ -408,10 +466,14 @@ pub fn excluded_detections_for_species(
             image_url: None,
             model_slug: row.get(10)?,
             model_name: row.get(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
         })
     })?;
 
-    rows.collect()
+    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
+    for d in &mut dets { stamp(d, tz); }
+    Ok(dets)
 }
 
 /// Add an exclusion override (ornithologist confirms the species is real).

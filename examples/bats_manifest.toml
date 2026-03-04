@@ -9,17 +9,10 @@
 #
 # Source: https://github.com/macaodha/batdetect2
 #
-# STATUS: Experimental.  The processing infrastructure (container,
-# manifest seeding, MODEL_SLUGS filtering) is in place, but the
-# model itself requires PyTorch → ONNX conversion before it can be
-# loaded by gaia-processing's tract runtime.  See MODELS.md for
-# details.
-#
-# The PyTorch weights (Net2DFast_UK_same.pth.tar, ~7.6 MB) are
-# publicly available in the GitHub repo and can be downloaded with:
-#   pip install batdetect2
-# or directly from:
-#   https://raw.githubusercontent.com/macaodha/batdetect2/main/batdetect2/models/Net2DFast_UK_same.pth.tar
+# The PyTorch weights are automatically exported to ONNX at container
+# build time and baked into the image.  At first start the entrypoint
+# seeds labels.csv into the model volume, and ensure_onnx_file()
+# copies the ONNX model from the baked-in path.
 
 [model]
 name = "BatDetect2"
@@ -34,22 +27,9 @@ labels_file = "labels.csv"
 v1_metadata = false
 # BatDetect2 outputs raw logits — softmax converts them to probabilities
 apply_softmax = true
-# Accepts raw audio waveform, not mel spectrograms
+# BatDetect2 is a detection model that expects a spectrogram input,
+# not a classifier that accepts raw audio.
 onnx_is_classifier = false
 
 # No metadata model for bats
 # [metadata_model]
-
-# ── Manual download required ─────────────────────────────────────────
-#
-# BatDetect2 ships as a PyTorch checkpoint (.pth.tar) and needs to be
-# exported to ONNX before use.  The HuggingFace repo (macaodha/batdetect2)
-# is gated and requires authentication.
-#
-# To prepare the model:
-#   1. pip install batdetect2
-#   2. Export to ONNX (script TBD)
-#   3. Place batdetect2.onnx and labels.csv in /models/batdetect2/
-#
-# PyTorch weights (public):
-#   https://raw.githubusercontent.com/macaodha/batdetect2/main/batdetect2/models/Net2DFast_UK_same.pth.tar

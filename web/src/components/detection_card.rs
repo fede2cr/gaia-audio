@@ -16,7 +16,11 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
         "confidence low"
     };
 
-    let datetime = format!("{} {}", &detection.date, &detection.time);
+    let datetime = if detection.display_date.is_empty() {
+        format!("{} {}", &detection.date, &detection.time)
+    } else {
+        format!("{} {}", &detection.display_date, &detection.display_time)
+    };
     let source_label = detection.source_label();
     let model_label = detection.model_label();
     let is_excluded = detection.excluded;
