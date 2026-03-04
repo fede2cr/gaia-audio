@@ -81,7 +81,7 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
             .to_string_lossy();
         info!("{summary};{basename}");
 
-        write_to_log(&summary);
+        write_to_log(&summary, &config.recs_dir);
 
         if let Err(e) = db::insert_detection(
             db_path,
@@ -204,10 +204,8 @@ fn format_summary(d: &Detection, config: &Config) -> String {
     )
 }
 
-fn write_to_log(summary: &str) {
-    let log_path = std::env::var("GAIA_DIR")
-        .map(|d| PathBuf::from(d).join("GaiaDB.txt"))
-        .unwrap_or_else(|_| PathBuf::from("/app/data/GaiaDB.txt"));
+fn write_to_log(summary: &str, data_dir: &Path) {
+    let log_path = data_dir.join("GaiaDB.txt");
 
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)

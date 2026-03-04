@@ -44,7 +44,12 @@ pub fn poll_and_process(
         .build()
         .context("Cannot create HTTP client")?;
 
-    let tmp_dir = config.recs_dir.join("processing_tmp");
+    let instance_suffix = if config.processing_instance.is_empty() {
+        "processing_tmp".to_string()
+    } else {
+        format!("processing_tmp_{}", config.processing_instance)
+    };
+    let tmp_dir = config.recs_dir.join(&instance_suffix);
     std::fs::create_dir_all(&tmp_dir)?;
 
     // Track which files we've already processed this session.
@@ -160,11 +165,34 @@ pub fn poll_and_process(
                 // generation.  It is cleaned up in reporting::handle_queue
                 // after processing is complete.
 
-                // ── ask capture server to delete ─────────────────────
-                if let Err(e) = delete_recording(&client, base_url, &rec.filename) {
-                    warn!(
-                        "Failed to delete {} from {}: {e}",
-                        rec.filename, base_url
+                // ── coordinate multi-instance deletion ───────────────
+                // Mark this instance as done with the file. Only ask the
+                // capture server to delete once ALL registered instances
+                // have finished.
+                let instance_id = if config.processing_instance.is_empty() {
+                    "default"
+                } else {
+                    &config.processing_instance
+                };
+                if let Err(e) = crate::db::mark_file_processed(
+                    &config.db_path,
+                    &rec.filename,
+                    instance_id,
+                ) {
+                    warn!("Cannot mark {} as processed: {e}", rec.filename);
+                }
+
+                if crate::db::all_instances_done(&config.db_path, &rec.filename) {
+                    if let Err(e) = delete_recording(&client, base_url, &rec.filename) {
+                        warn!(
+                            "Failed to delete {} from {}: {e}",
+                            rec.filename, base_url
+                        );
+                    }
+                } else {
+                    debug!(
+                        "{}: waiting for other instances to finish",
+                        rec.filename
                     );
                 }
 
@@ -179,6 +207,8 @@ pub fn poll_and_process(
         // Prevent unbounded growth of the processed set
         if processed.len() > 10_000 {
             processed.clear();
+            // Also purge old entries from the processing-log table.
+            crate::db::cleanup_processing_log(&config.db_path);
         }
 
         std::thread::sleep(poll_interval);

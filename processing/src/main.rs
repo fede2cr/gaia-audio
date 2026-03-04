@@ -53,8 +53,31 @@ fn main() -> Result<()> {
     // ── initialize database ──────────────────────────────────────────
     db::initialize(&config.db_path)?;
 
+    // Register this processing instance so multi-instance deletion
+    // coordination knows how many instances exist.
+    {
+        let instance_id = if config.processing_instance.is_empty() {
+            "default"
+        } else {
+            &config.processing_instance
+        };
+        db::register_instance(&config.db_path, instance_id)?;
+        info!("Registered processing instance: {instance_id:?}");
+    }
+
     // ── discover and load models ─────────────────────────────────────
     let mut manifests = manifest::discover_manifests(&config.model_dir)?;
+
+    // Filter to only the model slugs requested via MODEL_SLUGS (if set).
+    if !config.model_slugs.is_empty() {
+        let before = manifests.len();
+        manifests.retain(|m| config.model_slugs.contains(&m.slug()));
+        info!(
+            "MODEL_SLUGS filter: {before} manifests discovered, {} retained ({:?})",
+            manifests.len(),
+            config.model_slugs,
+        );
+    }
 
     // ── auto-download models from Zenodo if needed ───────────────────
     for m in &mut manifests {

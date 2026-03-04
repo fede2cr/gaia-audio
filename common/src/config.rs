@@ -42,6 +42,13 @@ pub struct Config {
     /// When set and the manifest has a [download] section, the processing
     /// server will auto-download the corresponding model from Zenodo.
     pub model_variant: Option<String>,
+    /// Comma-separated list of model slugs to load (e.g. "birdnet" or "perch").
+    /// When empty, all discovered models are loaded.
+    pub model_slugs: Vec<String>,
+    /// Instance identifier used to isolate temp directories when running
+    /// multiple processing containers on the same data volume.
+    pub processing_instance: String,
+
 
     // ── privacy / extraction (processing) ────────────────────────────
     pub raw_spectrogram: bool,
@@ -138,6 +145,15 @@ pub fn load(path: &Path) -> Result<Config> {
         sf_thresh: get_f64("SF_THRESH", 0.03),
         data_model_version: get_u32("DATA_MODEL_VERSION", 2),
         model_variant: get("MODEL_VARIANT").filter(|s| !s.is_empty()),
+        model_slugs: get("MODEL_SLUGS")
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        processing_instance: get("PROCESSING_INSTANCE").unwrap_or_default(),
         raw_spectrogram: get("RAW_SPECTROGRAM")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),

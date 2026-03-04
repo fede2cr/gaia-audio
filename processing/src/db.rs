@@ -87,6 +87,18 @@ pub fn initialize(db_path: &Path) -> Result<()> {
             overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
             notes         TEXT NOT NULL DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS file_processing_log (
+            filename   TEXT    NOT NULL,
+            instance   TEXT    NOT NULL,
+            processed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (filename, instance)
+        );
+
+        CREATE TABLE IF NOT EXISTS processing_instances (
+            instance      TEXT PRIMARY KEY,
+            registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
     ",
     )
     .context("Failed to create tables")?;
@@ -317,4 +329,62 @@ pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+}
+
+// ─── File processing coordination ────────────────────────────────────────────
+
+/// Register a processing instance so other instances know about it.
+/// Called once at startup.
+pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO processing_instances (instance) VALUES (?1)",
+        params![instance],
+    )?;
+    Ok(())
+}
+
+/// Record that this instance has finished processing a file.
+pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
+        params![filename, instance],
+    )?;
+    Ok(())
+}
+
+/// Check whether every registered processing instance has processed this file.
+pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return true, // fail-open: delete if we can't check
+    };
+    conn.execute_batch("PRAGMA busy_timeout=3000;").ok();
+    // A file is ready for deletion when there is no registered instance
+    // that has NOT yet processed it.
+    conn.query_row(
+        "SELECT COUNT(*) FROM processing_instances \
+         WHERE instance NOT IN \
+           (SELECT instance FROM file_processing_log WHERE filename = ?1)",
+        params![filename],
+        |row| row.get::<_, u32>(0),
+    )
+    .map(|remaining| remaining == 0)
+    .unwrap_or(true)
+}
+
+/// Remove old entries from the processing log (files older than 1 hour).
+pub fn cleanup_processing_log(db_path: &Path) {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    let _ = conn.execute(
+        "DELETE FROM file_processing_log WHERE processed_at < datetime('now', '-1 hour')",
+        [],
+    );
 }
