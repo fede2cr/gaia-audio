@@ -101,9 +101,7 @@ RUN python3 download_meta_tflite.py && \
 # Uses a separate stage with PyTorch to keep the runtime image lean.
 FROM python:3.11-slim AS batconverter
 
-RUN apt-get update && apt-get install -y --no-install-recommends cmake && \
-    rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir batdetect2 onnx onnxruntime onnxsim
+RUN pip install --no-cache-dir batdetect2 onnx onnxruntime
 
 WORKDIR /convert
 COPY scripts/convert_batdetect2_to_onnx.py .
