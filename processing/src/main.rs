@@ -3,6 +3,7 @@
 
 mod analysis;
 mod client;
+mod compress;
 mod db;
 mod download;
 mod live_status;
@@ -174,6 +175,21 @@ fn main() -> Result<()> {
     })
     .context("Cannot set Ctrl-C handler")?;
 
+    // ── compression thread (runs 4× daily) ─────────────────────────
+    let compress_extracted = config.extracted_dir.clone();
+    let compress_db = config.db_path.clone();
+    let compress_thread = std::thread::Builder::new()
+        .name("compression".into())
+        .spawn(move || {
+            compress::compress_loop(
+                compress_extracted,
+                compress_db,
+                std::time::Duration::from_secs(6 * 3600), // every 6 h
+                &SHUTDOWN,
+            );
+        })
+        .context("Cannot spawn compression thread")?;
+
     // ── reporting thread ─────────────────────────────────────────────
     let (report_tx, report_rx) = mpsc::sync_channel::<ReportPayload>(16);
     let report_config = config.clone();
@@ -199,6 +215,7 @@ fn main() -> Result<()> {
     // Signal reporting thread to finish
     drop(report_tx);
     report_thread.join().ok();
+    compress_thread.join().ok();
 
     // Clean up mDNS
     if let Some(dh) = discovery {

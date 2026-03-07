@@ -57,6 +57,10 @@ impl WebDetection {
     }
 
     /// URL to the spectrogram PNG (generated alongside the audio clip).
+    ///
+    /// Spectrograms are named `{clip_file}.png`.  After Opus compression
+    /// the clip extension changes from `.wav`/`.mp3` to `.opus`, and the
+    /// spectrogram is renamed accordingly, so this always works.
     pub fn spectrogram_url(&self) -> Option<String> {
         self.clip_url().map(|url| format!("{url}.png"))
     }
@@ -177,6 +181,17 @@ pub struct ImportResult {
     pub files_extracted: u64,
     pub skipped_existing: u64,
     pub errors: Vec<String>,
+}
+
+/// A BirdNET-Pi node discovered on the local network via mDNS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BirdnetNode {
+    /// mDNS instance name (e.g. "birdnet").
+    pub name: String,
+    /// IPv4 address.
+    pub address: String,
+    /// HTTP port (typically 80).
+    pub port: u16,
 }
 
 /// A discovered backup archive in the /backups volume.

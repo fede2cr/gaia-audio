@@ -1,14 +1,19 @@
 //! BirdNET-Pi backup importer.
 //!
-//! Reads a BirdNET-Pi backup `.tar` file and imports:
-//! - Detection records from the embedded `birds.db` SQLite database  
-//! - Audio clips (`.mp3`) from `By_Date/` into the Gaia extracted directory
-//! - Spectrograms (`.mp3.png`) from `By_Date/` alongside the clips
+//! Supports two import modes:
 //!
-//! The tar is read in a streaming fashion so memory usage stays bounded
-//! even for multi-GB archives.
+//! 1. **Network streaming** (preferred): fetches the backup directly from a
+//!    BirdNET-Pi node via `curl` HTTP POST and processes the tar stream
+//!    on-the-fly — no temporary archive written to disk.
+//! 2. **File-based** (legacy): reads a pre-downloaded `.tar` backup from the
+//!    `/backups` volume.
+//!
+//! Both modes handle deduplication: detections and audio clips that have
+//! already been imported — even if subsequently compressed from `.mp3`/`.wav`
+//! to `.opus` by the processing server — are detected and skipped.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -59,6 +64,9 @@ pub struct ImportResult {
     pub skipped_existing: u64,
     pub errors: Vec<String>,
 }
+
+// ─── Discovered BirdNET-Pi node (reuse the shared model type) ────────────
+pub use crate::model::BirdnetNode;
 
 /// Analyse a BirdNET-Pi backup tar and produce a report *without* importing.
 pub fn analyse_backup(tar_path: &Path) -> Result<ImportReport, String> {
@@ -256,11 +264,315 @@ pub fn import_backup(
     // Ensure Gaia DB exists with schema
     ensure_gaia_schema(gaia_db_path)?;
 
-    // Read existing file names to avoid duplicates
+    // Read existing file names to avoid duplicates (opus-aware)
     let existing_files = get_existing_filenames(gaia_db_path)?;
 
-    // Import detections
-    let src_conn = Connection::open(&source_db)
+    import_detections_from_db(&source_db, gaia_db_path, &existing_files, &mut result)?;
+
+    tracing::info!(
+        "Phase 1 complete: {} detections imported, {} skipped (existing)",
+        result.detections_imported,
+        result.skipped_existing
+    );
+
+    // ── Phase 2: Extract audio and spectrogram files ─────────────────
+    tracing::info!("Phase 2: Extracting audio files and spectrograms…");
+
+    extract_media_from_tar(tar_path, extracted_dir, &mut result)?;
+
+    // Cleanup temp
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    tracing::info!(
+        "Import complete: {} detections, {} files extracted, {} skipped, {} errors",
+        result.detections_imported,
+        result.files_extracted,
+        result.skipped_existing,
+        result.errors.len()
+    );
+
+    Ok(result)
+}
+
+// ─── Network streaming import ────────────────────────────────────────────────
+
+/// Import observations by streaming the backup directly from a BirdNET-Pi node.
+///
+/// 1. POSTs to `http://{address}:{port}/scripts/backup.php` via `curl`
+/// 2. Processes the tar response as a stream — audio clips and spectrograms
+///    are extracted directly to `extracted_dir` without writing a temporary
+///    archive.
+/// 3. The small `birds.db` is extracted to `/tmp`, then detection rows are
+///    imported into the Gaia database with opus-aware deduplication.
+///
+/// This function is blocking and designed to run inside `spawn_blocking`.
+pub fn stream_import(
+    address: &str,
+    port: u16,
+    gaia_db_path: &Path,
+    extracted_dir: &Path,
+) -> Result<ImportResult, String> {
+    let url = format!("http://{}:{}/scripts/backup.php", address, port);
+
+    let mut result = ImportResult {
+        detections_imported: 0,
+        files_extracted: 0,
+        skipped_existing: 0,
+        errors: Vec::new(),
+    };
+
+    tracing::info!("Starting streaming import from {url}");
+
+    // Ensure Gaia DB and directories exist
+    ensure_gaia_schema(gaia_db_path)?;
+    std::fs::create_dir_all(extracted_dir)
+        .map_err(|e| format!("Cannot create extracted dir: {e}"))?;
+
+    // Build the opus-aware dedup set BEFORE we start downloading
+    let existing = get_existing_filenames(gaia_db_path)?;
+
+    // ── Stream the tar from the BirdNET-Pi node via curl ─────────────
+    let mut child = std::process::Command::new("curl")
+        .args([
+            "-s",                           // silent
+            "-f",                           // fail on HTTP errors
+            "-L",                           // follow redirects
+            "-d", "user=birdnet&password=", // POST credentials
+            &url,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Cannot start curl (is it installed?): {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Cannot capture curl stdout")?;
+
+    let mut archive = tar::Archive::new(stdout);
+
+    let tmp_dir = std::env::temp_dir().join("gaia_stream_import");
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Cannot create temp dir: {e}"))?;
+
+    // ── Single-pass: extract files and DB simultaneously ─────────────
+    for entry_result in archive
+        .entries()
+        .map_err(|e| format!("Tar stream error: {e}"))?
+    {
+        let mut entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping corrupt tar entry: {e}");
+                continue;
+            }
+        };
+
+        let path_str = entry
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Extract birds.db to temp for later detection import
+        if path_str == "birds.db" {
+            entry
+                .unpack(tmp_dir.join("birds.db"))
+                .map_err(|e| format!("Cannot extract birds.db: {e}"))?;
+            tracing::info!("Extracted birds.db from stream");
+            continue;
+        }
+
+        // Extract birdnet.conf to temp (for future use)
+        if path_str == "birdnet.conf" {
+            let _ = entry.unpack(tmp_dir.join("birdnet.conf"));
+            continue;
+        }
+
+        // Only process By_Date/ audio + spectrograms
+        if !path_str.starts_with("By_Date/") {
+            continue;
+        }
+
+        let is_audio = path_str.ends_with(".mp3") && !path_str.ends_with(".mp3.png");
+        let is_spectrogram = path_str.ends_with(".mp3.png");
+        if !is_audio && !is_spectrogram {
+            continue;
+        }
+
+        let dest = extracted_dir.join(&path_str);
+
+        // Skip if file already exists (original or opus-converted variant)
+        if file_already_imported(&dest) {
+            result.skipped_existing += 1;
+            continue;
+        }
+
+        // Create parent directory and extract
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                result
+                    .errors
+                    .push(format!("Cannot create dir: {e}"));
+                continue;
+            }
+        }
+
+        if let Err(e) = entry.unpack(&dest) {
+            result
+                .errors
+                .push(format!("Cannot extract {path_str}: {e}"));
+            continue;
+        }
+
+        result.files_extracted += 1;
+        if result.files_extracted % 5000 == 0 {
+            tracing::info!("Extracted {} files so far…", result.files_extracted);
+        }
+    }
+
+    // ── Wait for curl to finish ──────────────────────────────────────
+    let status = child
+        .wait()
+        .map_err(|e| format!("curl wait error: {e}"))?;
+
+    if !status.success() {
+        let stderr_msg = child
+            .stderr
+            .take()
+            .map(|mut s| {
+                let mut buf = String::new();
+                s.read_to_string(&mut buf).ok();
+                buf
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "curl failed (exit {}): {stderr_msg}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+
+    // ── Import detections from the extracted birds.db ────────────────
+    let source_db = tmp_dir.join("birds.db");
+    if source_db.exists() {
+        tracing::info!("Importing detections from birds.db…");
+        import_detections_from_db(&source_db, gaia_db_path, &existing, &mut result)?;
+    } else {
+        tracing::warn!("No birds.db found in the streamed backup");
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    tracing::info!(
+        "Stream import complete: {} detections, {} files, {} skipped, {} errors",
+        result.detections_imported,
+        result.files_extracted,
+        result.skipped_existing,
+        result.errors.len()
+    );
+
+    Ok(result)
+}
+
+// ─── mDNS discovery ──────────────────────────────────────────────────────────
+
+/// Discover BirdNET-Pi nodes on the local network.
+///
+/// Browses `_http._tcp.local.` for 4 seconds and returns nodes whose
+/// instance name contains "birdnet" (case-insensitive).
+pub fn discover_birdnet_nodes() -> Vec<BirdnetNode> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+    use std::time::{Duration, Instant};
+
+    let daemon = match ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("Cannot start mDNS daemon: {e}");
+            return vec![];
+        }
+    };
+
+    let receiver = match daemon.browse("_http._tcp.local.") {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Cannot browse mDNS: {e}");
+            let _ = daemon.shutdown();
+            return vec![];
+        }
+    };
+
+    let mut nodes: Vec<BirdnetNode> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                let instance = info
+                    .get_fullname()
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+
+                // Filter for BirdNET-Pi nodes
+                if !instance.to_lowercase().contains("birdnet") {
+                    continue;
+                }
+
+                let port = info.get_port();
+                // Prefer IPv4 addresses
+                let addrs: Vec<std::net::IpAddr> = info
+                    .get_addresses()
+                    .iter()
+                    .map(|a| a.to_ip_addr())
+                    .filter(|a| a.is_ipv4())
+                    .collect();
+
+                if let Some(addr) = addrs.first() {
+                    let address = addr.to_string();
+                    // Avoid duplicate entries
+                    if !nodes.iter().any(|n| n.address == address) {
+                        tracing::info!(
+                            "mDNS: found BirdNET-Pi node '{}' at {}:{}",
+                            instance, address, port
+                        );
+                        nodes.push(BirdnetNode {
+                            name: instance,
+                            address,
+                            port,
+                        });
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let _ = daemon.stop_browse("_http._tcp.local.");
+    let _ = daemon.shutdown();
+
+    nodes
+}
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Import detection rows from a BirdNET-Pi `birds.db` into the Gaia database.
+///
+/// `existing` is a set of `File_Name` values already in the Gaia DB, expanded
+/// with pre-compression variants (`.mp3`/`.wav`) so that re-importing a backup
+/// after Opus compression still deduplicates correctly.
+fn import_detections_from_db(
+    source_db: &Path,
+    gaia_db_path: &Path,
+    existing: &HashSet<String>,
+    result: &mut ImportResult,
+) -> Result<(), String> {
+    let src_conn = Connection::open(source_db)
         .map_err(|e| format!("Cannot open source DB: {e}"))?;
 
     let dst_conn = Connection::open(gaia_db_path)
@@ -277,7 +589,6 @@ pub fn import_backup(
         )
         .map_err(|e| format!("Source query error: {e}"))?;
 
-    // Batch insert in transactions of 5000 rows
     let mut batch_count = 0u64;
     dst_conn
         .execute_batch("BEGIN TRANSACTION")
@@ -312,8 +623,8 @@ pub fn import_backup(
                 }
             };
 
-        // Skip duplicates (same File_Name already in Gaia DB)
-        if existing_files.contains(&fname) {
+        // Skip if this file was already imported (even if now .opus)
+        if existing.contains(&fname) {
             result.skipped_existing += 1;
             continue;
         }
@@ -346,27 +657,24 @@ pub fn import_backup(
         .execute_batch("COMMIT")
         .map_err(|e| format!("Final commit error: {e}"))?;
 
-    drop(src_stmt);
-    drop(src_conn);
-    drop(dst_conn);
+    Ok(())
+}
 
-    tracing::info!(
-        "Phase 1 complete: {} detections imported, {} skipped (existing)",
-        result.detections_imported,
-        result.skipped_existing
-    );
-
-    // ── Phase 2: Extract audio and spectrogram files ─────────────────
-    tracing::info!("Phase 2: Extracting audio files and spectrograms…");
-
+/// Extract audio and spectrogram files from a tar on disk into `extracted_dir`,
+/// with opus-aware deduplication.
+fn extract_media_from_tar(
+    tar_path: &Path,
+    extracted_dir: &Path,
+    result: &mut ImportResult,
+) -> Result<(), String> {
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| format!("Cannot create extracted dir: {e}"))?;
 
-    let file2 = std::fs::File::open(tar_path)
+    let file = std::fs::File::open(tar_path)
         .map_err(|e| format!("Cannot reopen tar: {e}"))?;
-    let mut archive2 = tar::Archive::new(file2);
+    let mut archive = tar::Archive::new(file);
 
-    for entry_result in archive2
+    for entry_result in archive
         .entries()
         .map_err(|e| format!("Tar read error: {e}"))?
     {
@@ -380,20 +688,20 @@ pub fn import_backup(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Only extract By_Date files (mp3 + png)
         if !path_str.starts_with("By_Date/") {
             continue;
         }
 
-        let is_audio = path_str.ends_with(".mp3");
+        let is_audio = path_str.ends_with(".mp3") && !path_str.ends_with(".mp3.png");
         let is_spectrogram = path_str.ends_with(".mp3.png");
         if !is_audio && !is_spectrogram {
             continue;
         }
 
-        // Preserve the By_Date structure inside the extracted dir
         let dest = extracted_dir.join(&path_str);
-        if dest.exists() {
+
+        // Check if file already exists (original or opus-converted variant)
+        if file_already_imported(&dest) {
             result.skipped_existing += 1;
             continue;
         }
@@ -421,18 +729,46 @@ pub fn import_backup(
         }
     }
 
-    // Cleanup temp
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}
 
-    tracing::info!(
-        "Import complete: {} detections, {} files extracted, {} skipped, {} errors",
-        result.detections_imported,
-        result.files_extracted,
-        result.skipped_existing,
-        result.errors.len()
-    );
+/// Check whether a media file (or its Opus-converted counterpart) already
+/// exists on disk.
+///
+/// After the compression background task converts `.mp3` → `.opus` and
+/// renames spectrograms from `.mp3.png` → `.opus.png`, a plain `dest.exists()`
+/// would miss these and cause a duplicate import.
+fn file_already_imported(dest: &Path) -> bool {
+    if dest.exists() {
+        return true;
+    }
 
-    Ok(result)
+    let name = match dest.file_name() {
+        Some(n) => n.to_string_lossy(),
+        None => return false,
+    };
+
+    // audio.mp3 → check for audio.opus
+    if let Some(stem) = name.strip_suffix(".mp3") {
+        return dest.with_file_name(format!("{stem}.opus")).exists();
+    }
+
+    // audio.mp3.png → check for audio.opus.png
+    if let Some(stem) = name.strip_suffix(".mp3.png") {
+        return dest.with_file_name(format!("{stem}.opus.png")).exists();
+    }
+
+    // audio.wav → check for audio.opus
+    if let Some(stem) = name.strip_suffix(".wav") {
+        return dest.with_file_name(format!("{stem}.opus")).exists();
+    }
+
+    // audio.wav.png → check for audio.opus.png
+    if let Some(stem) = name.strip_suffix(".wav.png") {
+        return dest.with_file_name(format!("{stem}.opus.png")).exists();
+    }
+
+    false
 }
 
 /// Ensure the Gaia detections table exists.
@@ -514,6 +850,10 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
 }
 
 /// Load all existing File_Name values from the Gaia DB for dedup.
+///
+/// After Opus compression, `File_Name` values may have changed from
+/// `.mp3`/`.wav` to `.opus`.  We expand the set with the pre-compression
+/// variants so that re-importing a BirdNET-Pi backup still deduplicates.
 fn get_existing_filenames(db_path: &Path) -> Result<HashSet<String>, String> {
     let conn = Connection::open(db_path)
         .map_err(|e| format!("Cannot open Gaia DB: {e}"))?;
@@ -522,11 +862,24 @@ fn get_existing_filenames(db_path: &Path) -> Result<HashSet<String>, String> {
         .prepare("SELECT File_Name FROM detections")
         .map_err(|e| format!("Query error: {e}"))?;
 
-    let names: HashSet<String> = stmt
+    let mut names: HashSet<String> = stmt
         .query_map([], |row| row.get(0))
         .map_err(|e| format!("Query error: {e}"))?
         .filter_map(|r| r.ok())
         .collect();
+
+    // For every .opus filename, also add .mp3 and .wav so the source
+    // BirdNET-Pi filenames (which are always .mp3) still match.
+    let opus_variants: Vec<String> = names
+        .iter()
+        .filter(|n| n.ends_with(".opus"))
+        .flat_map(|n| {
+            let stem = &n[..n.len() - 5]; // strip ".opus"
+            [format!("{stem}.mp3"), format!("{stem}.wav")]
+        })
+        .collect();
+
+    names.extend(opus_variants);
 
     Ok(names)
 }
@@ -578,6 +931,68 @@ mod tests {
         let (lat, lon) = parse_lat_lon(&conf);
         assert!((lat.unwrap() - 9.9346).abs() < 0.001);
         assert!((lon.unwrap() - (-84.0706)).abs() < 0.001);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_already_imported_opus_variant() {
+        let dir = std::env::temp_dir().join("gaia_import_opus_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create an .opus file (as if compression already ran)
+        let opus_file = dir.join("birds-Blackbird-92-birdnet-0715.opus");
+        std::fs::write(&opus_file, b"fake opus").unwrap();
+
+        // The original .mp3 does NOT exist on disk
+        let mp3_path = dir.join("birds-Blackbird-92-birdnet-0715.mp3");
+        assert!(!mp3_path.exists());
+
+        // But file_already_imported should detect the .opus variant
+        assert!(file_already_imported(&mp3_path));
+
+        // Same for spectrograms: .opus.png exists, .mp3.png does not
+        let opus_png = dir.join("birds-Blackbird-92-birdnet-0715.opus.png");
+        std::fs::write(&opus_png, b"fake png").unwrap();
+        let mp3_png = dir.join("birds-Blackbird-92-birdnet-0715.mp3.png");
+        assert!(file_already_imported(&mp3_png));
+
+        // Non-existent file with no variant → false
+        let unknown = dir.join("nonexistent.mp3");
+        assert!(!file_already_imported(&unknown));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_existing_filenames_includes_opus_variants() {
+        let dir = std::env::temp_dir().join("gaia_import_dedup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+
+        // Create a DB with an .opus filename (post-compression)
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE detections (File_Name TEXT NOT NULL);
+             INSERT INTO detections VALUES ('birds-Robin-42.opus');
+             INSERT INTO detections VALUES ('birds-Wren-10.mp3');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let names = get_existing_filenames(&db_path).unwrap();
+
+        // The .opus entry should also produce .mp3 and .wav variants
+        assert!(names.contains("birds-Robin-42.opus"));
+        assert!(names.contains("birds-Robin-42.mp3"));
+        assert!(names.contains("birds-Robin-42.wav"));
+
+        // The .mp3 entry stays as-is (no expansion needed)
+        assert!(names.contains("birds-Wren-10.mp3"));
+        // .mp3 is NOT expanded to .opus (source BirdNET-Pi always uses .mp3)
+        assert!(!names.contains("birds-Wren-10.opus"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

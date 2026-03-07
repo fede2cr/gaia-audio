@@ -1290,6 +1290,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "mdns-sd",
  "reqwest",
  "rusqlite",
  "serde",

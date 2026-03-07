@@ -84,14 +84,18 @@ def main():
     # The ip_height after resize_factor is used as freq dimension.
     ip_height = params["ip_height"]
     # Time dimension: 256 frames ≈ 1 second at default FFT params.
-    # We use dynamic axes so tract can handle variable lengths.
+    # Fixed shape — no dynamic axes.  BatDetect2's U-Net decoder has
+    # Resize (upsample) ops whose output sizes are computed from the input
+    # shape via Shape→Gather→Mul graphs.  Tract cannot resolve those as
+    # symbolic expressions, so we export with concrete shapes and then run
+    # onnx-simplifier to constant-fold them.
     time_frames = 256
 
     dummy_input = torch.randn(1, 1, ip_height, time_frames)
     onnx_path = os.path.join(args.output_dir, "batdetect2.onnx")
 
     print(f"Exporting to ONNX: {onnx_path}")
-    print(f"  Input shape: [1, 1, {ip_height}, {time_frames}] (dynamic time axis)")
+    print(f"  Input shape: [1, 1, {ip_height}, {time_frames}] (fixed)")
 
     # BatDetect2 forward() returns a ModelOutput namedtuple with multiple
     # fields.  We need to handle the multi-output export.
@@ -123,7 +127,31 @@ def main():
         opset_version=17,
         do_constant_folding=True,
     )
-    print(f"  Written: {onnx_path} ({os.path.getsize(onnx_path) / 1024 / 1024:.1f} MB)")
+    raw_size = os.path.getsize(onnx_path)
+    print(f"  Written: {onnx_path} ({raw_size / 1024 / 1024:.1f} MB)")
+
+    # ── Simplify with onnx-simplifier ────────────────────────────────────
+    # Constant-folds Shape→Gather→Mul sub-graphs that PyTorch emits for
+    # Resize/Upsample output-size computation.  Without this, tract sees
+    # symbolic dimensions (e.g. <Sym0>) and fails on the Resize nodes.
+    try:
+        import onnx
+        from onnxsim import simplify as onnxsim_simplify
+
+        print("  Running onnx-simplifier...")
+        model_onnx = onnx.load(onnx_path)
+        model_simp, ok = onnxsim_simplify(model_onnx)
+        if ok:
+            onnx.save(model_simp, onnx_path)
+            simp_size = os.path.getsize(onnx_path)
+            print(f"  Simplified OK: {simp_size / 1024 / 1024:.1f} MB "
+                  f"(was {raw_size / 1024 / 1024:.1f} MB)")
+        else:
+            print("  WARNING: onnx-simplifier returned ok=False, keeping original")
+    except ImportError:
+        print("  WARNING: onnxsim not installed — skipping simplification")
+    except Exception as e:
+        print(f"  WARNING: onnx-simplifier failed ({e}), keeping original")
 
     # ── Verify with onnxruntime ──────────────────────────────────────────
     try:

@@ -89,10 +89,19 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
                     </div>
                 })}
 
-                {audio_url.map(|url| view! {
-                    <audio class="detection-audio" controls preload="metadata">
-                        <source src={url} type="audio/wav"/>
-                    </audio>
+                {audio_url.map(|url| {
+                    let mime = if url.ends_with(".opus") {
+                        "audio/ogg; codecs=opus"
+                    } else if url.ends_with(".mp3") {
+                        "audio/mpeg"
+                    } else {
+                        "audio/wav"
+                    };
+                    view! {
+                        <audio class="detection-audio" controls preload="metadata">
+                            <source src={url} type={mime}/>
+                        </audio>
+                    }
                 })}
             </div>
         </div>

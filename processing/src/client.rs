@@ -24,6 +24,11 @@ use crate::ReportPayload;
 /// How often to re-scan mDNS for new/removed capture nodes.
 const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Maximum number of recordings to process from a single capture node
+/// before moving on to the next.  This ensures fair round-robin
+/// processing when multiple capture nodes are present.
+const BATCH_PER_NODE: usize = 3;
+
 /// Poll all known capture servers for new recordings and process them.
 ///
 /// If `discovery` is `Some`, capture nodes are located (and periodically
@@ -128,8 +133,19 @@ pub fn poll_and_process(
                 recordings.len()
             );
 
+            let mut batch_count = 0;
             for rec in &recordings {
                 if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Round-robin: only process a limited batch from each
+                // capture node per cycle so we service all nodes fairly.
+                if batch_count >= BATCH_PER_NODE {
+                    debug!(
+                        "[{}] Batch limit ({}) reached – rotating to next node",
+                        base_url, BATCH_PER_NODE
+                    );
                     break;
                 }
 
@@ -197,6 +213,7 @@ pub fn poll_and_process(
                 }
 
                 processed.insert(key);
+                batch_count += 1;
             }
         }
 

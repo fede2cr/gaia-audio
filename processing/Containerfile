@@ -51,7 +51,7 @@ RUN cargo build --release -p gaia-processing
 FROM python:3.11-slim AS converter
 
 RUN pip install --no-cache-dir 'pycparser<3' && \
-    pip install --no-cache-dir 'tensorflow==2.15.*' tf2onnx onnxruntime
+    pip install --no-cache-dir 'tensorflow==2.15.*' 'onnx<1.17' tf2onnx onnxruntime
 
 WORKDIR /convert
 COPY scripts/convert_keras_to_onnx.py .
@@ -101,7 +101,9 @@ RUN python3 download_meta_tflite.py && \
 # Uses a separate stage with PyTorch to keep the runtime image lean.
 FROM python:3.11-slim AS batconverter
 
-RUN pip install --no-cache-dir batdetect2 onnx onnxruntime
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir batdetect2 onnx onnxruntime onnxsim
 
 WORKDIR /convert
 COPY scripts/convert_batdetect2_to_onnx.py .
@@ -116,6 +118,7 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 \
     ca-certificates \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing

@@ -139,6 +139,7 @@ async fn main() {
             "json" => "application/json",
             "wav" => "audio/wav",
             "mp3" => "audio/mpeg",
+            "opus" | "ogg" => "audio/ogg",
             _ => "application/octet-stream",
         }
     }
