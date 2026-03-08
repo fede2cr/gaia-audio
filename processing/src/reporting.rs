@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use anyhow::Result;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use gaia_common::audio;
 use gaia_common::config::Config;
@@ -38,6 +38,18 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
         if src.exists() {
             if let Err(e) = std::fs::remove_file(src) {
                 warn!("Cannot remove source file {}: {e}", src.display());
+            } else {
+                // Count remaining temp files in the same directory.
+                let remaining = src.parent()
+                    .and_then(|d| std::fs::read_dir(d).ok())
+                    .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| {
+                        e.path().extension().map(|x| x == "wav" || x == "mp3").unwrap_or(false)
+                    }).count())
+                    .unwrap_or(0);
+                info!(
+                    "Removed local temp {} ({remaining} audio files remaining in tmp)",
+                    src.display()
+                );
             }
         }
     }
@@ -75,7 +87,11 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
                 ) {
                     warn!("Spectrogram failed for {}: {e}", path.display());
                 }
-                Some(path)
+                // Convert WAV clip → Opus immediately.  Falls back to
+                // the original WAV path if ffmpeg is unavailable.
+                let final_path = crate::compress::compress_inline(&path)
+                    .unwrap_or(path);
+                Some(final_path)
             }
             Err(e) => {
                 warn!("Clip extraction failed (detection will still be recorded): {e:#}");
@@ -89,7 +105,20 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
             .and_then(|p| p.file_name())
             .unwrap_or_default()
             .to_string_lossy();
-        info!("{summary};{basename}");
+        let model_tag = if !detection.model_name.is_empty() {
+            &detection.model_name
+        } else if !detection.model_slug.is_empty() {
+            &detection.model_slug
+        } else {
+            "unknown"
+        };
+        info!(
+            "[{model_tag}] {} {} ({:.1}%) @ {};{basename}",
+            detection.common_name,
+            detection.scientific_name,
+            detection.confidence * 100.0,
+            detection.time,
+        );
 
         write_to_log(&summary, &config.recs_dir);
 
@@ -116,8 +145,14 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
         let is_human = detection.scientific_name.contains("Human");
 
         if !is_human {
-            if let Err(e) = extract_detection(file, detection, config) {
-                warn!("Noise clip extraction failed: {e}");
+            match extract_detection(file, detection, config) {
+                Ok(path) => {
+                    // Convert noise clip to Opus inline as well.
+                    crate::compress::compress_inline(&path);
+                }
+                Err(e) => {
+                    warn!("Noise clip extraction failed: {e}");
+                }
             }
         }
 
@@ -192,8 +227,18 @@ fn extract_detection(
     let new_path = new_dir.join(&new_name);
 
     if new_path.exists() {
-        warn!("Extraction already exists, skipping: {}", new_path.display());
+        debug!("Extraction already exists (WAV): {}", new_path.display());
         return Ok(new_path);
+    }
+
+    // Check whether an Opus-compressed version already exists (from a
+    // previous inline compression).  If so, return the Opus path
+    // directly — no need to re-extract and re-compress.
+    let opus_name = format!("{}.opus", &new_name[..new_name.len() - 4]);
+    let opus_path = new_dir.join(&opus_name);
+    if opus_path.exists() {
+        debug!("Extraction already exists (Opus): {}", opus_path.display());
+        return Ok(opus_path);
     }
 
     audio::extract_clip(&file.file_path, &new_path, safe_start, safe_stop)?;
@@ -203,8 +248,15 @@ fn extract_detection(
 // ── summary / logging ────────────────────────────────────────────────────
 
 fn format_summary(d: &Detection, config: &Config) -> String {
+    let model = if !d.model_name.is_empty() {
+        &d.model_name
+    } else if !d.model_slug.is_empty() {
+        &d.model_slug
+    } else {
+        "unknown"
+    };
     format!(
-        "{};{};{};{};{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{};{};{};{}",
         d.domain,
         d.date,
         d.time,
@@ -217,6 +269,7 @@ fn format_summary(d: &Detection, config: &Config) -> String {
         d.week,
         config.sensitivity,
         config.overlap,
+        model,
     )
 }
 

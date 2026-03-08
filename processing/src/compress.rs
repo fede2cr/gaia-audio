@@ -42,7 +42,7 @@ pub fn compress_sweep(
 
     let candidates = collect_candidates(&by_date)?;
     if candidates.is_empty() {
-        debug!("No WAV/MP3 clips to compress");
+        info!("Compression sweep: no WAV/MP3 clips to convert");
         return Ok(0);
     }
 
@@ -110,6 +110,80 @@ pub fn compress_loop(
     }
 
     info!("Compression thread stopped");
+}
+
+// ── Inline single-clip conversion ────────────────────────────────────────
+
+/// Convert a single extracted WAV clip to Opus immediately after
+/// extraction + spectrogram generation.
+///
+/// Returns the path to the new `.opus` file on success, or `None` if
+/// ffmpeg is unavailable or the conversion fails.  The caller should
+/// use the returned path (or fall back to the original WAV path) when
+/// storing the filename in the database.
+pub fn compress_inline(wav_path: &Path) -> Option<PathBuf> {
+    if !ffmpeg_available() {
+        debug!("ffmpeg not available — skipping inline Opus conversion");
+        return None;
+    }
+
+    let src_name = wav_path.file_name()?.to_string_lossy().to_string();
+    if !src_name.ends_with(".wav") {
+        return None;
+    }
+
+    let opus_name = format!("{}.opus", &src_name[..src_name.len() - 4]);
+    let opus_path = wav_path.with_file_name(&opus_name);
+
+    // If the Opus file already exists, just clean up the WAV source.
+    if opus_path.exists() {
+        debug!("Opus already exists, removing WAV source: {}", wav_path.display());
+        std::fs::remove_file(wav_path).ok();
+        return Some(opus_path);
+    }
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &wav_path.to_string_lossy(),
+            "-c:a",
+            "libopus",
+            "-b:a",
+            OPUS_BITRATE,
+            "-vn",
+            "-loglevel",
+            "error",
+        ])
+        .arg(&opus_path)
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        warn!("Inline Opus conversion failed for {}", wav_path.display());
+        return None;
+    }
+
+    // Rename companion spectrogram: .wav.png → .opus.png
+    let old_spec = wav_path.with_file_name(format!("{src_name}.png"));
+    if old_spec.exists() {
+        let new_spec = wav_path.with_file_name(format!("{opus_name}.png"));
+        if let Err(e) = std::fs::rename(&old_spec, &new_spec) {
+            warn!(
+                "Cannot rename spectrogram {} → {}: {e}",
+                old_spec.display(),
+                new_spec.display()
+            );
+        }
+    }
+
+    // Remove original WAV
+    if let Err(e) = std::fs::remove_file(wav_path) {
+        warn!("Cannot remove original WAV {}: {e}", wav_path.display());
+    }
+
+    debug!("Inline compressed: {src_name} → {opus_name}");
+    Some(opus_path)
 }
 
 // ── Internals ────────────────────────────────────────────────────────────

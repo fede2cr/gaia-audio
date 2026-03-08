@@ -11,6 +11,59 @@ use leptos::*;
 
 use crate::model::{LivePrediction, LiveStatus};
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Extract a short node label from a capture URL.
+/// "http://192.168.1.50:8090" → "192.168.1.50"
+/// "http://gaia-cap-01.local:8090" → "gaia-cap-01"
+fn node_label(url: &str) -> String {
+    if url.is_empty() {
+        return "local".into();
+    }
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url)
+        .split(':')
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// Format an ISO-8601 timestamp with a UTC offset into
+/// a human-readable string like "4:21pm (UTC-6)".
+///
+/// Pure arithmetic — no chrono dependency (WASM-safe).
+fn format_capture_time(iso: &str, offset_hours: i32) -> String {
+    if iso.len() < 16 {
+        return String::new();
+    }
+    let parse = || -> Option<String> {
+        let hour: i32 = iso[11..13].parse().ok()?;
+        let min: u32 = iso[14..16].parse().ok()?;
+
+        let mut h = hour + offset_hours;
+        if h >= 24 { h -= 24; }
+        if h < 0 { h += 24; }
+
+        let (h12, ampm) = match h {
+            0 => (12, "am"),
+            1..=11 => (h, "am"),
+            12 => (12, "pm"),
+            _ => (h - 12, "pm"),
+        };
+
+        let tz_label = if offset_hours >= 0 {
+            format!("UTC+{offset_hours}")
+        } else {
+            format!("UTC{offset_hours}")
+        };
+
+        Some(format!("{h12}:{min:02}{ampm} ({tz_label})"))
+    };
+    parse().unwrap_or_default()
+}
+
 // ─── Server function ─────────────────────────────────────────────────────────
 
 #[server(GetLiveStatus, "/api")]
@@ -31,6 +84,15 @@ pub async fn get_live_status() -> Result<Option<LiveStatus>, ServerFnError> {
     Ok(Some(status))
 }
 
+#[server(GetTzOffset, "/api")]
+pub async fn get_tz_offset() -> Result<i32, ServerFnError> {
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    let map = crate::server::db::get_all_settings(&state.db_path)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    Ok(map.get("tz_offset").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0))
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 /// Live analysis panel that polls the processing server's current state.
@@ -42,6 +104,7 @@ pub fn LiveAnalysis() -> impl IntoView {
     // Reactive signals that drive the view.
     let (status, set_status) = create_signal::<Option<LiveStatus>>(None);
     let (img_url, set_img_url) = create_signal(String::new());
+    let (tz_offset, set_tz_offset) = create_signal(0_i32);
 
     // Track the last-seen timestamp so we can skip no-op updates.
     let last_ts = store_value(String::new());
@@ -70,9 +133,15 @@ pub fn LiveAnalysis() -> impl IntoView {
 
     // Initial load
     let initial = create_resource(|| (), |_| async { get_live_status().await });
+    let tz_res = create_resource(|| (), |_| async { get_tz_offset().await });
     create_effect(move |_| {
         if let Some(Ok(s)) = initial.get() {
             apply_update(s);
+        }
+    });
+    create_effect(move |_| {
+        if let Some(Ok(off)) = tz_res.get() {
+            set_tz_offset.set(off);
         }
     });
 
@@ -104,9 +173,10 @@ pub fn LiveAnalysis() -> impl IntoView {
                     }.into_view(),
                     Some(st) => {
                         let url = img_url.get();
-                        let filename = st.filename.clone();
                         let has_det = st.has_detections;
                         let preds = st.predictions.clone();
+                        let node = node_label(&st.source_node);
+                        let cap_time = format_capture_time(&st.captured_at, tz_offset.get());
 
                         view! {
                             <div class="live-analysis-card">
@@ -119,13 +189,19 @@ pub fn LiveAnalysis() -> impl IntoView {
                                     }}
                                 </div>
                                 <div class="live-details">
-                                    <p class="live-filename" title={filename.clone()}>
+                                    <p class="live-filename">
                                         <svg class="icon-mic" viewBox="0 0 16 16" width="14" height="14">
                                             <rect x="5" y="1" width="6" height="9" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
                                             <path d="M3 7.5 a5 5 0 0 0 10 0" fill="none" stroke="currentColor" stroke-width="1.5"/>
                                             <line x1="8" y1="13" x2="8" y2="15" stroke="currentColor" stroke-width="1.5"/>
                                         </svg>
-                                        {filename}
+                                        "Now processing from "
+                                        <strong>{node}</strong>
+                                        {if !cap_time.is_empty() {
+                                            view! { <span>", captured at " {cap_time}</span> }.into_view()
+                                        } else {
+                                            view! {}.into_view()
+                                        }}
                                     </p>
                                     <div class="live-predictions">
                                         <LivePredictionList predictions=preds/>
@@ -159,12 +235,24 @@ fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
                 } else {
                     "pred-bar low"
                 };
+                let model_tag = if !p.model_name.is_empty() {
+                    p.model_name.clone()
+                } else if !p.model_slug.is_empty() {
+                    p.model_slug.clone()
+                } else {
+                    String::new()
+                };
 
                 view! {
                     <li class="prediction-item">
                         <span class="pred-name" title={p.scientific_name.clone()}>
                             {&p.common_name}
                         </span>
+                        {if !model_tag.is_empty() {
+                            view! { <span class="pred-model">{model_tag}</span> }.into_view()
+                        } else {
+                            view! {}.into_view()
+                        }}
                         <div class="pred-bar-track">
                             <div class={bar_class} style={format!("width: {width}")}></div>
                         </div>

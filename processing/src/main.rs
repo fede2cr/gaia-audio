@@ -135,7 +135,14 @@ fn main() -> Result<()> {
     if models.is_empty() {
         tracing::warn!(
             "No models loaded. The processing server will run but cannot \
-             analyse audio until model files (tflite) are present."
+             analyse audio until model files (tflite/onnx) are present."
+        );
+    } else {
+        let names: Vec<&str> = models.iter().map(|m| m.manifest.manifest.model.name.as_str()).collect();
+        info!(
+            "{} model(s) loaded: [{}]  – each audio file will be analysed by all models",
+            models.len(),
+            names.join(", "),
         );
     }
 
@@ -175,7 +182,10 @@ fn main() -> Result<()> {
     })
     .context("Cannot set Ctrl-C handler")?;
 
-    // ── compression thread (runs 4× daily) ─────────────────────────
+    // ── compression thread (fallback sweep every 30 min) ──────────
+    // Clips are now converted to Opus inline during extraction, but
+    // the background sweep catches any files that were missed (e.g.
+    // ffmpeg was temporarily unavailable, or legacy WAV files).
     let compress_extracted = config.extracted_dir.clone();
     let compress_db = config.db_path.clone();
     let compress_thread = std::thread::Builder::new()
@@ -184,7 +194,7 @@ fn main() -> Result<()> {
             compress::compress_loop(
                 compress_extracted,
                 compress_db,
-                std::time::Duration::from_secs(6 * 3600), // every 6 h
+                std::time::Duration::from_secs(30 * 60), // every 30 min
                 &SHUTDOWN,
             );
         })

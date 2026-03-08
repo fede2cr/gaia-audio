@@ -215,6 +215,12 @@ pub struct LiveStatus {
     pub filename: String,
     pub predictions: Vec<LivePrediction>,
     pub has_detections: bool,
+    /// URL of the capture node this recording came from.
+    #[serde(default)]
+    pub source_node: String,
+    /// ISO-8601 capture timestamp parsed from the recording filename.
+    #[serde(default)]
+    pub captured_at: String,
 }
 
 /// One prediction entry in the live status.
@@ -223,6 +229,12 @@ pub struct LivePrediction {
     pub scientific_name: String,
     pub common_name: String,
     pub confidence: f64,
+    /// Short identifier for the model that produced this prediction.
+    #[serde(default)]
+    pub model_slug: String,
+    /// Human-readable model name.
+    #[serde(default)]
+    pub model_name: String,
 }
 
 // ─── Urban noise ─────────────────────────────────────────────────────────────

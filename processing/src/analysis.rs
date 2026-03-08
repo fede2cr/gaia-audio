@@ -56,6 +56,7 @@ pub fn process_file(
                 // Keep only the top 5 predictions by confidence.
                 live_predictions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
                 live_predictions.truncate(5);
+                let captured_at = file.file_date.format("%Y-%m-%dT%H:%M:%S").to_string();
                 live_status::update(
                     &file.file_path.file_name().unwrap_or_default().to_string_lossy(),
                     &samples,
@@ -63,6 +64,8 @@ pub fn process_file(
                     live_predictions,
                     config.confidence,
                     &config.colormap,
+                    source_node,
+                    &captured_at,
                 );
             }
             Err(e) => {
@@ -93,6 +96,8 @@ fn run_analysis(
     let domain = model.domain().to_string();
     let model_slug = model.manifest.slug();
     let model_name = model.manifest.manifest.model.name.clone();
+    // Tag for log messages: "BirdNET V2.4/birds" or "Google Perch 2.0/wildlife"
+    let tag = format!("{model_name}/{domain}");
 
     // ── custom species lists ─────────────────────────────────────────
     let base = std::env::var("GAIA_DIR").unwrap_or_else(|_| "/app".to_string());
@@ -127,7 +132,7 @@ fn run_analysis(
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("[{domain}] Error reading audio: {e}");
+            tracing::error!("[{tag}] Error reading audio: {e}");
             return Ok((vec![], vec![]));
         }
     };
@@ -142,10 +147,10 @@ fn run_analysis(
             let top3: Vec<String> = preds.iter().take(3)
                 .map(|(name, conf)| format!("{name}={conf:.4}"))
                 .collect();
-            debug!("[{domain}] chunk {i}: top raw = [{}]", top3.join(", "));
+            debug!("[{tag}] chunk {i}: top raw = [{}]", top3.join(", "));
             if top.1 >= config.confidence {
                 info!(
-                    "[{domain}] chunk {i}: {} ({:.1}%) ≥ threshold {:.0}%",
+                    "[{tag}] chunk {i}: {} ({:.1}%) ≥ threshold {:.0}%",
                     top.0, top.1 * 100.0, config.confidence * 100.0
                 );
             }
@@ -177,7 +182,7 @@ fn run_analysis(
     );
     if !predicted_species_list.is_empty() {
         info!(
-            "[{domain}] Species range model: {} species expected at ({}, {}) week {}",
+            "[{tag}] Species range model: {} species expected at ({}, {}) week {}",
             predicted_species_list.len(),
             config.latitude,
             config.longitude,
@@ -185,7 +190,7 @@ fn run_analysis(
         );
     } else if config.latitude != -1.0 && config.longitude != -1.0 {
         info!(
-            "[{domain}] No species-range model loaded — accepting all species"
+            "[{tag}] No species-range model loaded — accepting all species"
         );
     }
 
@@ -195,7 +200,7 @@ fn run_analysis(
     for (start, end, entries) in &labeled {
         if let Some((sci_name, confidence)) = entries.first() {
             debug!(
-                "[{domain}] {start:.1}-{end:.1}: {sci_name} ({} = {confidence:.4})",
+                "[{tag}] {start:.1}-{end:.1}: {sci_name} ({} = {confidence:.4})",
                 names.get(sci_name.as_str()).unwrap_or(sci_name)
             );
         }
@@ -211,11 +216,11 @@ fn run_analysis(
                 .unwrap_or_else(|| sci_name.clone());
 
             if !include_list.is_empty() && !include_list.contains(sci_name) {
-                warn!("[{domain}] Excluded (not in include list): {sci_name}");
+                warn!("[{tag}] Excluded (not in include list): {sci_name}");
                 continue;
             }
             if !exclude_list.is_empty() && exclude_list.contains(sci_name) {
-                warn!("[{domain}] Excluded (in exclude list): {sci_name}");
+                warn!("[{tag}] Excluded (in exclude list): {sci_name}");
                 continue;
             }
 
@@ -228,7 +233,7 @@ fn run_analysis(
 
             if excluded {
                 warn!(
-                    "[{domain}] Recording excluded detection (below occurrence threshold): {sci_name} ({:.1}%)",
+                    "[{tag}] Recording excluded detection (below occurrence threshold): {sci_name} ({:.1}%)",
                     confidence * 100.0
                 );
             }
@@ -252,7 +257,7 @@ fn run_analysis(
     let included = confident_detections.iter().filter(|d| !d.excluded).count();
     let excluded = confident_detections.iter().filter(|d| d.excluded).count();
     info!(
-        "[{domain}] {}: {} detection(s) ({included} included, {excluded} excluded)",
+        "[{tag}] {}: {} detection(s) ({included} included, {excluded} excluded)",
         file.file_path.display(),
         confident_detections.len()
     );
@@ -270,6 +275,8 @@ fn run_analysis(
                 scientific_name: sci_name.clone(),
                 common_name: com_name,
                 confidence: *confidence,
+                model_slug: model_slug.clone(),
+                model_name: model_name.clone(),
             });
         }
     }

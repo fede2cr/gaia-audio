@@ -199,11 +199,23 @@ pub fn poll_and_process(
                 }
 
                 if crate::db::all_instances_done(&config.db_path, &rec.filename) {
-                    if let Err(e) = delete_recording(&client, base_url, &rec.filename) {
-                        warn!(
-                            "Failed to delete {} from {}: {e}",
-                            rec.filename, base_url
-                        );
+                    match delete_recording(&client, base_url, &rec.filename) {
+                        Ok(()) => {
+                            // Log remaining file count on the capture server.
+                            let remaining = list_recordings(&client, base_url)
+                                .map(|r| r.len())
+                                .unwrap_or(0);
+                            info!(
+                                "[{}] Deleted {} from capture server ({} remaining)",
+                                base_url, rec.filename, remaining
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to delete {} from {}: {e}",
+                                rec.filename, base_url
+                            );
+                        }
                     }
                 } else {
                     debug!(
