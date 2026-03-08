@@ -66,6 +66,12 @@ pub struct Config {
     /// Spectrogram colour-map name ("default", "coolwarm", "magma", "viridis", "grayscale").
     pub colormap: String,
 
+    // ── disk guard (capture) ─────────────────────────────────────────
+    /// Maximum allowed disk usage percentage (0–100).  When the volume
+    /// holding `recs_dir` exceeds this threshold the capture process is
+    /// paused until space is freed.  Default: 95.
+    pub disk_usage_max: f64,
+
     // ── network (capture ↔ processing) ───────────────────────────────
     /// Address the capture HTTP server listens on.
     pub capture_listen_addr: String,
@@ -166,6 +172,8 @@ pub fn load(path: &Path) -> Result<Config> {
         db_path: PathBuf::from(get("DB_PATH").unwrap_or_else(|| "/data/birds.db".into())),
 
         colormap: get("COLORMAP").unwrap_or_else(|| "default".into()),
+
+        disk_usage_max: get_f64("DISK_USAGE_MAX", 95.0),
 
         capture_listen_addr: get("CAPTURE_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:8089".into()),

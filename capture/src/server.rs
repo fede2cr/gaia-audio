@@ -23,6 +23,8 @@ use tracing::info;
 
 use gaia_common::protocol::{HealthResponse, RecordingInfo};
 
+use crate::DiskState;
+
 /// Shared state for route handlers.
 #[derive(Clone)]
 struct AppState {
@@ -30,6 +32,7 @@ struct AppState {
     start_time: Instant,
     #[allow(dead_code)]
     shutdown: Arc<AtomicBool>,
+    disk: Arc<DiskState>,
 }
 
 /// Start the HTTP server. Blocks until shutdown.
@@ -37,11 +40,13 @@ pub async fn run(
     stream_dir: PathBuf,
     listen_addr: &str,
     shutdown: Arc<AtomicBool>,
+    disk: Arc<DiskState>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         stream_dir,
         start_time: Instant::now(),
         shutdown: shutdown.clone(),
+        disk,
     };
 
     let app = Router::new()
@@ -72,9 +77,16 @@ pub async fn run(
 // ── route handlers ───────────────────────────────────────────────────────
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let paused = state.disk.capture_paused.load(Ordering::Relaxed);
     Json(HealthResponse {
-        status: "ok".to_string(),
+        status: if paused {
+            "disk_full".to_string()
+        } else {
+            "ok".to_string()
+        },
         uptime_secs: state.start_time.elapsed().as_secs(),
+        disk_usage_pct: state.disk.usage_pct(),
+        capture_paused: paused,
     })
 }
 

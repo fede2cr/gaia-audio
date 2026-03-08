@@ -3,20 +3,46 @@
 //! This binary:
 //! 1. Reads configuration from `gaia.conf`
 //! 2. Starts audio capture (arecord / ffmpeg)
-//! 3. Runs an axum HTTP server that exposes the recordings to the
+//! 3. Monitors disk usage — pauses capture when usage exceeds the
+//!    configured threshold (`DISK_USAGE_MAX`, default 95 %) and
+//!    resumes automatically once space is freed.
+//! 4. Runs an axum HTTP server that exposes the recordings to the
 //!    processing server over the network.
 
 mod capture;
+mod disk;
 mod server;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::info;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Shared disk-guard state visible to the HTTP health endpoint.
+#[derive(Debug)]
+pub struct DiskState {
+    /// Current disk usage percentage × 100 (e.g. 9500 = 95.00 %).
+    pub usage_centipct: AtomicU32,
+    /// `true` while capture is paused because of disk pressure.
+    pub capture_paused: AtomicBool,
+}
+
+impl DiskState {
+    pub fn new() -> Self {
+        Self {
+            usage_centipct: AtomicU32::new(0),
+            capture_paused: AtomicBool::new(false),
+        }
+    }
+
+    pub fn usage_pct(&self) -> f64 {
+        self.usage_centipct.load(Ordering::Relaxed) as f64 / 100.0
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,8 +61,8 @@ async fn main() -> Result<()> {
         gaia_common::config::load(&PathBuf::from(&config_path)).context("Config load failed")?;
 
     info!(
-        "Gaia Capture Server starting (listen={})",
-        config.capture_listen_addr
+        "Gaia Capture Server starting (listen={}, disk_max={}%)",
+        config.capture_listen_addr, config.disk_usage_max,
     );
 
     // Ensure StreamData directory exists
@@ -52,11 +78,6 @@ async fn main() -> Result<()> {
     .context("Cannot set Ctrl-C handler")?;
 
     // ── start capture (with retries) ──────────────────────────────────
-    // If the capture process cannot start (e.g. no microphone attached,
-    // no ALSA device in the container) we retry a few times with a delay
-    // before falling back to running the HTTP server without capture.
-    // This avoids the container dying immediately and gives hardware
-    // (e.g. USB mics) time to initialise.
     const MAX_CAPTURE_RETRIES: u32 = 5;
     const CAPTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -90,7 +111,6 @@ async fn main() -> Result<()> {
     }
 
     // ── mDNS registration ─────────────────────────────────────────────
-    // Parse the port from the listen address for mDNS advertisement.
     let port: u16 = config
         .capture_listen_addr
         .rsplit(':')
@@ -112,28 +132,86 @@ async fn main() -> Result<()> {
         }
     };
 
+    // ── shared disk-guard state ──────────────────────────────────────
+    let disk_state = Arc::new(DiskState::new());
+
     // ── start HTTP server ────────────────────────────────────────────
     let stream_dir = config.stream_data_dir();
     let listen_addr = config.capture_listen_addr.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let disk_state_server = disk_state.clone();
 
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server::run(stream_dir, &listen_addr, shutdown_clone).await {
+        if let Err(e) =
+            server::run(stream_dir, &listen_addr, shutdown_clone, disk_state_server).await
+        {
             tracing::error!("HTTP server error: {e:#}");
         }
     });
 
-    // ── periodic capture health check ────────────────────────────────
-    // Monitor the arecord/ffmpeg child in a background task. If it
-    // dies, log the error so operators can diagnose the problem.
+    // ── periodic capture health check + disk guard ───────────────────
     let capture_shutdown = Arc::new(AtomicBool::new(false));
     let capture_shutdown_clone = capture_shutdown.clone();
+    let disk_state_health = disk_state.clone();
+    let guard_dir = config.stream_data_dir();
+    let disk_max = config.disk_usage_max;
+    // Keep a clone of config for restarting capture after pause.
+    let config_for_restart = config.clone();
+
     let health_thread = std::thread::Builder::new()
         .name("capture-health".into())
         .spawn(move || {
             while !capture_shutdown_clone.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(10));
+
+                // ── disk usage check ─────────────────────────────────
+                if let Some(pct) = disk::usage_pct(&guard_dir) {
+                    disk_state_health
+                        .usage_centipct
+                        .store((pct * 100.0) as u32, Ordering::Relaxed);
+
+                    let is_paused = disk_state_health.capture_paused.load(Ordering::Relaxed);
+
+                    if pct >= disk_max && !is_paused {
+                        // ── PAUSE: kill capture ──────────────────────
+                        tracing::warn!(
+                            "Disk usage {pct:.1}% >= threshold {disk_max}% — \
+                             pausing audio capture to prevent filling the disk"
+                        );
+                        if let Some(ref mut h) = capture_handle {
+                            if let Err(e) = h.kill() {
+                                tracing::error!("Failed to kill capture: {e:#}");
+                            }
+                        }
+                        capture_handle = None;
+                        disk_state_health
+                            .capture_paused
+                            .store(true, Ordering::Relaxed);
+                    } else if pct < disk_max && is_paused {
+                        // ── RESUME: restart capture ──────────────────
+                        tracing::info!(
+                            "Disk usage {pct:.1}% < threshold {disk_max}% — \
+                             resuming audio capture"
+                        );
+                        match capture::start(&config_for_restart) {
+                            Ok(h) => {
+                                capture_handle = Some(h);
+                                disk_state_health
+                                    .capture_paused
+                                    .store(false, Ordering::Relaxed);
+                                tracing::info!("Audio capture resumed");
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to restart capture after disk-free: {e:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // ── ffmpeg liveness check ────────────────────────────
                 if let Some(ref mut h) = capture_handle {
                     if let Some(msg) = h.check_alive() {
                         tracing::error!(
