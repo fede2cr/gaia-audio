@@ -39,12 +39,44 @@ fn format_capture_time(iso: &str, offset_hours: i32) -> String {
         return String::new();
     }
     let parse = || -> Option<String> {
+        let year: i32 = iso[0..4].parse().ok()?;
+        let month: u32 = iso[5..7].parse().ok()?;
+        let day: u32 = iso[8..10].parse().ok()?;
         let hour: i32 = iso[11..13].parse().ok()?;
         let min: u32 = iso[14..16].parse().ok()?;
 
         let mut h = hour + offset_hours;
-        if h >= 24 { h -= 24; }
-        if h < 0 { h += 24; }
+        let mut d = day as i32;
+        let mut m = month as i32;
+        let mut y = year;
+        if h >= 24 {
+            h -= 24;
+            d += 1;
+            let days_in_month = match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+                _ => 31,
+            };
+            if d > days_in_month {
+                d = 1;
+                m += 1;
+                if m > 12 { m = 1; y += 1; }
+            }
+        } else if h < 0 {
+            h += 24;
+            d -= 1;
+            if d < 1 {
+                m -= 1;
+                if m < 1 { m = 12; y -= 1; }
+                d = match m {
+                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                    4 | 6 | 9 | 11 => 30,
+                    2 => if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
+                    _ => 31,
+                };
+            }
+        }
 
         let (h12, ampm) = match h {
             0 => (12, "am"),
@@ -59,7 +91,7 @@ fn format_capture_time(iso: &str, offset_hours: i32) -> String {
             format!("UTC{offset_hours}")
         };
 
-        Some(format!("{h12}:{min:02}{ampm} ({tz_label})"))
+        Some(format!("{y}-{m:02}-{d:02} {h12}:{min:02}{ampm} ({tz_label})"))
     };
     parse().unwrap_or_default()
 }

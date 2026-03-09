@@ -48,6 +48,8 @@ pub struct Config {
     /// Instance identifier used to isolate temp directories when running
     /// multiple processing containers on the same data volume.
     pub processing_instance: String,
+    /// Number of parallel analysis threads (default 1).
+    pub processing_threads: usize,
 
 
     // ── privacy / extraction (processing) ────────────────────────────
@@ -160,6 +162,10 @@ pub fn load(path: &Path) -> Result<Config> {
             })
             .unwrap_or_default(),
         processing_instance: get("PROCESSING_INSTANCE").unwrap_or_default(),
+        processing_threads: get("PROCESSING_THREADS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .max(1),
         raw_spectrogram: get("RAW_SPECTROGRAM")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),

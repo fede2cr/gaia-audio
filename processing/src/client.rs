@@ -17,30 +17,23 @@ use gaia_common::config::Config;
 use gaia_common::discovery::{DiscoveryHandle, ServiceRole};
 use gaia_common::protocol::RecordingInfo;
 
-use crate::analysis;
-use crate::model::LoadedModel;
-use crate::ReportPayload;
+use crate::WorkItem;
 
 /// How often to re-scan mDNS for new/removed capture nodes.
 const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Maximum number of recordings to process from a single capture node
-/// before moving on to the next.  This ensures fair round-robin
-/// processing when multiple capture nodes are present.
-const BATCH_PER_NODE: usize = 3;
-
-/// Poll all known capture servers for new recordings and process them.
+/// Poll all known capture servers for new recordings, download them,
+/// and dispatch work items to the worker pool.
 ///
-/// If `discovery` is `Some`, capture nodes are located (and periodically
-/// refreshed) via mDNS.  If mDNS finds no capture nodes the config's
-/// `capture_server_url` is used as a fallback.
+/// This function only handles downloading and dispatching — the actual
+/// analysis is performed by worker threads that receive `WorkItem`s via
+/// the `work_tx` channel.
 ///
 /// Blocks until `shutdown` is set.
-pub fn poll_and_process(
-    models: &mut [LoadedModel],
+pub fn poll_and_dispatch(
     config: &mut Config,
     discovery: Option<&DiscoveryHandle>,
-    report_tx: &SyncSender<ReportPayload>,
+    work_tx: &SyncSender<WorkItem>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -57,9 +50,9 @@ pub fn poll_and_process(
     let tmp_dir = config.recs_dir.join(&instance_suffix);
     std::fs::create_dir_all(&tmp_dir)?;
 
-    // Track which files we've already processed this session.
+    // Track which files we've already dispatched this session.
     // Key = "base_url:filename" to avoid collisions across capture nodes.
-    let mut processed: HashSet<String> = HashSet::new();
+    let mut dispatched: HashSet<String> = HashSet::new();
 
     // Build initial list of capture URLs
     let mut capture_urls = resolve_capture_urls(discovery, config);
@@ -79,8 +72,6 @@ pub fn poll_and_process(
         }
     }
     // Prune processing instances that haven't heartbeated in a while.
-    // This removes stale entries left over from containers that were
-    // stopped or removed, which would otherwise block file deletion.
     let pruned = crate::db::prune_stale_instances(&config.db_path, 10);
     if pruned > 0 {
         info!("Pruned {pruned} stale processing instance(s) from previous runs");
@@ -90,13 +81,6 @@ pub fn poll_and_process(
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
-        }
-
-        // Without models we cannot analyse anything.
-        if models.is_empty() {
-            warn!("No models loaded – skipping poll cycle");
-            std::thread::sleep(poll_interval);
-            continue;
         }
 
         // ── refresh settings from DB ─────────────────────────────
@@ -147,24 +131,13 @@ pub fn poll_and_process(
                 recordings.len()
             );
 
-            let mut batch_count = 0;
             for rec in &recordings {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // Round-robin: only process a limited batch from each
-                // capture node per cycle so we service all nodes fairly.
-                if batch_count >= BATCH_PER_NODE {
-                    debug!(
-                        "[{}] Batch limit ({}) reached – rotating to next node",
-                        base_url, BATCH_PER_NODE
-                    );
-                    break;
-                }
-
                 let key = format!("{}:{}", base_url, rec.filename);
-                if processed.contains(&key) {
+                if dispatched.contains(&key) {
                     continue;
                 }
 
@@ -183,89 +156,35 @@ pub fn poll_and_process(
                     }
                 }
 
-                // ── process ──────────────────────────────────────────
-                if let Err(e) =
-                    analysis::process_file(&local_path, models, config, report_tx, base_url)
-                {
-                    error!("Error processing {}: {e:#}", rec.filename);
-                }
-
-                // NOTE: do NOT delete the temp file here — the reporting
-                // thread still needs it for clip extraction and spectrogram
-                // generation.  It is cleaned up in reporting::handle_queue
-                // after processing is complete.
-
-                // ── coordinate multi-instance deletion ───────────────
-                // Mark this instance as done with the file. Only ask the
-                // capture server to delete once ALL registered instances
-                // have finished.
-                let instance_id = if config.processing_instance.is_empty() {
-                    "default"
-                } else {
-                    &config.processing_instance
+                // ── dispatch to worker pool ──────────────────────────
+                let item = WorkItem {
+                    local_path,
+                    filename: rec.filename.clone(),
+                    base_url: base_url.clone(),
+                    config_snapshot: config.clone(),
                 };
-                if let Err(e) = crate::db::mark_file_processed(
-                    &config.db_path,
-                    &rec.filename,
-                    instance_id,
-                ) {
-                    warn!("Cannot mark {} as processed: {e}", rec.filename);
-                } else {
-                    debug!(
-                        "Marked {} as processed by instance {:?}",
-                        rec.filename, instance_id
-                    );
+                if work_tx.send(item).is_err() {
+                    warn!("Work channel closed — stopping dispatch");
+                    return Ok(());
                 }
 
-                if crate::db::all_instances_done(&config.db_path, &rec.filename) {
-                    debug!(
-                        "All processing instances done with {} — requesting deletion",
-                        rec.filename
-                    );
-                    match delete_recording(&client, base_url, &rec.filename) {
-                        Ok(()) => {
-                            // Log remaining file count on the capture server.
-                            let remaining = list_recordings(&client, base_url)
-                                .map(|r| r.len())
-                                .unwrap_or(0);
-                            info!(
-                                "[{}] Deleted {} from capture server ({} remaining)",
-                                base_url, rec.filename, remaining
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to delete {} from {}: {e}",
-                                rec.filename, base_url
-                            );
-                        }
-                    }
-                } else {
-                    debug!(
-                        "{}: waiting for other instances to finish",
-                        rec.filename
-                    );
-                }
-
-                processed.insert(key);
-                batch_count += 1;
+                dispatched.insert(key);
             }
         }
 
-        if !found_any {
-            debug!("No recordings on any capture node – sleeping");
-        }
-
-        // Prevent unbounded growth of the processed set
-        if processed.len() > 10_000 {
-            processed.clear();
-            // Also purge old entries from the processing-log table
-            // and remove stale processing instances.
+        // Prevent unbounded growth of the dispatched set
+        if dispatched.len() > 10_000 {
+            dispatched.clear();
             crate::db::cleanup_processing_log(&config.db_path);
             crate::db::prune_stale_instances(&config.db_path, 10);
         }
 
-        std::thread::sleep(poll_interval);
+        // Only sleep when idle — if we dispatched files there may be
+        // more waiting, so loop immediately.
+        if !found_any {
+            debug!("No recordings on any capture node – sleeping {poll_interval:?}");
+            std::thread::sleep(poll_interval);
+        }
     }
 
     info!("Polling loop stopped");
@@ -366,6 +285,7 @@ fn download_recording(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn delete_recording(
     client: &reqwest::blocking::Client,
     base_url: &str,

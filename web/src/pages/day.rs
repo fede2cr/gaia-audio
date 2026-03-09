@@ -4,9 +4,10 @@ use leptos::*;
 use leptos_router::*;
 
 use crate::components::detection_card::DetectionCard;
-use crate::model::{DayDetectionGroup, WebDetection};
+use crate::components::hourly_chart::SpeciesHourlyGrid;
+use crate::model::{DayDetectionGroup, SpeciesHourlyCounts, WebDetection};
 
-// ─── Server function ─────────────────────────────────────────────────────────
+// ─── Server functions ────────────────────────────────────────────────────────
 
 #[server(GetDayDetections, "/api")]
 pub async fn get_day_detections(
@@ -29,6 +30,18 @@ pub async fn get_day_detections(
     Ok(groups)
 }
 
+/// Hourly species×hour grid for a specific date.
+#[server(GetDayHourly, "/api")]
+pub async fn get_day_hourly(
+    date: String,
+) -> Result<Vec<SpeciesHourlyCounts>, ServerFnError> {
+    use crate::server::db;
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    db::daily_species_hourly(&state.db_path, &date)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+}
+
 // ─── Page component ──────────────────────────────────────────────────────────
 
 /// Detail view for a single day, showing every species detected.
@@ -39,12 +52,26 @@ pub fn DayView() -> impl IntoView {
         params.with(|p| p.get("date").cloned().unwrap_or_default())
     };
 
-    let data = create_resource(date, |d| async move { get_day_detections(d).await });
+    let data = create_resource(date, |d| async move { get_day_detections(d.clone()).await });
+    let hourly = create_resource(date, |d| async move { get_day_hourly(d).await });
 
     view! {
         <div class="day-page">
             <h1>"Detections for " {date}</h1>
             <a href="/calendar" class="back-link">"← Back to Calendar"</a>
+
+            // ── Species × Hour heatmap ───────────────────────────────
+            <Suspense fallback=move || view! { <p class="loading">"Loading chart…"</p> }>
+                {move || hourly.get().map(|res| match res {
+                    Ok(grid) if !grid.is_empty() => view! {
+                        <section class="day-hourly-section">
+                            <h2>"Activity by Hour"</h2>
+                            <SpeciesHourlyGrid data=grid />
+                        </section>
+                    }.into_view(),
+                    _ => view! {}.into_view(),
+                })}
+            </Suspense>
 
             <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
                 {move || data.get().map(|res| match res {

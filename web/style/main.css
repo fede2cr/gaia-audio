@@ -667,6 +667,269 @@ button {
     margin-bottom: 1rem;
 }
 
+/* Calendar navigation in species page */
+.species-cal-nav {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+.species-cal-nav .cal-nav-btn {
+    width: 2rem;
+    height: 2rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    color: var(--text);
+    font-size: 1.1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.species-cal-nav .cal-nav-btn:hover {
+    background: var(--bg-elevated);
+}
+.cal-nav-year {
+    font-weight: 700;
+    font-size: 1rem;
+    min-width: 3.5rem;
+    text-align: center;
+}
+.cal-nav-month-select {
+    padding: .35rem .6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    color: var(--text);
+    font-size: .85rem;
+    margin-left: .5rem;
+}
+
+/* Verification section */
+.species-verification {
+    margin-top: 1.5rem;
+    padding: 1rem;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+}
+.species-verification h2 {
+    font-size: 1.1rem;
+    margin-bottom: .75rem;
+}
+.verification-row {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    flex-wrap: wrap;
+}
+.verification-check {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    font-size: .9rem;
+    cursor: pointer;
+}
+.verification-check input[type="checkbox"] {
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: var(--accent);
+}
+.verification-method {
+    padding: .3rem .5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-size: .85rem;
+}
+.verification-method:disabled {
+    opacity: .5;
+}
+.inat-obs-form {
+    display: flex;
+    align-items: flex-end;
+    gap: .5rem;
+    margin-top: .75rem;
+    flex-wrap: wrap;
+}
+.inat-obs-label {
+    display: flex;
+    flex-direction: column;
+    gap: .25rem;
+    font-size: .8rem;
+    color: var(--text-muted);
+    flex: 1;
+    min-width: 200px;
+}
+.inat-obs-input {
+    padding: .4rem .6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: .85rem;
+}
+.inat-obs-save {
+    padding: .4rem .8rem;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: var(--bg);
+    font-size: .85rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.inat-obs-save:hover {
+    opacity: .9;
+}
+.verification-status {
+    margin-top: .5rem;
+    font-size: .8rem;
+}
+.verification-ok { color: var(--accent); }
+.verification-error { color: #e5534b; }
+
+/* ── Hourly bar chart (single species) ──────────────────────────────────── */
+
+.species-hourly {
+    margin-top: 1.5rem;
+}
+.species-hourly h2 {
+    font-size: 1.1rem;
+    margin-bottom: .75rem;
+}
+
+.hourly-chart {
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    padding: .75rem 1rem;
+}
+.hourly-chart-header {
+    display: flex;
+    align-items: baseline;
+    gap: .75rem;
+    margin-bottom: .5rem;
+}
+.hourly-chart-title {
+    font-weight: 600;
+    font-size: .95rem;
+}
+.hourly-chart-total {
+    font-size: .8rem;
+    color: var(--text-muted);
+}
+
+.hourly-row {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    height: 1.25rem;
+    margin-bottom: 1px;
+}
+.hourly-hour {
+    width: 1.6rem;
+    text-align: right;
+    font-size: .7rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+.hourly-bar-track {
+    flex: 1;
+    height: 100%;
+    background: var(--bg-elevated);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.hourly-bar {
+    height: 100%;
+    border-radius: 2px;
+    transition: width .3s ease;
+}
+.hourly-bar.filled {
+    background: var(--accent);
+}
+.hourly-count {
+    width: 2.2rem;
+    text-align: right;
+    font-size: .7rem;
+    font-weight: 600;
+    color: var(--text);
+    flex-shrink: 0;
+}
+
+/* ── Species × Hour heatmap grid (day view) ─────────────────────────────── */
+
+.day-hourly-section {
+    margin-bottom: 1.5rem;
+}
+.day-hourly-section h2 {
+    font-size: 1.1rem;
+    margin-bottom: .75rem;
+}
+
+.species-hourly-grid-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+.species-hourly-grid {
+    border-collapse: collapse;
+    font-size: .75rem;
+    width: 100%;
+    min-width: 700px;
+}
+.species-hourly-grid th,
+.species-hourly-grid td {
+    padding: .2rem .3rem;
+    text-align: center;
+    border: 1px solid var(--border);
+}
+.species-hourly-grid thead th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+}
+.shg-species-header,
+.shg-species {
+    text-align: left;
+    white-space: nowrap;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.shg-species a {
+    color: var(--text);
+    text-decoration: none;
+}
+.shg-species a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}
+.shg-total-header,
+.shg-total {
+    font-weight: 700;
+    min-width: 2rem;
+}
+.shg-hour-header {
+    min-width: 1.5rem;
+    font-size: .65rem;
+}
+.shg-cell {
+    min-width: 1.5rem;
+    height: 1.5rem;
+    background: var(--bg-card);
+}
+.shg-cell.has-data {
+    /* --intensity set inline via style attr */
+    background: color-mix(in srgb, var(--accent) var(--intensity, 0%), var(--bg-card));
+    font-weight: 600;
+    color: var(--text);
+}
+
 /* ── Species list page ──────────────────────────────────────────────────── */
 
 .species-list-page h1 {

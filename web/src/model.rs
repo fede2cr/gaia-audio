@@ -108,6 +108,22 @@ pub struct SpeciesInfo {
     pub total_detections: u64,
     pub first_seen: Option<String>,
     pub last_seen: Option<String>,
+    /// Verification state (loaded separately).
+    #[serde(default)]
+    pub verification: Option<SpeciesVerification>,
+}
+
+/// Verification record for a species.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeciesVerification {
+    /// `"ornithologist"` or `"inaturalist"`.
+    pub method: String,
+    /// iNaturalist observation URL/ID (only when method == "inaturalist").
+    #[serde(default)]
+    pub inaturalist_obs: String,
+    /// When the verification was recorded.
+    #[serde(default)]
+    pub verified_at: String,
 }
 
 // ─── Calendar ────────────────────────────────────────────────────────────────
@@ -118,6 +134,24 @@ pub struct CalendarDay {
     pub date: String,
     pub total_detections: u32,
     pub unique_species: u32,
+}
+
+// ─── Hourly histogram ────────────────────────────────────────────────────────
+
+/// Detection count for a single hour (0–23).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyCount {
+    pub hour: u32,
+    pub count: u32,
+}
+
+/// Per-species hourly breakdown (used in day and species views).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeciesHourlyCounts {
+    pub scientific_name: String,
+    pub common_name: String,
+    pub total: u32,
+    pub hours: Vec<HourlyCount>,
 }
 
 /// All detections for a single species within one day, grouped.

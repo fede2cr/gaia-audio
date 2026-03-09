@@ -35,7 +35,10 @@ pub async fn get_top_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFn
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut species = db::top_species(&state.db_path, limit)
+
+    // Show today's top species instead of all-time.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut species = db::top_species_for_date(&state.db_path, &today, limit)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images
@@ -119,7 +122,7 @@ pub fn Home() -> impl IntoView {
             </section>
 
             <aside class="top-species">
-                <h2>"Top Species"</h2>
+                <h2>"Today's Top Species"</h2>
                 <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
                     {move || top_species.get().map(|res| match res {
                         Ok(species) => view! {

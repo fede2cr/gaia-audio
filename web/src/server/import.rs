@@ -826,6 +826,13 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             Sci_Name      VARCHAR(100) PRIMARY KEY,
             overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
             notes         TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS species_verifications (
+            Sci_Name         VARCHAR(100) PRIMARY KEY,
+            method           VARCHAR(50) NOT NULL DEFAULT 'ornithologist',
+            inaturalist_obs  TEXT NOT NULL DEFAULT '',
+            verified_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )
     .map_err(|e| format!("Schema error: {e}"))?;

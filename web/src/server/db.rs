@@ -11,7 +11,8 @@ use std::path::Path;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration};
 use rusqlite::{params, Connection};
 
-use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection};
+use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection,
+                    HourlyCount, SpeciesHourlyCounts};
 
 // ─── Timezone helpers ────────────────────────────────────────────────────────
 
@@ -283,6 +284,114 @@ pub fn species_active_dates(
     rows.collect()
 }
 
+/// Hourly detection histogram for a single species (all-time).
+pub fn species_hourly_histogram(
+    db_path: &Path,
+    scientific_name: &str,
+) -> Result<Vec<HourlyCount>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
+         FROM detections \
+         WHERE Sci_Name = ?1 \
+           AND (COALESCE(Excluded, 0) = 0 \
+                OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY hour ORDER BY hour",
+    )?;
+
+    let rows = stmt.query_map(params![scientific_name], |row| {
+        Ok(HourlyCount {
+            hour: row.get(0)?,
+            count: row.get(1)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Per-species hourly breakdown for a specific date (for the day view chart).
+pub fn daily_species_hourly(
+    db_path: &Path,
+    date: &str,
+) -> Result<Vec<SpeciesHourlyCounts>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    // First get distinct species for the day, ordered by total count.
+    let mut sp_stmt = conn.prepare(
+        "SELECT Sci_Name, Com_Name, COUNT(*) AS cnt \
+         FROM detections \
+         WHERE Date = ?1 \
+           AND (COALESCE(Excluded, 0) = 0 \
+                OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY Sci_Name ORDER BY cnt DESC",
+    )?;
+
+    let species: Vec<(String, String, u32)> = sp_stmt
+        .query_map(params![date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Then get hourly breakdown for each species.
+    let mut hour_stmt = conn.prepare(
+        "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
+         FROM detections \
+         WHERE Date = ?1 AND Sci_Name = ?2 \
+         GROUP BY hour ORDER BY hour",
+    )?;
+
+    let mut result = Vec::new();
+    for (sci, com, total) in species {
+        let hours: Vec<HourlyCount> = hour_stmt
+            .query_map(params![date, &sci], |row| {
+                Ok(HourlyCount {
+                    hour: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        result.push(SpeciesHourlyCounts {
+            scientific_name: sci,
+            common_name: com,
+            total,
+            hours,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Top species for a specific date (for daily top species on home page).
+pub fn top_species_for_date(
+    db_path: &Path,
+    date: &str,
+    limit: u32,
+) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+         MAX(d.Date || ' ' || d.Time) AS last \
+         FROM detections d \
+         WHERE d.Date = ?1 \
+           AND (COALESCE(d.Excluded, 0) = 0 \
+                OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![date, limit], |row| {
+        Ok(SpeciesSummary {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            domain: row.get(2)?,
+            detection_count: row.get(3)?,
+            last_seen: row.get(4)?,
+            image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
 /// Top species (for species list on home page).
 ///
 /// Excluded detections are omitted unless the species has been overridden
@@ -502,5 +611,81 @@ pub fn remove_exclusion_override(
         "DELETE FROM exclusion_overrides WHERE Sci_Name = ?1",
         params![scientific_name],
     )?;
+    Ok(())
+}
+
+// ─── Species verification ────────────────────────────────────────────────────
+
+use crate::model::SpeciesVerification;
+
+/// Get verification record for a species (if any).
+pub fn get_species_verification(
+    db_path: &Path,
+    scientific_name: &str,
+) -> Result<Option<SpeciesVerification>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    // Table may not exist in older DBs.
+    let result = conn.query_row(
+        "SELECT method, COALESCE(inaturalist_obs, ''), verified_at \
+         FROM species_verifications WHERE Sci_Name = ?1",
+        params![scientific_name],
+        |row| {
+            Ok(SpeciesVerification {
+                method: row.get(0)?,
+                inaturalist_obs: row.get(1)?,
+                verified_at: row.get(2)?,
+            })
+        },
+    );
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => {
+            // Table doesn't exist yet – treat as no verification.
+            if e.to_string().contains("no such table") {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Save a verification record for a species.
+pub fn set_species_verification(
+    db_path: &Path,
+    scientific_name: &str,
+    method: &str,
+    inaturalist_obs: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = open_rw(db_path)?;
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS species_verifications (
+            Sci_Name         VARCHAR(100) PRIMARY KEY,
+            method           VARCHAR(50) NOT NULL DEFAULT 'ornithologist',
+            inaturalist_obs  TEXT NOT NULL DEFAULT '',
+            verified_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );"
+    );
+    conn.execute(
+        "INSERT INTO species_verifications (Sci_Name, method, inaturalist_obs, verified_at) \
+         VALUES (?1, ?2, ?3, datetime('now')) \
+         ON CONFLICT(Sci_Name) DO UPDATE SET method = excluded.method, \
+         inaturalist_obs = excluded.inaturalist_obs, verified_at = datetime('now')",
+        params![scientific_name, method, inaturalist_obs],
+    )?;
+    Ok(())
+}
+
+/// Remove verification for a species.
+pub fn remove_species_verification(
+    db_path: &Path,
+    scientific_name: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = open_rw(db_path)?;
+    let _ = conn.execute(
+        "DELETE FROM species_verifications WHERE Sci_Name = ?1",
+        params![scientific_name],
+    );
     Ok(())
 }

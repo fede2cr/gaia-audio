@@ -31,6 +31,14 @@ pub struct ReportPayload {
     pub source_node: String,
 }
 
+/// A downloaded file ready for analysis by a worker thread.
+pub struct WorkItem {
+    pub local_path: PathBuf,
+    pub filename: String,
+    pub base_url: String,
+    pub config_snapshot: gaia_common::config::Config,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -150,6 +158,12 @@ fn main() -> Result<()> {
         );
     }
 
+    let num_workers = config.processing_threads;
+    info!(
+        "Processing threads: {} (set PROCESSING_THREADS to change)",
+        num_workers
+    );
+
     // ── mDNS registration + capture discovery ──────────────────────
     // With network_mode: host, mDNS multicast reaches the physical
     // network and containers discover each other automatically —
@@ -215,15 +229,160 @@ fn main() -> Result<()> {
         })
         .context("Cannot spawn reporting thread")?;
 
-    // ── poll capture server(s) and process files ─────────────────────
-    if let Err(e) = client::poll_and_process(
-        &mut models,
+    // ── work channel: poll thread → worker threads ───────────────────
+    let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(num_workers * 2);
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+
+    // ── spawn worker threads ─────────────────────────────────────────
+    // Worker 0 takes the already-loaded models; workers 1..N each load
+    // their own copy from the same manifests.
+    let mut worker_handles = Vec::with_capacity(num_workers);
+
+    for worker_id in 0..num_workers {
+        let report_tx = report_tx.clone();
+        let work_rx = work_rx.clone();
+        let db_path = config.db_path.clone();
+        let instance_id_owned = if config.processing_instance.is_empty() {
+            "default".to_string()
+        } else {
+            config.processing_instance.clone()
+        };
+
+        let mut worker_models = if worker_id == 0 {
+            // First worker reuses the models already loaded above.
+            std::mem::take(&mut models)
+        } else {
+            // Additional workers load their own model copies.
+            let mut m = Vec::with_capacity(manifests.len());
+            for manifest in &manifests {
+                let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    model::load_model(manifest, &config)
+                }));
+                match load_result {
+                    Ok(Ok(loaded)) => m.push(loaded),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Worker {worker_id}: cannot load model {}: {e:#}",
+                            manifest.manifest.model.name
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Worker {worker_id}: model {} panicked during loading",
+                            manifest.manifest.model.name
+                        );
+                    }
+                }
+            }
+            m
+        };
+
+        let handle = std::thread::Builder::new()
+            .name(format!("worker-{worker_id}"))
+            .spawn(move || {
+                info!("Worker {worker_id} started ({} model(s))", worker_models.len());
+
+                // Build a per-worker HTTP client for deletion requests.
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .expect("Cannot create HTTP client");
+
+                loop {
+                    // Receive work items from the shared channel.
+                    let item = {
+                        let rx = work_rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    let item = match item {
+                        Ok(item) => item,
+                        Err(_) => break, // channel closed → shutdown
+                    };
+
+                    tracing::debug!("Worker {worker_id}: analysing {}", item.filename);
+
+                    // ── run analysis ──────────────────────────────────
+                    if let Err(e) = analysis::process_file(
+                        &item.local_path,
+                        &mut worker_models,
+                        &item.config_snapshot,
+                        &report_tx,
+                        &item.base_url,
+                    ) {
+                        tracing::error!(
+                            "Worker {worker_id}: error processing {}: {e:#}",
+                            item.filename
+                        );
+                    }
+
+                    // ── coordinate multi-instance deletion ───────────
+                    if let Err(e) = crate::db::mark_file_processed(
+                        &db_path,
+                        &item.filename,
+                        &instance_id_owned,
+                    ) {
+                        tracing::warn!(
+                            "Worker {worker_id}: cannot mark {} as processed: {e}",
+                            item.filename
+                        );
+                    }
+
+                    if crate::db::all_instances_done(&db_path, &item.filename) {
+                        tracing::debug!(
+                            "Worker {worker_id}: all instances done with {} — deleting",
+                            item.filename
+                        );
+                        let url = format!(
+                            "{}/api/recordings/{}",
+                            item.base_url, item.filename
+                        );
+                        match client.delete(&url).send() {
+                            Ok(resp) if resp.status().is_success()
+                                || resp.status() == reqwest::StatusCode::NOT_FOUND =>
+                            {
+                                info!(
+                                    "Worker {worker_id}: deleted {} from capture server",
+                                    item.filename
+                                );
+                            }
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    "Worker {worker_id}: DELETE {} returned {}",
+                                    item.filename,
+                                    resp.status()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Worker {worker_id}: failed to delete {}: {e}",
+                                    item.filename
+                                );
+                            }
+                        }
+                    }
+                }
+
+                info!("Worker {worker_id} stopped");
+            })
+            .with_context(|| format!("Cannot spawn worker-{worker_id}"))?;
+
+        worker_handles.push(handle);
+    }
+
+    // ── poll capture server(s) and dispatch to workers ───────────────
+    if let Err(e) = client::poll_and_dispatch(
         &mut config,
         discovery.as_ref(),
-        &report_tx,
+        &work_tx,
         &SHUTDOWN,
     ) {
         tracing::error!("Processing loop error: {e:#}");
+    }
+
+    // Signal workers to finish, then wait.
+    drop(work_tx);
+    for h in worker_handles {
+        h.join().ok();
     }
 
     // Signal reporting thread to finish
