@@ -135,9 +135,19 @@ fn migrate_add_excluded(conn: &Connection) {
 
 /// Add `last_heartbeat` column to `processing_instances` if missing.
 fn migrate_add_heartbeat(conn: &Connection) {
-    let _ = conn.execute_batch(
-        "ALTER TABLE processing_instances ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'));",
+    // SQLite ALTER TABLE ADD COLUMN with NOT NULL requires a *constant*
+    // default — datetime('now') is an expression and would be rejected.
+    // Use a constant default, then backfill existing rows.
+    let added = conn.execute_batch(
+        "ALTER TABLE processing_instances ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT '';",
     );
+    if added.is_ok() {
+        // Backfill: set heartbeat to registered_at for existing rows.
+        conn.execute_batch(
+            "UPDATE processing_instances SET last_heartbeat = registered_at WHERE last_heartbeat = '';",
+        )
+        .ok();
+    }
 }
 
 /// Add model tracking columns if they don't exist (idempotent).
