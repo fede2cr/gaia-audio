@@ -96,8 +96,9 @@ pub fn initialize(db_path: &Path) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS processing_instances (
-            instance      TEXT PRIMARY KEY,
-            registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+            instance       TEXT PRIMARY KEY,
+            registered_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
         );
     ",
     )
@@ -107,6 +108,8 @@ pub fn initialize(db_path: &Path) -> Result<()> {
     migrate_add_source_node(&conn);
     // Migration: add Excluded column to existing databases.
     migrate_add_excluded(&conn);
+    // Migration: add last_heartbeat to existing processing_instances tables.
+    migrate_add_heartbeat(&conn);
     // Migration: add Model_Slug and Model_Name columns.
     migrate_add_model_columns(&conn);
 
@@ -127,6 +130,13 @@ fn migrate_add_source_node(conn: &Connection) {
 fn migrate_add_excluded(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
+    );
+}
+
+/// Add `last_heartbeat` column to `processing_instances` if missing.
+fn migrate_add_heartbeat(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "ALTER TABLE processing_instances ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'));",
     );
 }
 
@@ -339,7 +349,8 @@ pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA busy_timeout=3000;")?;
     conn.execute(
-        "INSERT OR REPLACE INTO processing_instances (instance) VALUES (?1)",
+        "INSERT OR REPLACE INTO processing_instances (instance, registered_at, last_heartbeat) \
+         VALUES (?1, datetime('now'), datetime('now'))",
         params![instance],
     )?;
     let total: u32 = conn
@@ -350,6 +361,47 @@ pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
         instance
     );
     Ok(())
+}
+
+/// Update the heartbeat timestamp for a running instance.
+/// Should be called every poll cycle so `all_instances_done` can
+/// distinguish live instances from stale ones.
+pub fn update_heartbeat(db_path: &Path, instance: &str) {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    conn.execute(
+        "UPDATE processing_instances SET last_heartbeat = datetime('now') WHERE instance = ?1",
+        params![instance],
+    )
+    .ok();
+}
+
+/// Remove processing instances whose heartbeat is older than the given
+/// threshold (in minutes).  Returns the number of pruned rows.
+pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    let removed = conn
+        .execute(
+            &format!(
+                "DELETE FROM processing_instances \
+                 WHERE last_heartbeat < datetime('now', '-{stale_minutes} minutes')"
+            ),
+            [],
+        )
+        .unwrap_or(0);
+    if removed > 0 {
+        info!(
+            "Pruned {removed} stale processing instance(s) (no heartbeat in >{stale_minutes} min)"
+        );
+    }
+    removed
 }
 
 /// Record that this instance has finished processing a file.
@@ -377,26 +429,42 @@ pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Re
     Ok(())
 }
 
-/// Check whether every registered processing instance has processed this file.
+/// Check whether every **active** processing instance has processed this file.
+///
+/// Only instances with a heartbeat within the last 5 minutes are
+/// considered.  This prevents stale / stopped containers from blocking
+/// deletion forever.
 pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
         Err(_) => return true, // fail-open: delete if we can't check
     };
     conn.execute_batch("PRAGMA busy_timeout=3000;").ok();
-    // A file is ready for deletion when there is no registered instance
-    // that has NOT yet processed it.
+
+    // Only count instances that are still alive (heartbeat within last
+    // 5 minutes).  Stale entries from previous runs are ignored.
     let remaining = conn.query_row(
         "SELECT COUNT(*) FROM processing_instances \
-         WHERE instance NOT IN \
-           (SELECT instance FROM file_processing_log WHERE filename = ?1)",
+         WHERE last_heartbeat >= datetime('now', '-5 minutes') \
+           AND instance NOT IN \
+             (SELECT instance FROM file_processing_log WHERE filename = ?1)",
         params![filename],
         |row| row.get::<_, u32>(0),
     )
     .unwrap_or(0);
+
+    let active: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM processing_instances \
+             WHERE last_heartbeat >= datetime('now', '-5 minutes')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
     let done = remaining == 0;
     debug!(
-        "all_instances_done({filename}): {remaining} instance(s) still pending → {}",
+        "all_instances_done({filename}): {remaining}/{active} active instance(s) still pending → {}",
         if done { "ready to delete" } else { "waiting" }
     );
     done

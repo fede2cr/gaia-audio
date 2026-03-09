@@ -24,6 +24,10 @@ async fn main() {
         )
         .init();
 
+    if std::env::var("RUST_LOG").map_or(false, |v| v.contains("debug")) {
+        tracing::info!("🔍 Debug logging ENABLED (RUST_LOG={})", std::env::var("RUST_LOG").unwrap_or_default());
+    }
+
     // ── Configuration ────────────────────────────────────────────────────
     let conf = get_configuration(None).await.unwrap();
     let leptos_options = conf.leptos_options.clone();

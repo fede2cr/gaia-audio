@@ -83,22 +83,35 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
         // prevent the detection from being recorded in the database.
         let extracted = match extract_detection(file, detection, config) {
             Ok(path) => {
-                let spec_path = format!("{}.png", path.display());
-                let spec_params = SpectrogramParams {
-                    colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
-                    ..SpectrogramParams::default()
-                };
-                if let Err(e) = spectrogram::generate_from_wav(
-                    &path,
-                    Path::new(&spec_path),
-                    &spec_params,
-                ) {
-                    warn!("Spectrogram failed for {}: {e}", path.display());
+                // Only generate a spectrogram for freshly-extracted WAV
+                // files.  When extract_detection returns an .opus path the
+                // clip was already processed (and its spectrogram created)
+                // in a previous run — re-generating would fail because
+                // generate_from_wav cannot read Opus.
+                let is_opus = path.extension().and_then(|e| e.to_str()) == Some("opus");
+                if !is_opus {
+                    let spec_path = format!("{}.png", path.display());
+                    let spec_params = SpectrogramParams {
+                        colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
+                        ..SpectrogramParams::default()
+                    };
+                    if let Err(e) = spectrogram::generate_from_wav(
+                        &path,
+                        Path::new(&spec_path),
+                        &spec_params,
+                    ) {
+                        warn!("Spectrogram failed for {}: {e}", path.display());
+                    }
+                } else {
+                    debug!("Skipping spectrogram for already-compressed {}", path.display());
                 }
                 // Convert WAV clip → Opus immediately.  Falls back to
                 // the original WAV path if ffmpeg is unavailable.
-                let final_path = crate::compress::compress_inline(&path)
-                    .unwrap_or(path);
+                let final_path = if is_opus {
+                    path
+                } else {
+                    crate::compress::compress_inline(&path).unwrap_or(path)
+                };
                 Some(final_path)
             }
             Err(e) => {

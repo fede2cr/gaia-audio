@@ -39,6 +39,10 @@ fn main() -> Result<()> {
         )
         .init();
 
+    if std::env::var("RUST_LOG").map_or(false, |v| v.contains("debug")) {
+        info!("🔍 Debug logging ENABLED (RUST_LOG={})", std::env::var("RUST_LOG").unwrap_or_default());
+    }
+
     // ── load config ──────────────────────────────────────────────────
     let config_path = std::env::args()
         .nth(1)

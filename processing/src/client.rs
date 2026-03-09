@@ -78,7 +78,13 @@ pub fn poll_and_process(
             Err(e) => warn!("[{url}] Not reachable at startup: {e:#}"),
         }
     }
-
+    // Prune processing instances that haven't heartbeated in a while.
+    // This removes stale entries left over from containers that were
+    // stopped or removed, which would otherwise block file deletion.
+    let pruned = crate::db::prune_stale_instances(&config.db_path, 10);
+    if pruned > 0 {
+        info!("Pruned {pruned} stale processing instance(s) from previous runs");
+    }
     let mut last_discovery = Instant::now();
 
     loop {
@@ -95,6 +101,14 @@ pub fn poll_and_process(
 
         // ── refresh settings from DB ─────────────────────────────
         crate::db::apply_settings_overrides(config);
+
+        // ── heartbeat so other instances know we're alive ────────
+        let instance_id = if config.processing_instance.is_empty() {
+            "default"
+        } else {
+            &config.processing_instance
+        };
+        crate::db::update_heartbeat(&config.db_path, instance_id);
 
         // ── periodic mDNS re-discovery ───────────────────────────────
         if last_discovery.elapsed() >= REDISCOVERY_INTERVAL {
@@ -245,8 +259,10 @@ pub fn poll_and_process(
         // Prevent unbounded growth of the processed set
         if processed.len() > 10_000 {
             processed.clear();
-            // Also purge old entries from the processing-log table.
+            // Also purge old entries from the processing-log table
+            // and remove stale processing instances.
             crate::db::cleanup_processing_log(&config.db_path);
+            crate::db::prune_stale_instances(&config.db_path, 10);
         }
 
         std::thread::sleep(poll_interval);
