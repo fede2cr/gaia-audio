@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use tracing::info;
+use tracing::{debug, info};
 
 use gaia_common::detection::Detection;
 
@@ -342,6 +342,13 @@ pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
         "INSERT OR REPLACE INTO processing_instances (instance) VALUES (?1)",
         params![instance],
     )?;
+    let total: u32 = conn
+        .query_row("SELECT COUNT(*) FROM processing_instances", [], |row| row.get(0))
+        .unwrap_or(1);
+    debug!(
+        "Registered processing instance {:?} ({total} instance(s) total)",
+        instance
+    );
     Ok(())
 }
 
@@ -353,6 +360,20 @@ pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Re
         "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
         params![filename, instance],
     )?;
+    let done: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
+            params![filename],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let total: u32 = conn
+        .query_row("SELECT COUNT(*) FROM processing_instances", [], |row| row.get(0))
+        .unwrap_or(0);
+    debug!(
+        "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
+        instance
+    );
     Ok(())
 }
 
@@ -365,15 +386,20 @@ pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
     conn.execute_batch("PRAGMA busy_timeout=3000;").ok();
     // A file is ready for deletion when there is no registered instance
     // that has NOT yet processed it.
-    conn.query_row(
+    let remaining = conn.query_row(
         "SELECT COUNT(*) FROM processing_instances \
          WHERE instance NOT IN \
            (SELECT instance FROM file_processing_log WHERE filename = ?1)",
         params![filename],
         |row| row.get::<_, u32>(0),
     )
-    .map(|remaining| remaining == 0)
-    .unwrap_or(true)
+    .unwrap_or(0);
+    let done = remaining == 0;
+    debug!(
+        "all_instances_done({filename}): {remaining} instance(s) still pending → {}",
+        if done { "ready to delete" } else { "waiting" }
+    );
+    done
 }
 
 /// Remove old entries from the processing log (files older than 1 hour).
@@ -383,8 +409,11 @@ pub fn cleanup_processing_log(db_path: &Path) {
         Err(_) => return,
     };
     conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    let _ = conn.execute(
+    let removed = conn.execute(
         "DELETE FROM file_processing_log WHERE processed_at < datetime('now', '-1 hour')",
         [],
-    );
+    ).unwrap_or(0);
+    if removed > 0 {
+        debug!("cleanup_processing_log: purged {removed} stale entries");
+    }
 }

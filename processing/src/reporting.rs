@@ -67,6 +67,14 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
         .iter()
         .partition(|d| !db::is_urban_noise(&d.scientific_name));
 
+    debug!(
+        "Report for {}: {} total detection(s) ({} species, {} noise)",
+        file.file_path.display(),
+        payload.detections.len(),
+        species_dets.len(),
+        noise_dets.len()
+    );
+
     write_json_file(file, &payload.detections, config)?;
 
     // ── real species detections ──────────────────────────────────────
@@ -242,6 +250,12 @@ fn extract_detection(
     }
 
     audio::extract_clip(&file.file_path, &new_path, safe_start, safe_stop)?;
+    debug!(
+        "Extracted clip {:.1}s–{:.1}s from {} → {}",
+        safe_start, safe_stop,
+        file.file_path.display(),
+        new_path.display()
+    );
     Ok(new_path)
 }
 

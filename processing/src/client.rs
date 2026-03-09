@@ -196,9 +196,18 @@ pub fn poll_and_process(
                     instance_id,
                 ) {
                     warn!("Cannot mark {} as processed: {e}", rec.filename);
+                } else {
+                    debug!(
+                        "Marked {} as processed by instance {:?}",
+                        rec.filename, instance_id
+                    );
                 }
 
                 if crate::db::all_instances_done(&config.db_path, &rec.filename) {
+                    debug!(
+                        "All processing instances done with {} — requesting deletion",
+                        rec.filename
+                    );
                     match delete_recording(&client, base_url, &rec.filename) {
                         Ok(()) => {
                             // Log remaining file count on the capture server.
@@ -296,6 +305,10 @@ fn list_recordings(
     }
 
     let recordings: Vec<RecordingInfo> = resp.json().context("Parse recordings JSON")?;
+    debug!(
+        "[{base_url}] GET /api/recordings → {} file(s)",
+        recordings.len()
+    );
     Ok(recordings)
 }
 
@@ -306,6 +319,7 @@ fn download_recording(
     out_path: &Path,
 ) -> Result<()> {
     let url = format!("{base_url}/api/recordings/{filename}");
+    let t0 = Instant::now();
     let resp = client.get(&url).send().context("GET recording")?;
 
     if !resp.status().is_success() {
@@ -317,6 +331,21 @@ fn download_recording(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(out_path, &bytes)?;
+    let elapsed = t0.elapsed();
+    let size_mb = bytes.len() as f64 / 1_048_576.0;
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        size_mb / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    debug!(
+        "Downloaded {} → {} ({:.2} MB in {:.1}s, {:.1} MB/s)",
+        filename,
+        out_path.display(),
+        size_mb,
+        elapsed.as_secs_f64(),
+        rate
+    );
     info!("Downloaded {} → {}", filename, out_path.display());
     Ok(())
 }
@@ -330,7 +359,11 @@ fn delete_recording(
     let resp = client.delete(&url).send().context("DELETE recording")?;
 
     if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-        debug!("Deleted {filename} from capture server");
+        debug!(
+            "DELETE {filename} from capture server → {} ({})",
+            resp.status(),
+            if resp.status().is_success() { "removed" } else { "already gone" }
+        );
         Ok(())
     } else {
         anyhow::bail!("DELETE {} returned {}", url, resp.status())

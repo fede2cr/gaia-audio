@@ -19,7 +19,7 @@ use axum::routing::{delete, get};
 use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{debug, info};
 
 use gaia_common::protocol::{HealthResponse, RecordingInfo};
 
@@ -142,6 +142,14 @@ async fn list_recordings(
     }
 
     recordings.sort_by(|a, b| a.filename.cmp(&b.filename));
+
+    let total_bytes: u64 = recordings.iter().map(|r| r.size).sum();
+    debug!(
+        "Listing {} recording(s), total size {:.1} MB",
+        recordings.len(),
+        total_bytes as f64 / 1_048_576.0
+    );
+
     Ok(Json(recordings))
 }
 
@@ -163,6 +171,13 @@ async fn download_recording(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    debug!(
+        file = %name,
+        size_bytes = bytes.len(),
+        size_mb = format_args!("{:.2}", bytes.len() as f64 / 1_048_576.0),
+        "Serving recording to processing node"
+    );
+
     Ok((
         [(axum::http::header::CONTENT_TYPE, "audio/wav")],
         Body::from(bytes),
@@ -173,17 +188,40 @@ async fn delete_recording(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> StatusCode {
+    debug!(file = %name, "DELETE request received from processing node");
+
     if name.contains('/') || name.contains('\\') || name.contains("..") {
+        debug!(file = %name, "DELETE rejected: invalid path characters");
         return StatusCode::BAD_REQUEST;
     }
 
     let file_path = state.stream_dir.join(&name);
     if !file_path.exists() {
+        debug!(file = %name, "DELETE rejected: file not found");
         return StatusCode::NOT_FOUND;
     }
 
+    // Grab file size before deleting so we can log how much space was freed.
+    let size_bytes = tokio::fs::metadata(&file_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     match tokio::fs::remove_file(&file_path).await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(()) => {
+            let disk_pct = state.disk.usage_pct();
+            debug!(
+                file = %name,
+                freed_bytes = size_bytes,
+                freed_mb = format_args!("{:.2}", size_bytes as f64 / 1_048_576.0),
+                disk_usage_pct = format_args!("{disk_pct:.1}"),
+                "DELETE OK — recording removed"
+            );
+            StatusCode::NO_CONTENT
+        }
+        Err(e) => {
+            debug!(file = %name, error = %e, "DELETE failed: could not remove file");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }

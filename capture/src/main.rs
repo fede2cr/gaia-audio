@@ -69,6 +69,12 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(config.stream_data_dir())
         .context("Cannot create StreamData directory")?;
 
+    // ── log initial disk space ───────────────────────────────────────
+    match disk::summary(&config.stream_data_dir()) {
+        Some(s) => info!("Disk space at startup: {s}"),
+        None => tracing::warn!("Could not determine disk space at startup"),
+    }
+
     // ── ctrl-c ───────────────────────────────────────────────────────
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::Relaxed);
