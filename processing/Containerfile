@@ -139,9 +139,10 @@ COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models
 # Bundle all model manifests so the entrypoint can seed them into the
 # models volume automatically.  Each manifest goes into its own
 # subdirectory matching the slug used at runtime.
-COPY examples/birds_manifest.toml /usr/local/share/gaia/manifests/birdnet/manifest.toml
-COPY examples/perch_manifest.toml /usr/local/share/gaia/manifests/perch/manifest.toml
-COPY examples/bats_manifest.toml  /usr/local/share/gaia/manifests/batdetect2/manifest.toml
+COPY examples/birds_manifest.toml    /usr/local/share/gaia/manifests/birdnet/manifest.toml
+COPY examples/perch_manifest.toml    /usr/local/share/gaia/manifests/perch/manifest.toml
+COPY examples/bats_manifest.toml     /usr/local/share/gaia/manifests/batdetect2/manifest.toml
+COPY examples/birdnet3_manifest.toml /usr/local/share/gaia/manifests/birdnet3/manifest.toml
 
 # Seed batdetect2 labels alongside the manifest so entrypoint.sh copies
 # them into /models/batdetect2/ (no-clobber) at container start.

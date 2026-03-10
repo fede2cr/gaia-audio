@@ -113,16 +113,25 @@ pip install batdetect2
 | Field | Value |
 |-------|-------|
 | **Species** | ~11,000 (birds + expanded non-bird taxa) |
-| **Format** | TFLite |
+| **Format** | ONNX (Zenodo) |
 | **Sample rate** | 32 kHz |
-| **Chunk duration** | Variable length input |
+| **Chunk duration** | 3.0 s |
 | **Source** | [Zenodo 18247420](https://zenodo.org/records/18247420) |
-| **Status** | Preview — needs testing with `tract`; variable-length input may require padding |
+| **Slug** | `birdnet3` |
+| **Status** | Fully integrated — auto-download from Zenodo |
 
 Developer preview from the BirdNET team.  Extends the species list to include
 non-bird species (amphibians, insects, mammals).  Uses 32 kHz (vs. 48 kHz
-for V2.4) and supports variable-length input, which may need adapter code in
-the processing server to pad or tile chunks.
+for V2.4) and accepts raw audio input — no mel spectrogram preprocessing
+is needed (`onnx_is_classifier = false`).  Uses sigmoid scaling like V2.4
+(`apply_softmax = false`).
+
+Already shipped as `examples/birdnet3_manifest.toml`.
+
+**Deployment:** Automatic.  The entrypoint seeds the manifest; the
+processing server downloads the ONNX model (~541 MB) and labels on
+first start via the `[download.direct_files]` section.  No build-time
+conversion is needed — the model is already in ONNX format.
 
 ---
 

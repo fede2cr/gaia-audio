@@ -1,0 +1,49 @@
+# Model manifest for BirdNET+ V3.0 (Developer Preview)
+#
+# Place this file as manifest.toml inside a model directory, e.g.:
+#   /models/birdnet3/manifest.toml
+#
+# The processing server auto-discovers all subdirectories of MODEL_DIR
+# that contain a manifest.toml.
+#
+# If model files are missing and a [download] section is present, the
+# server will automatically download them from Zenodo.
+
+[model]
+name = "BirdNET+ V3.0"
+slug = "birdnet3"
+domain = "birds"
+sample_rate = 32000
+chunk_duration = 3.0
+# BirdNET+ V3.0 is ONNX-only — no TFLite file needed for inference.
+# Set to a placeholder; the ONNX path takes priority when present.
+tflite_file = "model.tflite"
+onnx_file = "model.onnx"
+labels_file = "labels.csv"
+# V3.0 does not use V1-style metadata input
+v1_metadata = false
+# BirdNET uses sigmoid scaling (flat_sigmoid), not softmax.
+# scale_logits() applies: 1/(1+exp(-sensitivity * clip(x,-20,20)))
+apply_softmax = false
+# BirdNET+ V3.0 accepts raw audio [1, N], NOT mel spectrograms.
+# Only BirdNET V2.4's extracted classifier sub-model needs this set to true.
+onnx_is_classifier = false
+
+# ── Automatic download from Zenodo ───────────────────────────────────
+#
+# The processing server downloads the ONNX model (~541 MB) and labels
+# on first start.  No build-time conversion is needed — the model is
+# already in ONNX format.
+#
+# Source: https://zenodo.org/records/18247420
+#
+# Species coverage: ~11,000 species including birds + expanded non-bird
+# taxa (amphibians, insects, mammals).
+
+[download]
+# No Zenodo variants — files are downloaded directly.
+default_variant = "default"
+
+[download.direct_files]
+"model.onnx" = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_FP32.onnx/content"
+"labels.csv" = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_Labels.csv/content"
