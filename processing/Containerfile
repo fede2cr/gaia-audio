@@ -109,15 +109,16 @@ RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
     ls -lh /convert/batdetect2.onnx /convert/labels.csv
 
 # ── BirdNET+ V3.0 ONNX patch at build time ────────────────────────
-# Downloads the BirdNET+ V3.0 ONNX model from Zenodo and patches
-# Resize nodes that use coordinate_transformation_mode
-# "pytorch_half_pixel" (unsupported by tract-onnx) to "half_pixel".
+# Downloads the BirdNET+ V3.0 ONNX model from Zenodo, patches
+# Resize nodes and freezes symbolic dimensions to concrete values
+# for tract-onnx compatibility, then validates the result with
+# onnxruntime.
 #
-# The resulting ~541 MB ONNX file is baked into the image.
+# The resulting ~516 MB ONNX file is baked into the image.
 # No Python is needed at runtime.
 FROM python:3.11-slim AS birdnet3converter
 
-RUN pip install --no-cache-dir onnx
+RUN pip install --no-cache-dir onnx onnxruntime numpy
 
 WORKDIR /convert
 COPY scripts/patch_birdnet3_onnx.py .

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Download BirdNET+ V3.0 ONNX model from Zenodo and patch for tract-onnx.
 
-tract-onnx does not support the ``Resize`` operator with
-``coordinate_transformation_mode = "pytorch_half_pixel"``.  This script:
+tract-onnx does not support:
+
+ * The ``Resize`` operator with
+   ``coordinate_transformation_mode = "pytorch_half_pixel"``.
+ * Symbolic dimension expressions that use Python-style integer
+   division (``//``), e.g. ``((samples//512)) + 1``.
+
+This script:
 
  1. Downloads the original ONNX model from Zenodo record 18247420.
  2. Replaces ``pytorch_half_pixel`` with ``half_pixel`` in every
-    ``Resize`` node that uses it.  The two modes are functionally
-    equivalent for fractional scale factors (they only differ when
-    the scale is exactly 1, which is not the case here).
- 3. Saves the patched model to the output path.
+    ``Resize`` node.
+ 3. Freezes the model input to the concrete shape ``[1, 96000]``
+    (batch=1, 3 s × 32 kHz) and runs ONNX shape inference so that
+    **all** symbolic dimensions are replaced by concrete integers.
+ 4. Saves the patched model to the output path.
 
 Usage::
 
@@ -27,6 +34,7 @@ import sys
 import urllib.request
 
 import onnx
+from onnx import TensorProto, helper, numpy_helper, shape_inference
 
 ZENODO_RECORD = "18247420"
 ONNX_FILENAME = "BirdNET%2B_V3.0-preview3_Global_11K_FP32.onnx"
@@ -95,6 +103,233 @@ def patch_resize_nodes(model: onnx.ModelProto) -> int:
     return count
 
 
+# ── Input shape: 1 batch × (sample_rate × chunk_duration) samples ─────
+BATCH_SIZE = 1
+SAMPLE_RATE = 32_000
+CHUNK_DURATION_S = 3.0
+NUM_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION_S)  # 96 000
+
+
+def freeze_input_shapes(model: onnx.ModelProto) -> int:
+    """Replace symbolic / dynamic input dimensions with concrete values.
+
+    BirdNET+ V3.0 declares its input as ``[batch, samples]`` where both
+    are symbolic.  Downstream nodes derive shapes such as
+    ``((samples//512)) + 1`` which tract-onnx cannot parse because its
+    TDim parser doesn't support Python-style integer division (``//``).
+
+    Freezing the input to ``[1, 96000]`` and running ONNX shape inference
+    propagates concrete integers through the entire graph, eliminating
+    all symbolic expressions.
+
+    Returns the number of input dimensions that were changed.
+    """
+    graph = model.graph
+    changed = 0
+
+    target_shapes = {
+        # Map input name → desired concrete shape.
+        # BirdNET+ V3.0 has a single input; handle any name.
+    }
+    for inp in graph.input:
+        # Only patch float inputs (skip any non-tensor inputs).
+        if inp.type.tensor_type.elem_type not in (
+            TensorProto.FLOAT,
+            TensorProto.FLOAT16,
+            TensorProto.DOUBLE,
+        ):
+            continue
+        target_shapes[inp.name] = [BATCH_SIZE, NUM_SAMPLES]
+
+    for inp in graph.input:
+        if inp.name not in target_shapes:
+            continue
+        shape = target_shapes[inp.name]
+        dims = inp.type.tensor_type.shape.dim
+        old_dims = []
+        for d in dims:
+            if d.dim_param:
+                old_dims.append(d.dim_param)
+            else:
+                old_dims.append(str(d.dim_value))
+
+        # Clear existing dims and set concrete values.
+        while len(dims) > 0:
+            dims.pop()
+        for val in shape:
+            dim = dims.add()
+            dim.dim_value = val
+
+        print(f"  Froze input '{inp.name}': [{', '.join(old_dims)}] → {shape}")
+        changed += len(shape)
+
+    if changed == 0:
+        print("  WARNING: no input dimensions were frozen")
+        return changed
+
+    # Run shape inference to propagate concrete shapes through the graph.
+    print("  Running ONNX shape inference to propagate concrete dimensions ...")
+    try:
+        model_inferred = shape_inference.infer_shapes(model, check_type=True)
+        # Copy the inferred graph back into the model in-place.
+        model.graph.CopyFrom(model_inferred.graph)
+        print("  Shape inference complete")
+    except Exception as e:
+        print(f"  WARNING: shape inference failed ({e}), dimensions may still be symbolic")
+
+    # Even after shape inference, some intermediate value_info entries may
+    # retain symbolic dim_param values.  Clear them from all value_info and
+    # output entries where we now have a concrete dim_value != 0.
+    cleared = _clear_residual_symbolic_dims(model)
+    if cleared:
+        print(f"  Cleared {cleared} residual symbolic dimension(s)")
+
+    return changed
+
+
+def _clear_residual_symbolic_dims(model: onnx.ModelProto) -> int:
+    """Remove leftover dim_param strings once dim_value is set."""
+    count = 0
+    for vi in list(model.graph.value_info) + list(model.graph.output):
+        if not vi.type.HasField("tensor_type"):
+            continue
+        for d in vi.type.tensor_type.shape.dim:
+            if d.dim_param and d.dim_value > 0:
+                d.ClearField("dim_param")
+                count += 1
+    return count
+
+
+def fix_range_scalar_inputs(model: onnx.ModelProto) -> int:
+    """Ensure all Range node inputs are true scalars (shape ``[]``).
+
+    After shape inference freezes symbolic dimensions, some tensors
+    that feed into ``Range`` nodes may have shape ``[1]`` instead of
+    ``[]``.  The ONNX Range op spec requires 0-d scalar inputs and
+    onnxruntime enforces this strictly.
+
+    Strategy:
+      * Initializers with shape ``[1]`` → squeezed in-place.
+      * Constant-op outputs with shape ``[1]`` → squeezed in-place.
+      * **Compute-node outputs** (Shape→Gather, etc.) → a ``Reshape``
+        node is inserted to convert ``[1]`` → ``[]``.
+
+    Returns the number of fixes applied.
+    """
+    import numpy as np
+
+    graph = model.graph
+
+    # Build lookups.
+    init_by_name = {init.name: init for init in graph.initializer}
+    const_by_output: dict[str, onnx.NodeProto] = {}
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) == 1:
+            const_by_output[node.output[0]] = node
+
+    fixed = 0
+    reshape_nodes_to_add: list[onnx.NodeProto] = []
+
+    # We may need a single "empty shape" initializer for Reshape → scalar.
+    scalar_shape_init_name = "_scalar_shape_for_range"
+    scalar_shape_added = False
+
+    def _ensure_scalar_shape_init():
+        nonlocal scalar_shape_added
+        if not scalar_shape_added:
+            graph.initializer.append(
+                numpy_helper.from_array(
+                    np.array([], dtype=np.int64), name=scalar_shape_init_name
+                )
+            )
+            scalar_shape_added = True
+
+    for node in list(graph.node):
+        if node.op_type != "Range":
+            continue
+
+        for i, inp_name in enumerate(node.input):
+            if not inp_name:
+                continue
+
+            squeezed = False
+
+            # ── Try initializer ───────────────────────────────────
+            if inp_name in init_by_name:
+                init = init_by_name[inp_name]
+                arr = numpy_helper.to_array(init)
+                if arr.shape == (1,):
+                    scalar = arr.flatten()[0]
+                    new_init = numpy_helper.from_array(
+                        np.array(scalar), name=inp_name
+                    )
+                    init.CopyFrom(new_init)
+                    print(f"  Squeezed initializer '{inp_name}': [1] → scalar ({scalar})")
+                    squeezed = True
+                    fixed += 1
+                # Shape () is already scalar – nothing to do.
+                continue
+
+            # ── Try Constant op ────────────────────────────────────
+            if inp_name in const_by_output:
+                cnode = const_by_output[inp_name]
+                for attr in cnode.attribute:
+                    if attr.name == "value" and attr.t is not None:
+                        arr = numpy_helper.to_array(attr.t)
+                        if arr.shape == (1,):
+                            scalar = arr.flatten()[0]
+                            new_tensor = numpy_helper.from_array(
+                                np.array(scalar), name=attr.t.name or ""
+                            )
+                            attr.t.CopyFrom(new_tensor)
+                            print(
+                                f"  Squeezed Constant '{inp_name}': "
+                                f"[1] → scalar ({scalar})"
+                            )
+                            squeezed = True
+                            fixed += 1
+                continue
+
+            # ── Compute-node output: insert Reshape → scalar ──────
+            # We don't know the shape statically for certain, but if
+            # onnxruntime is complaining about it, it must be [1].
+            # Insert Reshape(x, []) which converts [1] → scalar.
+            _ensure_scalar_shape_init()
+            new_name = f"{inp_name}_scalar_{node.name}_{i}"
+            reshape_node = helper.make_node(
+                "Reshape",
+                inputs=[inp_name, scalar_shape_init_name],
+                outputs=[new_name],
+                name=f"reshape_to_scalar_{node.name}_inp{i}",
+            )
+            node.input[i] = new_name
+            reshape_nodes_to_add.append(reshape_node)
+            print(
+                f"  Inserted Reshape for compute output '{inp_name}' "
+                f"→ '{new_name}' (scalar) feeding {node.name} input {i}"
+            )
+            fixed += 1
+
+    # Append the new Reshape nodes to the graph.
+    for n in reshape_nodes_to_add:
+        graph.node.append(n)
+
+    # Fix value_info shapes for Range inputs: set them to 0-d.
+    range_input_names: set[str] = set()
+    for node in graph.node:
+        if node.op_type == "Range":
+            for inp_name in node.input:
+                range_input_names.add(inp_name)
+    for vi in graph.value_info:
+        if vi.name in range_input_names:
+            tt = vi.type.tensor_type
+            if tt.HasField("shape") and len(tt.shape.dim) == 1:
+                while len(tt.shape.dim) > 0:
+                    tt.shape.dim.pop()
+
+    return fixed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Patch BirdNET+ V3.0 ONNX for tract-onnx")
     parser.add_argument("-o", "--output", required=True, help="Output path for patched ONNX model")
@@ -122,9 +357,16 @@ def main() -> None:
 
     patched = patch_resize_nodes(model)
     if patched == 0:
-        print("WARNING: No Resize nodes with pytorch_half_pixel found — saving unmodified model")
+        print("WARNING: No Resize nodes with pytorch_half_pixel found — continuing anyway")
     else:
         print(f"Patched {patched} Resize node(s)")
+
+    frozen = freeze_input_shapes(model)
+    print(f"Froze {frozen} input dimension(s)")
+
+    range_fixed = fix_range_scalar_inputs(model)
+    if range_fixed:
+        print(f"Fixed {range_fixed} Range-node scalar input(s)")
 
     # Save
     print(f"Saving patched model to {args.output} ...")
@@ -136,6 +378,38 @@ def main() -> None:
     if not args.keep_download and os.path.exists(raw_path):
         os.remove(raw_path)
         print("  Removed original download")
+
+    # ── Validate the patched model ────────────────────────────────────
+    # Run a quick inference with dummy audio to confirm the model loads
+    # and produces output with the expected shape.
+    print("Validating patched model with onnxruntime ...")
+    try:
+        import numpy as np
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(args.output, providers=["CPUExecutionProvider"])
+        inp_name = sess.get_inputs()[0].name
+        inp_shape = sess.get_inputs()[0].shape
+        print(f"  Input: name={inp_name!r}, shape={inp_shape}")
+
+        # Feed 3 s of silence at 32 kHz.
+        dummy = np.zeros((BATCH_SIZE, NUM_SAMPLES), dtype=np.float32)
+        outputs = sess.run(None, {inp_name: dummy})
+        out_shape = outputs[0].shape
+        print(f"  Output shape: {out_shape}")
+        if len(out_shape) < 2 or out_shape[-1] < 100:
+            print(
+                f"WARNING: output shape {out_shape} looks unexpected for a "
+                f"species classifier — double-check the model",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  Validation passed: {out_shape[-1]} class scores produced")
+    except ImportError:
+        print("  onnxruntime / numpy not installed — skipping runtime validation")
+    except Exception as e:
+        print(f"ERROR: model validation failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print("Done.")
 
