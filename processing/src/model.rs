@@ -177,7 +177,32 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                 onnx_path.display(),
                 is_classifier
             );
-            (load_onnx_runner(&onnx_path)?, is_classifier)
+            match load_onnx_runner(&onnx_path) {
+                Ok(r) => (r, is_classifier),
+                Err(e) => {
+                    // If a baked (patched) version exists, try that before
+                    // giving up — the file on the volume may be stale/unpatched.
+                    let fallback = onnx_path.file_name().map(|f| {
+                        Path::new(crate::download::BAKED_MODELS_DIR).join(f)
+                    });
+                    if let Some(baked) = fallback.filter(|p| p.exists() && *p != onnx_path) {
+                        tracing::warn!(
+                            "ONNX load failed ({e:#}); retrying with baked model at {}",
+                            baked.display()
+                        );
+                        // Replace the stale copy so future starts succeed.
+                        if let Err(copy_err) = std::fs::copy(&baked, &onnx_path) {
+                            tracing::warn!(
+                                "Could not overwrite {} with baked model: {copy_err}",
+                                onnx_path.display()
+                            );
+                        }
+                        (load_onnx_runner(&onnx_path)?, is_classifier)
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         } else {
             info!(
                 "ONNX file configured but missing ({}), falling back to TFLite",

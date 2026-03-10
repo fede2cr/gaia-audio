@@ -16,7 +16,7 @@ const ZENODO_FILES_URL: &str = "https://zenodo.org/api/records";
 
 /// Directory where pre-converted ONNX models are baked into the container
 /// image at build time (see `processing/Containerfile`, converter stage).
-const BAKED_MODELS_DIR: &str = "/usr/local/share/gaia/models";
+pub const BAKED_MODELS_DIR: &str = "/usr/local/share/gaia/models";
 
 /// Name of the marker file used to implement exponential backoff across
 /// container restarts.  The file contains the next retry timestamp.
@@ -161,27 +161,45 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         None => return Ok(()), // no onnx_file configured
     };
 
-    if onnx_path.exists() {
-        info!("ONNX model already present: {}", onnx_path.display());
-        return Ok(());
-    }
-
     // ── 1. Baked-in model from container image ───────────────────────
+    // Always prefer the baked version: it may contain build-time
+    // patches (e.g. Resize node fixes for tract-onnx) that a
+    // previously-downloaded copy on the volume does not have.
     if let Some(filename) = onnx_path.file_name() {
         let baked = Path::new(BAKED_MODELS_DIR).join(filename);
         if baked.exists() {
-            info!(
-                "Copying baked-in ONNX model: {} → {}",
-                baked.display(),
-                onnx_path.display()
-            );
-            std::fs::copy(&baked, &onnx_path).with_context(|| {
-                format!(
-                    "Failed to copy baked ONNX model {} → {}",
+            let needs_copy = if onnx_path.exists() {
+                // Overwrite if sizes differ (stale / unpatched copy).
+                let baked_len = std::fs::metadata(&baked).map(|m| m.len()).unwrap_or(0);
+                let local_len = std::fs::metadata(&onnx_path).map(|m| m.len()).unwrap_or(0);
+                if baked_len != local_len {
+                    info!(
+                        "Baked ONNX model size ({baked_len}) differs from local \
+                         copy ({local_len}) — replacing with baked version"
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+
+            if needs_copy {
+                info!(
+                    "Copying baked-in ONNX model: {} → {}",
                     baked.display(),
                     onnx_path.display()
-                )
-            })?;
+                );
+                std::fs::copy(&baked, &onnx_path).with_context(|| {
+                    format!(
+                        "Failed to copy baked ONNX model {} → {}",
+                        baked.display(),
+                        onnx_path.display()
+                    )
+                })?;
+            }
+
             let size = std::fs::metadata(&onnx_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -192,6 +210,11 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
             );
             return Ok(());
         }
+    }
+
+    if onnx_path.exists() {
+        info!("ONNX model already present: {}", onnx_path.display());
+        return Ok(());
     }
 
     // ── 2. Keras-based conversion (preferred on hosts with Python) ───

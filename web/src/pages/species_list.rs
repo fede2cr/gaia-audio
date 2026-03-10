@@ -5,13 +5,32 @@ use leptos::*;
 use crate::components::species_card::SpeciesCard;
 use crate::model::SpeciesSummary;
 
-// Re-use the server function from home (or define a dedicated one)
-use crate::pages::home::get_top_species;
+/// Fetch **all-time** species from the database (not just today).
+///
+/// Excluded detections are omitted unless the species has been
+/// overridden in the `exclusion_overrides` table.
+#[server(GetAllSpecies, "/api")]
+pub async fn get_all_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFnError> {
+    use crate::server::{db, inaturalist};
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
-/// Browse all detected species (paginated by detection count).
+    let mut species = db::top_species(&state.db_path, limit)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    // Enrich with iNaturalist images
+    for sp in species.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+            sp.image_url = Some(photo.medium_url);
+        }
+    }
+    Ok(species)
+}
+
+/// Browse all detected species (sorted by detection count).
 #[component]
 pub fn SpeciesListPage() -> impl IntoView {
-    let species = create_resource(|| (), |_| async { get_top_species(100).await });
+    let species = create_resource(|| (), |_| async { get_all_species(500).await });
 
     view! {
         <div class="species-list-page">
