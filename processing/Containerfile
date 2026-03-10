@@ -108,6 +108,22 @@ COPY scripts/convert_batdetect2_to_onnx.py .
 RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
     ls -lh /convert/batdetect2.onnx /convert/labels.csv
 
+# ── BirdNET+ V3.0 ONNX patch at build time ────────────────────────
+# Downloads the BirdNET+ V3.0 ONNX model from Zenodo and patches
+# Resize nodes that use coordinate_transformation_mode
+# "pytorch_half_pixel" (unsupported by tract-onnx) to "half_pixel".
+#
+# The resulting ~541 MB ONNX file is baked into the image.
+# No Python is needed at runtime.
+FROM python:3.11-slim AS birdnet3converter
+
+RUN pip install --no-cache-dir onnx
+
+WORKDIR /convert
+COPY scripts/patch_birdnet3_onnx.py .
+RUN python3 patch_birdnet3_onnx.py -o /convert/birdnet3.onnx && \
+    ls -lh /convert/birdnet3.onnx
+
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
 # No Python, no TensorFlow — all inference runs in native Rust.
@@ -135,6 +151,11 @@ COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta
 # batconverter stage, so no Python/PyTorch is needed at runtime.
 COPY --from=batconverter /convert/batdetect2.onnx  /usr/local/share/gaia/models/batdetect2.onnx
 COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models/batdetect2-labels.csv
+
+# Pre-patched BirdNET+ V3.0 ONNX model (~541 MB).
+# Resize nodes patched: pytorch_half_pixel → half_pixel for tract-onnx.
+# At runtime, ensure_onnx_file() copies this to the model directory.
+COPY --from=birdnet3converter /convert/birdnet3.onnx /usr/local/share/gaia/models/birdnet3.onnx
 
 # Bundle all model manifests so the entrypoint can seed them into the
 # models volume automatically.  Each manifest goes into its own

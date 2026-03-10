@@ -18,7 +18,9 @@ chunk_duration = 3.0
 # BirdNET+ V3.0 is ONNX-only — no TFLite file needed for inference.
 # Set to a placeholder; the ONNX path takes priority when present.
 tflite_file = "model.tflite"
-onnx_file = "model.onnx"
+# Use a unique name so the baked-model lookup in ensure_onnx_file()
+# finds /usr/local/share/gaia/models/birdnet3.onnx without conflict.
+onnx_file = "birdnet3.onnx"
 labels_file = "labels.csv"
 # V3.0 does not use V1-style metadata input
 v1_metadata = false
@@ -31,9 +33,9 @@ onnx_is_classifier = false
 
 # ── Automatic download from Zenodo ───────────────────────────────────
 #
-# The processing server downloads the ONNX model (~541 MB) and labels
-# on first start.  No build-time conversion is needed — the model is
-# already in ONNX format.
+# The ONNX model (~541 MB) is patched at build time (Resize nodes:
+# pytorch_half_pixel → half_pixel for tract-onnx compatibility) and
+# baked into the container image.  Labels are downloaded on first start.
 #
 # Source: https://zenodo.org/records/18247420
 #
@@ -41,9 +43,9 @@ onnx_is_classifier = false
 # taxa (amphibians, insects, mammals).
 
 [download]
-# No Zenodo variants — files are downloaded directly.
+# No Zenodo variants — labels are downloaded directly; the ONNX model
+# is baked into the image (patched at build time by patch_birdnet3_onnx.py).
 default_variant = "default"
 
 [download.direct_files]
-"model.onnx" = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_FP32.onnx/content"
 "labels.csv" = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_Labels.csv/content"

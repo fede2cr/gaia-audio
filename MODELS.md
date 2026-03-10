@@ -128,10 +128,12 @@ is needed (`onnx_is_classifier = false`).  Uses sigmoid scaling like V2.4
 
 Already shipped as `examples/birdnet3_manifest.toml`.
 
-**Deployment:** Automatic.  The entrypoint seeds the manifest; the
-processing server downloads the ONNX model (~541 MB) and labels on
-first start via the `[download.direct_files]` section.  No build-time
-conversion is needed — the model is already in ONNX format.
+**Deployment:** Automatic.  The Containerfile includes a `birdnet3converter`
+stage that downloads the ONNX model from Zenodo and patches `Resize` nodes
+(`pytorch_half_pixel` → `half_pixel`) for tract-onnx compatibility.  The
+patched model (~541 MB) is baked into the image at
+`/usr/local/share/gaia/models/birdnet3.onnx`.  Labels (~809 KB) are
+downloaded on first start via `[download.direct_files]`.
 
 ---
 
