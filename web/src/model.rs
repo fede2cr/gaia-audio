@@ -2,6 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Return the `NODE_NAME` env var if set, otherwise `"local"`.
+///
+/// This gives the operator's chosen friendly name for the local station.
+fn node_name_or_local() -> String {
+    std::env::var("NODE_NAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "local".into())
+}
+
 // ─── Detection ───────────────────────────────────────────────────────────────
 
 /// A single detection row, fully serialisable (no DateTime).
@@ -67,17 +79,23 @@ impl WebDetection {
 
     /// Human-friendly label for the capture node.
     ///
-    /// Strips the `http://` prefix and trailing port to show just the
-    /// hostname or IP.  Returns `"local"` when no node was recorded.
+    /// Uses the `NODE_NAME` environment variable when the source is local
+    /// (localhost / 127.x), otherwise extracts hostname from the URL.
+    /// Returns `"local"` when no node was recorded and no name is set.
     pub fn source_label(&self) -> String {
         if self.source_node.is_empty() {
-            return "local".to_string();
+            return node_name_or_local();
         }
-        self.source_node
+        let stripped = self.source_node
             .trim_start_matches("http://")
             .trim_start_matches("https://")
-            .trim_end_matches('/')
-            .to_string()
+            .trim_end_matches('/');
+        let host = stripped.split(':').next().unwrap_or(stripped);
+        if host == "localhost" || host.starts_with("127.") {
+            return node_name_or_local();
+        }
+        // Remote node — show hostname portion (strip port)
+        host.trim_end_matches('.').to_string()
     }
 
     /// Display label for the model that produced this detection.

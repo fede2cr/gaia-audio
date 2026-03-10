@@ -14,20 +14,30 @@ use crate::model::{LivePrediction, LiveStatus};
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Extract a short node label from a capture URL.
-/// "http://192.168.1.50:8090" → "192.168.1.50"
-/// "http://gaia-cap-01.local:8090" → "gaia-cap-01"
+///
+/// Uses `NODE_NAME` env var for local sources, otherwise strips the URL
+/// to just the hostname.
 fn node_label(url: &str) -> String {
     if url.is_empty() {
-        return "local".into();
+        return node_name_or_local();
     }
-    url.strip_prefix("http://")
+    let stripped = url
+        .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url)
-        .split(':')
-        .next()
-        .unwrap_or(url)
-        .trim_end_matches('.')
-        .to_string()
+        .unwrap_or(url);
+    let host = stripped.split(':').next().unwrap_or(stripped).trim_end_matches('.');
+    if host == "localhost" || host.starts_with("127.") {
+        return node_name_or_local();
+    }
+    host.to_string()
+}
+
+/// Return the `NODE_NAME` env var if set, otherwise `"local"`.
+fn node_name_or_local() -> String {
+    std::env::var("NODE_NAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "local".into())
 }
 
 /// Format an ISO-8601 timestamp with a UTC offset into
