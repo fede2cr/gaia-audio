@@ -1,6 +1,7 @@
 //! Gaia Processing Server – loads models, polls the capture server,
 //! runs TFLite inference, writes detections to SQLite.
 
+mod accel;
 mod analysis;
 mod client;
 mod compress;
@@ -62,6 +63,16 @@ fn main() -> Result<()> {
         "Gaia Processing Server starting (capture_url={})",
         config.capture_server_url
     );
+
+    // ── GPU acceleration check ───────────────────────────────────────
+    if accel::is_rocm_requested() {
+        #[cfg(feature = "rocm")]
+        info!("🚀 ROCm acceleration ENABLED (GAIA_ACCEL=rocm) — will use MIGraphX EP");
+        #[cfg(not(feature = "rocm"))]
+        accel::warn_if_requested();
+    } else {
+        info!("GPU acceleration not requested — using CPU inference (tract-onnx)");
+    }
 
     // ── initialize database ──────────────────────────────────────────
     db::initialize(&config.db_path)?;

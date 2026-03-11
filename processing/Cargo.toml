@@ -39,3 +39,15 @@ reqwest.workspace = true
 # Archive & checksum (Zenodo model download)
 zip.workspace = true
 md5.workspace = true
+
+# GPU-accelerated inference via ONNX Runtime (MIGraphX EP for ROCm).
+# Enabled at build time with `--features rocm`.  When disabled,
+# inference uses the default tract-onnx CPU backend.
+[dependencies.ort]
+version = "2.0.0-rc.12"
+optional = true
+features = ["load-dynamic"]
+
+[features]
+default = []
+rocm = ["ort"]

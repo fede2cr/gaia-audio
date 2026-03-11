@@ -42,6 +42,10 @@ pub struct LoadedModel {
     /// expects a mel-spectrogram input `[1, 96, 511, 2]` instead of raw
     /// audio `[1, N]`.  The mel computation is handled by [`crate::mel`].
     onnx_classifier: bool,
+    /// GPU-accelerated session (MIGraphX / ROCm).
+    /// When `Some`, `predict()` routes through ORT instead of tract.
+    #[cfg(feature = "rocm")]
+    accel_session: Option<crate::accel::AccelSession>,
 }
 
 /// Species-occurrence metadata model (filters by location/week).
@@ -232,6 +236,39 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     // Higher values → steeper sigmoid → higher reported confidences.
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
 
+    // ── GPU acceleration via ONNX Runtime (MIGraphX) ─────────────────
+    #[cfg(feature = "rocm")]
+    let accel_session = if crate::accel::is_rocm_requested() {
+        // Try to create an accelerated session for the ONNX file.
+        if let Some(onnx_path) = resolved.onnx_path() {
+            if onnx_path.exists() {
+                let cache_dir = onnx_path
+                    .parent()
+                    .unwrap_or(Path::new("/tmp"))
+                    .join("migraphx_cache");
+                match crate::accel::AccelSession::new(&onnx_path, &cache_dir, labels.len()) {
+                    Ok(sess) => {
+                        info!("🚀 MIGraphX accelerated session ready for {}", onnx_path.display());
+                        Some(sess)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create MIGraphX session for {} — falling back to CPU: {e:#}",
+                            onnx_path.display()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(LoadedModel {
         runner,
         meta_model,
@@ -239,6 +276,8 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         manifest: resolved.clone(),
         sensitivity,
         onnx_classifier,
+        #[cfg(feature = "rocm")]
+        accel_session,
     })
 }
 
@@ -298,12 +337,40 @@ impl LoadedModel {
     /// boundary), the mel preprocessing is computed in Rust via
     /// [`crate::mel::birdnet_mel_spectrogram`] before feeding the classifier.
     pub fn predict(
-        &self,
+        &mut self,
         chunk: &[f32],
         lat: f64,
         lon: f64,
         week: u32,
     ) -> Result<Vec<Prediction>> {
+        // ── GPU-accelerated path (MIGraphX / ORT) ────────────────────
+        #[cfg(feature = "rocm")]
+        if let Some(accel) = &mut self.accel_session {
+            let logits = if self.onnx_classifier {
+                let mel = crate::mel::birdnet_mel_spectrogram(chunk);
+                accel.predict(mel, vec![1, 96, 511, 2])?
+            } else {
+                let n = chunk.len();
+                accel.predict(chunk.to_vec(), vec![1, n])?
+            };
+
+            let scores = if self.manifest.manifest.model.apply_softmax {
+                softmax(&logits)
+            } else {
+                self.scale_logits(&logits)
+            };
+
+            let mut predictions: Vec<Prediction> = self
+                .labels
+                .iter()
+                .zip(scores.iter())
+                .map(|(label, &score)| (label.clone(), score as f64))
+                .collect();
+            predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            return Ok(predictions);
+        }
+
+        // ── CPU path (tract-onnx / tract-tflite) ────────────────────
         let result = if self.onnx_classifier {
             // ── ONNX classifier: audio → Rust mel → CNN ──────────
             let mel = crate::mel::birdnet_mel_spectrogram(chunk);
