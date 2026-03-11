@@ -145,10 +145,14 @@ fn main() -> Result<()> {
     }
 
     if models.is_empty() {
-        tracing::warn!(
-            "No models loaded. The processing server will run but cannot \
-             analyse audio until model files (tflite/onnx) are present."
+        tracing::error!(
+            "No models loaded — the processing server cannot analyse audio \
+             without at least one working model. Exiting.\n\
+             Check that model files (tflite/onnx) are present in {model_dir} \
+             and compatible with the current runtime.",
+            model_dir = config.model_dir.display(),
         );
+        std::process::exit(1);
     } else {
         let names: Vec<&str> = models.iter().map(|m| m.manifest.manifest.model.name.as_str()).collect();
         info!(
