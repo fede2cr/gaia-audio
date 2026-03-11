@@ -141,15 +141,20 @@ def freeze_input_shapes(model: onnx.ModelProto) -> int:
             continue
         target_shapes[inp.name] = [BATCH_SIZE, NUM_SAMPLES]
 
+    # Collect symbolic variable names → concrete values so we can evaluate
+    # leftover expressions like ``((samples//512)) + 1`` after shape inference.
+    sym_variables: dict[str, int] = {}
+
     for inp in graph.input:
         if inp.name not in target_shapes:
             continue
         shape = target_shapes[inp.name]
         dims = inp.type.tensor_type.shape.dim
         old_dims = []
-        for d in dims:
+        for i, d in enumerate(dims):
             if d.dim_param:
                 old_dims.append(d.dim_param)
+                sym_variables[d.dim_param] = shape[i]
             else:
                 old_dims.append(str(d.dim_value))
 
@@ -162,6 +167,9 @@ def freeze_input_shapes(model: onnx.ModelProto) -> int:
 
         print(f"  Froze input '{inp.name}': [{', '.join(old_dims)}] → {shape}")
         changed += len(shape)
+
+    if sym_variables:
+        print(f"  Symbolic variable map: {sym_variables}")
 
     if changed == 0:
         print("  WARNING: no input dimensions were frozen")
@@ -178,23 +186,84 @@ def freeze_input_shapes(model: onnx.ModelProto) -> int:
         print(f"  WARNING: shape inference failed ({e}), dimensions may still be symbolic")
 
     # Even after shape inference, some intermediate value_info entries may
-    # retain symbolic dim_param values.  Clear them from all value_info and
-    # output entries where we now have a concrete dim_value != 0.
-    cleared = _clear_residual_symbolic_dims(model)
+    # retain symbolic dim_param values.  Clear them — either by evaluating
+    # the expression against our variable map, or by stripping the symbolic
+    # string entirely so tract-onnx doesn't choke on ``//``.
+    cleared = _clear_residual_symbolic_dims(model, sym_variables)
     if cleared:
         print(f"  Cleared {cleared} residual symbolic dimension(s)")
 
     return changed
 
 
-def _clear_residual_symbolic_dims(model: onnx.ModelProto) -> int:
-    """Remove leftover dim_param strings once dim_value is set."""
+def _eval_symbolic_dim(expr: str, variables: dict[str, int]) -> int | None:
+    """Try to evaluate a symbolic dimension expression to a concrete integer.
+
+    Handles Python-style ``//`` (floor division) and standard arithmetic.
+    Returns ``None`` if evaluation fails.
+
+    >>> _eval_symbolic_dim("((samples//512)) + 1", {"samples": 96000})
+    188
+    """
+    import re
+
+    # Replace known variables with their concrete values.
+    resolved = expr
+    for var, val in variables.items():
+        resolved = re.sub(rf'\b{re.escape(var)}\b', str(val), resolved)
+
+    # Only allow digits, arithmetic operators, parentheses, and whitespace
+    # to prevent arbitrary code execution.
+    if re.search(r'[^0-9+\-*/() \t]', resolved):
+        return None
+
+    try:
+        result = eval(resolved)  # noqa: S307 — safe: only digit/op chars
+        if isinstance(result, (int, float)) and float(result).is_integer():
+            return int(result)
+    except Exception:
+        pass
+    return None
+
+
+def _clear_residual_symbolic_dims(
+    model: onnx.ModelProto,
+    variables: dict[str, int] | None = None,
+) -> int:
+    """Remove leftover dim_param strings once dim_value is set.
+
+    When *variables* is provided, also attempts to **evaluate** symbolic
+    expressions (e.g. ``((samples//512)) + 1``) and replace them with
+    their concrete value.  This handles the case where
+    ``onnx.shape_inference`` could not propagate a concrete dim_value
+    through certain operations.
+    """
+    if variables is None:
+        variables = {}
+
     count = 0
     for vi in list(model.graph.value_info) + list(model.graph.output):
         if not vi.type.HasField("tensor_type"):
             continue
         for d in vi.type.tensor_type.shape.dim:
-            if d.dim_param and d.dim_value > 0:
+            if not d.dim_param:
+                continue
+            # Case 1: shape inference already set a concrete value.
+            if d.dim_value > 0:
+                d.ClearField("dim_param")
+                count += 1
+                continue
+            # Case 2: try to evaluate the symbolic expression.
+            concrete = _eval_symbolic_dim(d.dim_param, variables)
+            if concrete is not None:
+                print(f"    Evaluated '{d.dim_param}' → {concrete}")
+                d.dim_value = concrete
+                d.ClearField("dim_param")
+                count += 1
+            else:
+                # Case 3: cannot evaluate — clear anyway so tract does
+                # not choke.  The dimension becomes fully dynamic (0).
+                print(f"    WARNING: clearing un-evaluable dim_param '{d.dim_param}'")
                 d.ClearField("dim_param")
                 count += 1
     return count
