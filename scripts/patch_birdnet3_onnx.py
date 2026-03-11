@@ -7,16 +7,21 @@ tract-onnx does not support:
    ``coordinate_transformation_mode = "pytorch_half_pixel"``.
  * Symbolic dimension expressions that use Python-style integer
    division (``//``), e.g. ``((samples//512)) + 1``.
+ * One-sided DFT (``onesided=1``): tract's DFT shape analysis
+   enforces ``inputs[0].shape[2] == outputs[0].shape[2]`` which
+   fails when output is ``N/2+1`` (1025 vs 2048).
 
 This script:
 
  1. Downloads the original ONNX model from Zenodo record 18247420.
  2. Replaces ``pytorch_half_pixel`` with ``half_pixel`` in every
     ``Resize`` node.
- 3. Freezes the model input to the concrete shape ``[1, 96000]``
+ 3. Rewrites one-sided DFT nodes as full DFT + Slice so that
+    tract's shape check passes.
+ 4. Freezes the model input to the concrete shape ``[1, 96000]``
     (batch=1, 3 s × 32 kHz) and runs ONNX shape inference so that
     **all** symbolic dimensions are replaced by concrete integers.
- 4. Saves the patched model to the output path.
+ 5. Saves the patched model to the output path.
 
 Usage::
 
@@ -101,6 +106,127 @@ def patch_resize_nodes(model: onnx.ModelProto) -> int:
                     count += 1
                     print(f"  Patched node {node.name}: {OLD_MODE} → {NEW_MODE}")
     return count
+
+
+def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
+    """Replace one-sided DFT nodes with full DFT + Slice.
+
+    tract-onnx's DFT analysis enforces ``inputs[0].shape[2] ==
+    outputs[0].shape[2]`` without accounting for the ``onesided``
+    attribute.  When ``onesided=1``, the output length along the
+    signal axis is ``floor(N/2)+1`` (e.g. 1025 for N=2048), which
+    violates that rule.
+
+    Fix: set ``onesided=0`` (full DFT, output length == input length)
+    and insert a ``Slice`` node after to truncate the frequency axis
+    to ``floor(N/2)+1`` bins, matching what downstream nodes expect.
+
+    This must run **before** ``freeze_input_shapes`` so that shape
+    inference can propagate the correct concrete dimensions.
+
+    Returns the number of DFT nodes patched.
+    """
+    import numpy as np
+
+    graph = model.graph
+    nodes_to_add: list[onnx.NodeProto] = []
+    inits_to_add: list[onnx.TensorProto] = []
+    fixed = 0
+
+    for node in list(graph.node):
+        if node.op_type not in ("DFT", "STFT"):
+            continue
+
+        # Check if onesided=1
+        onesided_attr = None
+        for attr in node.attribute:
+            if attr.name == "onesided":
+                onesided_attr = attr
+                break
+
+        if onesided_attr is None or onesided_attr.i != 1:
+            continue
+
+        # Determine the signal length from the dft_length input
+        # (input index 1 for DFT, index 2 for STFT) or from
+        # value_info / initializers.
+        dft_length = None
+
+        # For DFT: input[1] is dft_length (optional)
+        # For STFT: input[2] is frame_length (the per-frame DFT size)
+        dft_len_idx = 1 if node.op_type == "DFT" else 2
+        if len(node.input) > dft_len_idx and node.input[dft_len_idx]:
+            dft_len_name = node.input[dft_len_idx]
+            # Check initializers
+            for init in graph.initializer:
+                if init.name == dft_len_name:
+                    arr = numpy_helper.to_array(init)
+                    dft_length = int(arr.flat[0])
+                    break
+
+        if dft_length is None:
+            print(
+                f"  WARNING: cannot determine DFT length for {node.name} "
+                f"— skipping onesided patch"
+            )
+            continue
+
+        onesided_bins = dft_length // 2 + 1
+        print(
+            f"  Patching {node.op_type} node '{node.name}': "
+            f"onesided=1 → onesided=0 + Slice(axis=2, end={onesided_bins})"
+        )
+
+        # 1. Set onesided = 0
+        onesided_attr.i = 0
+
+        # 2. Rename the original output and wire a Slice after it.
+        orig_output = node.output[0]
+        full_output = f"{orig_output}_full_dft"
+        node.output[0] = full_output
+
+        # Slice parameters: axis=2 (frequency axis), start=0, end=onesided_bins
+        # Using the ONNX Slice op (opset 10+): inputs = [data, starts, ends, axes]
+        uid = f"_dft_slice_{node.name}"
+
+        starts_name = f"{uid}_starts"
+        ends_name = f"{uid}_ends"
+        axes_name = f"{uid}_axes"
+
+        inits_to_add.append(
+            numpy_helper.from_array(
+                np.array([0], dtype=np.int64), name=starts_name
+            )
+        )
+        inits_to_add.append(
+            numpy_helper.from_array(
+                np.array([onesided_bins], dtype=np.int64), name=ends_name
+            )
+        )
+        inits_to_add.append(
+            numpy_helper.from_array(
+                np.array([2], dtype=np.int64), name=axes_name
+            )
+        )
+
+        # For STFT output shape is [batch, frames, freq_bins, 2]
+        # The frequency axis is axis 2 in both DFT and STFT outputs.
+        slice_node = helper.make_node(
+            "Slice",
+            inputs=[full_output, starts_name, ends_name, axes_name],
+            outputs=[orig_output],
+            name=f"slice_onesided{uid}",
+        )
+        nodes_to_add.append(slice_node)
+        fixed += 1
+
+    # Add new nodes and initializers to the graph
+    for n in nodes_to_add:
+        graph.node.append(n)
+    for init in inits_to_add:
+        graph.initializer.append(init)
+
+    return fixed
 
 
 # ── Input shape: 1 batch × (sample_rate × chunk_duration) samples ─────
@@ -429,6 +555,10 @@ def main() -> None:
         print("WARNING: No Resize nodes with pytorch_half_pixel found — continuing anyway")
     else:
         print(f"Patched {patched} Resize node(s)")
+
+    dft_fixed = patch_onesided_dft_nodes(model)
+    if dft_fixed:
+        print(f"Patched {dft_fixed} one-sided DFT node(s)")
 
     frozen = freeze_input_shapes(model)
     print(f"Froze {frozen} input dimension(s)")
