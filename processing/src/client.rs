@@ -54,6 +54,11 @@ pub fn poll_and_dispatch(
     // Key = "base_url:filename" to avoid collisions across capture nodes.
     let mut dispatched: HashSet<String> = HashSet::new();
 
+    // Track how many NEW items we actually dispatched per iteration so we
+    // can distinguish "new work to do" from "recordings on disk but
+    // already dispatched".
+    let mut dispatched_this_round: usize;
+
     // Build initial list of capture URLs
     let mut capture_urls = resolve_capture_urls(discovery, config);
     info!(
@@ -105,7 +110,7 @@ pub fn poll_and_dispatch(
         }
 
         // ── poll each capture server ─────────────────────────────────
-        let mut found_any = false;
+        dispatched_this_round = 0;
 
         for base_url in &capture_urls {
             if shutdown.load(Ordering::Relaxed) {
@@ -124,8 +129,7 @@ pub fn poll_and_dispatch(
                 continue;
             }
 
-            found_any = true;
-            info!(
+            debug!(
                 "[{}] Found {} recording(s) to process",
                 base_url,
                 recordings.len()
@@ -169,7 +173,14 @@ pub fn poll_and_dispatch(
                 }
 
                 dispatched.insert(key);
+                dispatched_this_round += 1;
             }
+        }
+
+        if dispatched_this_round > 0 {
+            info!(
+                "Dispatched {dispatched_this_round} new recording(s) for processing"
+            );
         }
 
         // Prevent unbounded growth of the dispatched set
@@ -179,10 +190,13 @@ pub fn poll_and_dispatch(
             crate::db::prune_stale_instances(&config.db_path, 10);
         }
 
-        // Only sleep when idle — if we dispatched files there may be
-        // more waiting, so loop immediately.
-        if !found_any {
-            debug!("No recordings on any capture node – sleeping {poll_interval:?}");
+        // Only skip the sleep when we actually dispatched new work
+        // this round — there may be more files arriving soon.  When
+        // recordings exist on the capture node but have already been
+        // dispatched, sleeping prevents a busy-loop that would spam
+        // the logs and waste CPU.
+        if dispatched_this_round == 0 {
+            debug!("No new recordings to dispatch – sleeping {poll_interval:?}");
             std::thread::sleep(poll_interval);
         }
     }

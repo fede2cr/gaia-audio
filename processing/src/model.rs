@@ -33,7 +33,13 @@ const MIN_TFLITE_SIZE: u64 = 1024;
 
 /// A loaded model ready for inference, built from a manifest.
 pub struct LoadedModel {
-    runner: TypedRunnableModel<TypedModel>,
+    /// tract-onnx or tract-tflite runner.  `None` when the model was
+    /// loaded through the ORT CPU fallback (tract could not handle it).
+    runner: Option<TypedRunnableModel<TypedModel>>,
+    /// ONNX Runtime CPU fallback – used when tract cannot load the model
+    /// (e.g. unsupported DFT/STFT operators in BirdNET V3).  Requires
+    /// `libonnxruntime.so` to be available at runtime.
+    ort_cpu_session: Option<crate::accel::OrtCpuSession>,
     meta_model: Option<MetaDataModel>,
     labels: Vec<String>,
     pub manifest: ResolvedManifest,
@@ -173,7 +179,7 @@ fn validate_tflite_file(path: &Path) -> Result<()> {
 /// otherwise falls back to TFLite.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
     // ── choose format ────────────────────────────────────────────────
-    let (runner, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
+    let (runner, ort_cpu_session, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
             let is_classifier = resolved.manifest.model.onnx_is_classifier;
             info!(
@@ -181,11 +187,14 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                 onnx_path.display(),
                 is_classifier
             );
-            match load_onnx_runner(&onnx_path) {
-                Ok(r) => (r, is_classifier),
+
+            // 1. Try tract-onnx.
+            let tract_result = load_onnx_runner(&onnx_path);
+
+            // 2. If tract failed, try the baked (patched) copy.
+            let tract_result = match tract_result {
+                ok @ Ok(_) => ok,
                 Err(e) => {
-                    // If a baked (patched) version exists, try that before
-                    // giving up — the file on the volume may be stale/unpatched.
                     let fallback = onnx_path.file_name().map(|f| {
                         Path::new(crate::download::BAKED_MODELS_DIR).join(f)
                     });
@@ -194,16 +203,47 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                             "ONNX load failed ({e:#}); retrying with baked model at {}",
                             baked.display()
                         );
-                        // Replace the stale copy so future starts succeed.
                         if let Err(copy_err) = std::fs::copy(&baked, &onnx_path) {
                             tracing::warn!(
                                 "Could not overwrite {} with baked model: {copy_err}",
                                 onnx_path.display()
                             );
                         }
-                        (load_onnx_runner(&onnx_path)?, is_classifier)
+                        load_onnx_runner(&onnx_path)
                     } else {
-                        return Err(e);
+                        Err(e)
+                    }
+                }
+            };
+
+            // 3. If tract still failed, try ONNX Runtime CPU fallback.
+            //    This handles models with operators tract cannot optimise
+            //    (e.g. DFT/STFT in BirdNET V3).
+            match tract_result {
+                Ok(r) => (Some(r), None, is_classifier),
+                Err(tract_err) => {
+                    tracing::warn!(
+                        "tract-onnx failed for {} ({tract_err:#}); \
+                         trying ONNX Runtime CPU fallback",
+                        onnx_path.display()
+                    );
+                    match crate::accel::OrtCpuSession::new(&onnx_path) {
+                        Ok(sess) => {
+                            info!(
+                                "ONNX Runtime CPU fallback active for {}",
+                                onnx_path.display()
+                            );
+                            (None, Some(sess), is_classifier)
+                        }
+                        Err(ort_err) => {
+                            tracing::error!(
+                                "ONNX Runtime CPU fallback also failed: {ort_err:#}"
+                            );
+                            return Err(tract_err.context(
+                                "tract-onnx failed and ONNX Runtime CPU fallback \
+                                 is unavailable (is libonnxruntime.so installed?)"
+                            ));
+                        }
                     }
                 }
             }
@@ -212,10 +252,10 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                 "ONNX file configured but missing ({}), falling back to TFLite",
                 onnx_path.display()
             );
-            (load_tflite_runner(&resolved.tflite_path())?, false)
+            (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
         }
     } else {
-        (load_tflite_runner(&resolved.tflite_path())?, false)
+        (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
     };
 
     let labels = load_labels(&resolved.labels_path())?;
@@ -271,6 +311,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
 
     Ok(LoadedModel {
         runner,
+        ort_cpu_session,
         meta_model,
         labels,
         manifest: resolved.clone(),
@@ -370,7 +411,36 @@ impl LoadedModel {
             return Ok(predictions);
         }
 
+        // ── ORT CPU fallback (for models tract cannot handle) ─────────
+        if let Some(ort_cpu) = &mut self.ort_cpu_session {
+            let logits = if self.onnx_classifier {
+                let mel = crate::mel::birdnet_mel_spectrogram(chunk);
+                ort_cpu.predict(mel, vec![1, 96, 511, 2])?
+            } else {
+                let n = chunk.len();
+                ort_cpu.predict(chunk.to_vec(), vec![1, n])?
+            };
+
+            let scores = if self.manifest.manifest.model.apply_softmax {
+                softmax(&logits)
+            } else {
+                self.scale_logits(&logits)
+            };
+
+            let mut predictions: Vec<Prediction> = self
+                .labels
+                .iter()
+                .zip(scores.iter())
+                .map(|(label, &score)| (label.clone(), score as f64))
+                .collect();
+            predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            return Ok(predictions);
+        }
+
         // ── CPU path (tract-onnx / tract-tflite) ────────────────────
+        let runner = self.runner.as_ref()
+            .context("No inference backend available (tract did not load and ORT CPU is absent)")?;
+
         let result = if self.onnx_classifier {
             // ── ONNX classifier: audio → Rust mel → CNN ──────────
             let mel = crate::mel::birdnet_mel_spectrogram(chunk);
@@ -378,7 +448,7 @@ impl LoadedModel {
                 tract_ndarray::Array4::from_shape_vec((1, 96, 511, 2), mel)
                     .context("Cannot reshape mel spectrogram")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into()])
                 .context("ONNX classifier inference failed")?
         } else if self.v1_metadata() {
@@ -393,7 +463,7 @@ impl LoadedModel {
                 tract_ndarray::Array2::from_shape_vec((1, 6), mdata.to_vec())
                     .context("Cannot reshape metadata")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into(), mdata_tensor.into()])
                 .context("V1 inference failed")?
         } else {
@@ -403,7 +473,7 @@ impl LoadedModel {
                 tract_ndarray::Array2::from_shape_vec((1, n), chunk.to_vec())
                     .context("Cannot reshape audio chunk")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into()])
                 .context("Inference failed")?
         };

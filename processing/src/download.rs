@@ -168,8 +168,12 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
     if let Some(filename) = onnx_path.file_name() {
         let baked = Path::new(BAKED_MODELS_DIR).join(filename);
         if baked.exists() {
+            // Always overwrite: the baked model contains build-time patches
+            // (e.g. DFT onesided fix, Resize node rewrite) that a previously
+            // downloaded or copied file on the volume may lack.  A simple
+            // size comparison is insufficient because patched and unpatched
+            // models can have the same byte length.
             let needs_copy = if onnx_path.exists() {
-                // Overwrite if sizes differ (stale / unpatched copy).
                 let baked_len = std::fs::metadata(&baked).map(|m| m.len()).unwrap_or(0);
                 let local_len = std::fs::metadata(&onnx_path).map(|m| m.len()).unwrap_or(0);
                 if baked_len != local_len {
@@ -177,10 +181,8 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
                         "Baked ONNX model size ({baked_len}) differs from local \
                          copy ({local_len}) — replacing with baked version"
                     );
-                    true
-                } else {
-                    false
                 }
+                true
             } else {
                 true
             };

@@ -125,6 +125,27 @@ COPY scripts/patch_birdnet3_onnx.py .
 RUN python3 patch_birdnet3_onnx.py -o /convert/birdnet3.onnx && \
     ls -lh /convert/birdnet3.onnx
 
+# ── ONNX Runtime shared library (CPU inference fallback) ──────────
+# When tract-onnx cannot handle a model (e.g. DFT/STFT ops in BirdNET
+# V3), the processing server falls back to ONNX Runtime via the `ort`
+# crate with the CPU execution provider.  This stage downloads the
+# official release tarball so no Python is needed at runtime.
+FROM debian:trixie-slim AS ort-download
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG ORT_VERSION=1.21.0
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+      x86_64)  ORT_ARCH=x64     ;; \
+      aarch64) ORT_ARCH=aarch64 ;; \
+      *)       echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    curl -sSL \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" | \
+    tar xz -C /tmp && \
+    cp "/tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /usr/lib/ && \
+    ln -sf "libonnxruntime.so.${ORT_VERSION}" /usr/lib/libonnxruntime.so
+
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
 # No Python, no TensorFlow — all inference runs in native Rust.
@@ -137,6 +158,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+
+# ONNX Runtime shared library for CPU fallback inference.
+COPY --from=ort-download /usr/lib/libonnxruntime.so* /usr/lib/
+RUN ldconfig
 
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory

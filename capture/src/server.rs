@@ -13,11 +13,13 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get};
 use axum::Router;
+use tokio::io::BufReader;
 use tokio::net::TcpListener;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
 
@@ -163,25 +165,37 @@ async fn download_recording(
     }
 
     let file_path = state.stream_dir.join(&name);
-    if !file_path.exists() {
-        return Err(StatusCode::NOT_FOUND);
-    }
 
-    let bytes = tokio::fs::read(&file_path)
+    let meta = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let file_size = meta.len();
+
+    let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     debug!(
         file = %name,
-        size_bytes = bytes.len(),
-        size_mb = format_args!("{:.2}", bytes.len() as f64 / 1_048_576.0),
-        "Serving recording to processing node"
+        size_bytes = file_size,
+        size_mb = format_args!("{:.2}", file_size as f64 / 1_048_576.0),
+        "Streaming recording to processing node"
     );
 
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "audio/wav")],
-        Body::from(bytes),
-    ))
+    // Stream the file in 64 KB chunks instead of loading it entirely
+    // into memory.  This keeps resident memory bounded regardless of
+    // file size.
+    let stream = ReaderStream::with_capacity(BufReader::with_capacity(65_536, file), 65_536);
+    let body = Body::from_stream(stream);
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "audio/wav".parse().unwrap());
+    headers.insert(
+        header::CONTENT_LENGTH,
+        file_size.to_string().parse().unwrap(),
+    );
+
+    Ok((headers, body))
 }
 
 async fn delete_recording(
