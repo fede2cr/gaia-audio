@@ -72,10 +72,7 @@ fn main() -> Result<()> {
         std::env::var("ROCM_VISIBLE_DEVICES").unwrap_or_default()
     );
     if accel::is_rocm_requested() {
-        #[cfg(feature = "rocm")]
-        info!("🚀 ROCm acceleration ENABLED (GAIA_ACCEL=rocm) — will use MIGraphX EP");
-        #[cfg(not(feature = "rocm"))]
-        accel::warn_if_requested();
+        info!("ROCm acceleration requested (GAIA_ACCEL=rocm) — ORT will try MIGraphX → ROCm → CPU");
     } else {
         info!(
             "GPU acceleration not requested (GAIA_ACCEL={:?}) — using CPU inference (tract-onnx)",

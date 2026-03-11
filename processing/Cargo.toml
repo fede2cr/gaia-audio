@@ -40,19 +40,13 @@ reqwest.workspace = true
 zip.workspace = true
 md5.workspace = true
 
-# GPU-accelerated inference via ONNX Runtime (MIGraphX EP for ROCm).
-# Enabled at build time with `--features rocm`.  When disabled,
-# inference uses the default tract-onnx CPU backend.
+# Inference via ONNX Runtime — used as a fallback when tract-onnx
+# cannot load a model (e.g. DFT/STFT ops in BirdNET V3), and as the
+# GPU-accelerated path when ROCm hardware is detected at runtime.
 #
-# NOTE: ort is always compiled (with load-dynamic) so it can serve as a
-# CPU fallback for models that tract cannot optimise (e.g. DFT/STFT
-# operators in BirdNET V3).  The `rocm` feature adds MIGraphX EP
-# support.  At runtime, if libonnxruntime.so is not available the ort
-# fallback is simply skipped.
+# `load-dynamic` loads libonnxruntime.so at runtime — no native libs
+# needed at build time.  `rocm` just exposes the MIGraphX/ROCm EP
+# types; the actual GPU libraries only need to be present at runtime.
 [dependencies.ort]
 version = "2.0.0-rc.12"
-features = ["load-dynamic"]
-
-[features]
-default = []
-rocm = ["ort/rocm"]
+features = ["load-dynamic", "rocm"]

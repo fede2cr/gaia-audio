@@ -34,12 +34,13 @@ const MIN_TFLITE_SIZE: u64 = 1024;
 /// A loaded model ready for inference, built from a manifest.
 pub struct LoadedModel {
     /// tract-onnx or tract-tflite runner.  `None` when the model was
-    /// loaded through the ORT CPU fallback (tract could not handle it).
+    /// loaded through the ORT fallback (tract could not handle it).
     runner: Option<TypedRunnableModel<TypedModel>>,
-    /// ONNX Runtime CPU fallback – used when tract cannot load the model
-    /// (e.g. unsupported DFT/STFT operators in BirdNET V3).  Requires
-    /// `libonnxruntime.so` to be available at runtime.
-    ort_cpu_session: Option<crate::accel::OrtCpuSession>,
+    /// ONNX Runtime session – used when tract cannot load the model
+    /// (e.g. unsupported DFT/STFT operators in BirdNET V3), **or** when
+    /// `GAIA_ACCEL=rocm` is set for GPU-accelerated inference.
+    /// Requires `libonnxruntime.so` to be available at runtime.
+    ort_session: Option<crate::accel::OrtSession>,
     meta_model: Option<MetaDataModel>,
     labels: Vec<String>,
     pub manifest: ResolvedManifest,
@@ -48,10 +49,6 @@ pub struct LoadedModel {
     /// expects a mel-spectrogram input `[1, 96, 511, 2]` instead of raw
     /// audio `[1, N]`.  The mel computation is handled by [`crate::mel`].
     onnx_classifier: bool,
-    /// GPU-accelerated session (MIGraphX / ROCm).
-    /// When `Some`, `predict()` routes through ORT instead of tract.
-    #[cfg(feature = "rocm")]
-    accel_session: Option<crate::accel::AccelSession>,
 }
 
 /// Species-occurrence metadata model (filters by location/week).
@@ -179,7 +176,7 @@ fn validate_tflite_file(path: &Path) -> Result<()> {
 /// otherwise falls back to TFLite.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
     // ── choose format ────────────────────────────────────────────────
-    let (runner, ort_cpu_session, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
+    let (runner, ort_session, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
             let is_classifier = resolved.manifest.model.onnx_is_classifier;
             info!(
@@ -224,23 +221,27 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                 Err(tract_err) => {
                     tracing::warn!(
                         "tract-onnx failed for {} ({tract_err:#}); \
-                         trying ONNX Runtime CPU fallback",
+                         trying ONNX Runtime fallback",
                         onnx_path.display()
                     );
-                    match crate::accel::OrtCpuSession::new(&onnx_path) {
+                    let cache_dir = onnx_path
+                        .parent()
+                        .unwrap_or(Path::new("/tmp"))
+                        .join("ort_cache");
+                    match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
                         Ok(sess) => {
                             info!(
-                                "ONNX Runtime CPU fallback active for {}",
+                                "ONNX Runtime fallback active for {}",
                                 onnx_path.display()
                             );
                             (None, Some(sess), is_classifier)
                         }
                         Err(ort_err) => {
                             tracing::error!(
-                                "ONNX Runtime CPU fallback also failed: {ort_err:#}"
+                                "ONNX Runtime fallback also failed: {ort_err:#}"
                             );
                             return Err(tract_err.context(
-                                "tract-onnx failed and ONNX Runtime CPU fallback \
+                                "tract-onnx failed and ONNX Runtime fallback \
                                  is unavailable (is libonnxruntime.so installed?)"
                             ));
                         }
@@ -257,7 +258,6 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     } else {
         (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
     };
-
     let labels = load_labels(&resolved.labels_path())?;
 
     let meta_model = match load_meta_model(resolved, &labels, config.sf_thresh) {
@@ -277,23 +277,27 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
 
     // ── GPU acceleration via ONNX Runtime (MIGraphX) ─────────────────
-    #[cfg(feature = "rocm")]
-    let accel_session = if crate::accel::is_rocm_requested() {
-        // Try to create an accelerated session for the ONNX file.
+    // When ROCm is requested and the model was loaded by tract (i.e. no
+    // ORT fallback already in place), try to create an accelerated ORT
+    // session that will be preferred at inference time.
+    let ort_session = if ort_session.is_some() {
+        // Already using ORT (tract couldn't load the model).
+        ort_session
+    } else if crate::accel::is_rocm_requested() {
         if let Some(onnx_path) = resolved.onnx_path() {
             if onnx_path.exists() {
                 let cache_dir = onnx_path
                     .parent()
                     .unwrap_or(Path::new("/tmp"))
-                    .join("migraphx_cache");
-                match crate::accel::AccelSession::new(&onnx_path, &cache_dir, labels.len()) {
+                    .join("ort_cache");
+                match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
                     Ok(sess) => {
-                        info!("🚀 MIGraphX accelerated session ready for {}", onnx_path.display());
+                        info!("ORT accelerated session ready for {}", onnx_path.display());
                         Some(sess)
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to create MIGraphX session for {} — falling back to CPU: {e:#}",
+                            "Failed to create ORT session for {} — using tract CPU: {e:#}",
                             onnx_path.display()
                         );
                         None
@@ -311,14 +315,12 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
 
     Ok(LoadedModel {
         runner,
-        ort_cpu_session,
+        ort_session,
         meta_model,
         labels,
         manifest: resolved.clone(),
         sensitivity,
         onnx_classifier,
-        #[cfg(feature = "rocm")]
-        accel_session,
     })
 }
 
@@ -384,15 +386,14 @@ impl LoadedModel {
         lon: f64,
         week: u32,
     ) -> Result<Vec<Prediction>> {
-        // ── GPU-accelerated path (MIGraphX / ORT) ────────────────────
-        #[cfg(feature = "rocm")]
-        if let Some(accel) = &mut self.accel_session {
+        // ── ORT path (GPU-accelerated or CPU fallback) ───────────────
+        if let Some(ort) = &mut self.ort_session {
             let logits = if self.onnx_classifier {
                 let mel = crate::mel::birdnet_mel_spectrogram(chunk);
-                accel.predict(mel, vec![1, 96, 511, 2])?
+                ort.predict(mel, vec![1, 96, 511, 2])?
             } else {
                 let n = chunk.len();
-                accel.predict(chunk.to_vec(), vec![1, n])?
+                ort.predict(chunk.to_vec(), vec![1, n])?
             };
 
             let scores = if self.manifest.manifest.model.apply_softmax {
@@ -411,35 +412,9 @@ impl LoadedModel {
             return Ok(predictions);
         }
 
-        // ── ORT CPU fallback (for models tract cannot handle) ─────────
-        if let Some(ort_cpu) = &mut self.ort_cpu_session {
-            let logits = if self.onnx_classifier {
-                let mel = crate::mel::birdnet_mel_spectrogram(chunk);
-                ort_cpu.predict(mel, vec![1, 96, 511, 2])?
-            } else {
-                let n = chunk.len();
-                ort_cpu.predict(chunk.to_vec(), vec![1, n])?
-            };
-
-            let scores = if self.manifest.manifest.model.apply_softmax {
-                softmax(&logits)
-            } else {
-                self.scale_logits(&logits)
-            };
-
-            let mut predictions: Vec<Prediction> = self
-                .labels
-                .iter()
-                .zip(scores.iter())
-                .map(|(label, &score)| (label.clone(), score as f64))
-                .collect();
-            predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            return Ok(predictions);
-        }
-
-        // ── CPU path (tract-onnx / tract-tflite) ────────────────────
+        // ── tract path (tract-onnx / tract-tflite) ──────────────────
         let runner = self.runner.as_ref()
-            .context("No inference backend available (tract did not load and ORT CPU is absent)")?;
+            .context("No inference backend available (tract did not load and ORT is absent)")?;
 
         let result = if self.onnx_classifier {
             // ── ONNX classifier: audio → Rust mel → CNN ──────────
