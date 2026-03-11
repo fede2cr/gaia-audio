@@ -65,13 +65,22 @@ fn main() -> Result<()> {
     );
 
     // ── GPU acceleration check ───────────────────────────────────────
+    let accel_var = std::env::var("GAIA_ACCEL").unwrap_or_default();
+    info!(
+        "Acceleration env: GAIA_ACCEL={:?} ROCM_VISIBLE_DEVICES={:?}",
+        accel_var,
+        std::env::var("ROCM_VISIBLE_DEVICES").unwrap_or_default()
+    );
     if accel::is_rocm_requested() {
         #[cfg(feature = "rocm")]
         info!("🚀 ROCm acceleration ENABLED (GAIA_ACCEL=rocm) — will use MIGraphX EP");
         #[cfg(not(feature = "rocm"))]
         accel::warn_if_requested();
     } else {
-        info!("GPU acceleration not requested — using CPU inference (tract-onnx)");
+        info!(
+            "GPU acceleration not requested (GAIA_ACCEL={:?}) — using CPU inference (tract-onnx)",
+            accel_var
+        );
     }
 
     // ── initialize database ──────────────────────────────────────────
