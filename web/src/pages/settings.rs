@@ -1,6 +1,10 @@
 //! Settings page – adjust detection thresholds from the web UI.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, use_context, Effect, ElementChild, IntoView, Resource,
+    ServerFnError, Suspense,
+};
 
 use crate::model::DetectionSettings;
 
@@ -15,7 +19,7 @@ const DEFAULT_TZ_OFFSET: i32 = 0;
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
-#[server(GetSettings, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
@@ -39,7 +43,7 @@ pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
     })
 }
 
-#[server(SaveSettings, "/api")]
+#[server(prefix = "/api")]
 pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnError> {
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
@@ -72,23 +76,23 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
 /// Detection settings page.
 #[component]
 pub fn SettingsPage() -> impl IntoView {
-    let (saving, set_saving) = create_signal(false);
-    let (saved_msg, set_saved_msg) = create_signal::<Option<String>>(None);
-    let (error_msg, set_error_msg) = create_signal::<Option<String>>(None);
+    let (saving, set_saving) = signal(false);
+    let (saved_msg, set_saved_msg) = signal::<Option<String>>(None);
+    let (error_msg, set_error_msg) = signal::<Option<String>>(None);
 
     // Fetch current settings on mount.
-    let settings_resource = create_resource(|| (), |_| get_settings());
+    let settings_resource = Resource::new(|| (), |_| get_settings());
 
     // Local signals for each field – initialised from the resource.
-    let (sensitivity, set_sensitivity) = create_signal(DEFAULT_SENSITIVITY);
-    let (confidence, set_confidence) = create_signal(DEFAULT_CONFIDENCE);
-    let (sf_thresh, set_sf_thresh) = create_signal(DEFAULT_SF_THRESH);
-    let (overlap, set_overlap) = create_signal(DEFAULT_OVERLAP);
-    let (colormap, set_colormap) = create_signal(DEFAULT_COLORMAP.to_string());
-    let (tz_offset, set_tz_offset) = create_signal(DEFAULT_TZ_OFFSET);
+    let (sensitivity, set_sensitivity) = signal(DEFAULT_SENSITIVITY);
+    let (confidence, set_confidence) = signal(DEFAULT_CONFIDENCE);
+    let (sf_thresh, set_sf_thresh) = signal(DEFAULT_SF_THRESH);
+    let (overlap, set_overlap) = signal(DEFAULT_OVERLAP);
+    let (colormap, set_colormap) = signal(DEFAULT_COLORMAP.to_string());
+    let (tz_offset, set_tz_offset) = signal(DEFAULT_TZ_OFFSET);
 
     // Sync resource → local signals once loaded.
-    create_effect(move |_| {
+    Effect::new(move || {
         if let Some(Ok(s)) = settings_resource.get() {
             set_sensitivity.set(s.sensitivity);
             set_confidence.set(s.confidence);
@@ -113,7 +117,7 @@ pub fn SettingsPage() -> impl IntoView {
             tz_offset: tz_offset.get(),
         };
 
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             match save_settings(payload).await {
                 Ok(()) => set_saved_msg.set(Some("Settings saved. Changes take effect on the next analysis cycle.".into())),
                 Err(e) => set_error_msg.set(Some(format!("Failed to save: {e}"))),
@@ -130,7 +134,7 @@ pub fn SettingsPage() -> impl IntoView {
                 "Changes are stored in the shared database and picked up on the next analysis cycle."
             </p>
 
-            <Suspense fallback=move || view! { <p class="text-muted">"Loading settings…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-muted">"Loading settings…"</p> }>
                 <div class="settings-form">
 
                     // ── Sensitivity ──────────────────────────────

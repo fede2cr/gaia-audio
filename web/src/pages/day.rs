@@ -1,7 +1,11 @@
 //! Day detail page – all detections for a specific date, grouped by species.
 
-use leptos::*;
-use leptos_router::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    use_context, ElementChild, For, IntoView, Resource, ServerFnError,
+    Suspense,
+};
+use leptos_router::hooks::use_params_map;
 
 use crate::components::detection_card::DetectionCard;
 use crate::components::hourly_chart::SpeciesHourlyGrid;
@@ -9,7 +13,7 @@ use crate::model::{DayDetectionGroup, SpeciesHourlyCounts, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
-#[server(GetDayDetections, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_day_detections(
     date: String,
 ) -> Result<Vec<DayDetectionGroup>, ServerFnError> {
@@ -31,7 +35,7 @@ pub async fn get_day_detections(
 }
 
 /// Hourly species×hour grid for a specific date.
-#[server(GetDayHourly, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_day_hourly(
     date: String,
 ) -> Result<Vec<SpeciesHourlyCounts>, ServerFnError> {
@@ -49,11 +53,11 @@ pub async fn get_day_hourly(
 pub fn DayView() -> impl IntoView {
     let params = use_params_map();
     let date = move || {
-        params.with(|p| p.get("date").cloned().unwrap_or_default())
+        params.with(|p| p.get("date").unwrap_or_default())
     };
 
-    let data = create_resource(date, |d| async move { get_day_detections(d.clone()).await });
-    let hourly = create_resource(date, |d| async move { get_day_hourly(d).await });
+    let data = Resource::new(date, |d| async move { get_day_detections(d.clone()).await });
+    let hourly = Resource::new(date, |d| async move { get_day_hourly(d).await });
 
     view! {
         <div class="day-page">
@@ -61,19 +65,19 @@ pub fn DayView() -> impl IntoView {
             <a href="/calendar" class="back-link">"← Back to Calendar"</a>
 
             // ── Species × Hour heatmap ───────────────────────────────
-            <Suspense fallback=move || view! { <p class="loading">"Loading chart…"</p> }>
+            <Suspense fallback=|| view! { <p class="loading">"Loading chart\u{2026}"</p> }>
                 {move || hourly.get().map(|res| match res {
-                    Ok(grid) if !grid.is_empty() => view! {
+                    Ok(grid) if !grid.is_empty() => Some(view! {
                         <section class="day-hourly-section">
                             <h2>"Activity by Hour"</h2>
                             <SpeciesHourlyGrid data=grid />
                         </section>
-                    }.into_view(),
-                    _ => view! {}.into_view(),
+                    }.into_any()),
+                    _ => None,
                 })}
             </Suspense>
 
-            <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
                 {move || data.get().map(|res| match res {
                     Ok(groups) => view! {
                         <div class="day-groups">
@@ -88,10 +92,10 @@ pub fn DayView() -> impl IntoView {
                                 }
                             />
                         </div>
-                    }.into_view(),
+                    }.into_any(),
                     Err(e) => view! {
                         <p class="error">"Error: " {e.to_string()}</p>
-                    }.into_view(),
+                    }.into_any(),
                 })}
             </Suspense>
         </div>
@@ -117,10 +121,10 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                 <img src={img_src} alt={group.common_name.clone()} class="day-group-img" loading="lazy" />
                 <div class="day-group-info">
                     <a href={species_href} class="day-group-name">
-                        <strong>{&group.common_name}</strong>
-                        " ("{&group.scientific_name}")"
+                        <strong>{group.common_name.clone()}</strong>
+                        " ("{group.scientific_name.clone()}")"
                     </a>
-                    <span class="domain-badge">{&group.domain}</span>
+                    <span class="domain-badge">{group.domain.clone()}</span>
                     <span class="confidence">"Best: " {conf}</span>
                     <span class="detection-count">{group.detections.len()}" detections"</span>
                 </div>
@@ -135,5 +139,5 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                 />
             </div>
         </div>
-    }
+    }.into_any()
 }

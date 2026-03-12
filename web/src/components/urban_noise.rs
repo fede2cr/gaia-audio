@@ -1,13 +1,16 @@
 //! Urban noise panel – shows aggregated counts of non-bird detections
 //! (Engine, Dog, etc.) without storing or exposing human audio.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    use_context, ElementChild, IntoView, Resource, ServerFnError, Suspense,
+};
 
 use crate::model::UrbanNoiseSummary;
 
 // ─── Server function ─────────────────────────────────────────────────────────
 
-#[server(GetUrbanNoise, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_urban_noise() -> Result<Vec<UrbanNoiseSummary>, ServerFnError> {
     use crate::server::db;
     let state = use_context::<crate::app::AppState>()
@@ -21,10 +24,10 @@ pub async fn get_urban_noise() -> Result<Vec<UrbanNoiseSummary>, ServerFnError> 
 /// Compact panel showing urban-noise detection tallies.
 #[component]
 pub fn UrbanNoise() -> impl IntoView {
-    let data = create_resource(|| (), |_| async { get_urban_noise().await });
+    let data = Resource::new(|| (), |_| async { get_urban_noise().await });
 
     view! {
-        <Suspense fallback=move || ()>
+        <Suspense fallback=|| ()>
             {move || data.get().map(|res| match res {
                 Ok(items) if !items.is_empty() => {
                     let total_today: u32 = items.iter().map(|i| i.today_count).sum();
@@ -57,13 +60,13 @@ pub fn UrbanNoise() -> impl IntoView {
                                     view! {
                                         <li class="noise-item">
                                             <span class="noise-icon">{icon}</span>
-                                            <span class="noise-category">{&item.category}</span>
+                                            <span class="noise-category">{item.category.clone()}</span>
                                             <span class="noise-count today">{item.today_count}</span>
                                             <span class="noise-count week">{item.week_count}</span>
                                             <span class="noise-count total">{item.total_count}</span>
                                         </li>
                                     }
-                                }).collect_view()}
+                                }).collect::<Vec<_>>()}
                             </ul>
                             <div class="noise-legend">
                                 <span>"today"</span>
@@ -71,9 +74,9 @@ pub fn UrbanNoise() -> impl IntoView {
                                 <span>"all"</span>
                             </div>
                         </div>
-                    }.into_view()
+                    }.into_any()
                 }
-                _ => view! { <div></div> }.into_view(),
+                _ => view! { <div></div> }.into_any(),
             })}
         </Suspense>
     }

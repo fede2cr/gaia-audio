@@ -5,14 +5,18 @@
 //! detections with spectrograms and audio playback, so the user can
 //! listen before deciding whether to confirm the override.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, use_context, ElementChild, For, IntoView, Resource,
+    ServerFnError, Suspense, WriteSignal,
+};
 
 use crate::components::detection_card::DetectionCard;
 use crate::model::{ExcludedSpecies, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
-#[server(GetExcludedSpecies, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnError> {
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
@@ -29,7 +33,7 @@ pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnErro
     Ok(species)
 }
 
-#[server(OverrideExclusion, "/api")]
+#[server(prefix = "/api")]
 pub async fn override_exclusion(
     scientific_name: String,
     notes: String,
@@ -41,7 +45,7 @@ pub async fn override_exclusion(
     Ok(())
 }
 
-#[server(RemoveOverride, "/api")]
+#[server(prefix = "/api")]
 pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnError> {
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
@@ -50,7 +54,7 @@ pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnErro
     Ok(())
 }
 
-#[server(GetExcludedDetections, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_excluded_detections(
     scientific_name: String,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
@@ -74,8 +78,8 @@ pub async fn get_excluded_detections(
 /// Excluded species page with override controls.
 #[component]
 pub fn ExcludedPage() -> impl IntoView {
-    let (version, set_version) = create_signal(0u32);
-    let species = create_resource(
+    let (version, set_version) = signal(0u32);
+    let species = Resource::new(
         move || version.get(),
         |_| async { get_excluded_species().await },
     );
@@ -91,13 +95,13 @@ pub fn ExcludedPage() -> impl IntoView {
                 " to include the species in the main Species list and future detections."
             </p>
 
-            <Suspense fallback=move || view! { <p class="loading">"Loading excluded species…"</p> }>
+            <Suspense fallback=|| view! { <p class="loading">"Loading excluded species…"</p> }>
                 {move || species.get().map(|res| match res {
                     Ok(list) if list.is_empty() => view! {
                         <div class="empty-state">
                             <p>"No excluded detections yet."</p>
                         </div>
-                    }.into_view(),
+                    }.into_any(),
                     Ok(list) => {
                         let overridden: Vec<ExcludedSpecies> = list.iter().filter(|s| s.overridden).cloned().collect();
                         let pending: Vec<ExcludedSpecies> = list.iter().filter(|s| !s.overridden).cloned().collect();
@@ -115,9 +119,9 @@ pub fn ExcludedPage() -> impl IntoView {
                                             }
                                         />
                                     </div>
-                                }.into_view()
+                                }.into_any()
                             } else {
-                                view! {}.into_view()
+                                ().into_any()
                             }}
                             {if !overridden.is_empty() {
                                 view! {
@@ -131,15 +135,15 @@ pub fn ExcludedPage() -> impl IntoView {
                                             }
                                         />
                                     </div>
-                                }.into_view()
+                                }.into_any()
                             } else {
-                                view! {}.into_view()
+                                ().into_any()
                             }}
-                        }.into_view()
+                        }.into_any()
                     },
                     Err(e) => view! {
                         <p class="error">"Error: " {e.to_string()}</p>
-                    }.into_view(),
+                    }.into_any(),
                 })}
             </Suspense>
         </div>
@@ -156,12 +160,12 @@ fn ExcludedCard(
     let sci_name_action = sci_name.clone();
     let is_overridden = species.overridden;
 
-    let (busy, set_busy) = create_signal(false);
+    let (busy, set_busy) = signal(false);
 
     let on_override = move |_| {
         set_busy.set(true);
         let name = sci_name_action.clone();
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             let _ = override_exclusion(name, String::new()).await;
             set_busy.set(false);
             version.update(|v| *v += 1);
@@ -172,7 +176,7 @@ fn ExcludedCard(
     let on_undo = move |_| {
         set_busy.set(true);
         let name = sci_name_undo.clone();
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             let _ = remove_override(name).await;
             set_busy.set(false);
             version.update(|v| *v += 1);
@@ -197,9 +201,9 @@ fn ExcludedCard(
     };
 
     // ── expandable detections drawer ─────────────────────────────────
-    let (expanded, set_expanded) = create_signal(false);
+    let (expanded, set_expanded) = signal(false);
     let sci_name_det = sci_name.clone();
-    let detections = create_resource(
+    let detections = Resource::new(
         move || (expanded.get(), sci_name_det.clone()),
         move |(open, name)| async move {
             if open {
@@ -216,24 +220,24 @@ fn ExcludedCard(
                 {match &species.image_url {
                     Some(url) => view! {
                         <img class="species-thumb" src={url.clone()} alt={species.common_name.clone()} loading="lazy"/>
-                    }.into_view(),
+                    }.into_any(),
                     None => view! {
                         <div class="species-thumb-placeholder">
                             <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5">
                                 <path d="M12 3c-1.5 2-4 3-6 3 0 4 1.5 8 6 11 4.5-3 6-7 6-11-2 0-4.5-1-6-3z"/>
                             </svg>
                         </div>
-                    }.into_view(),
+                    }.into_any(),
                 }}
             </div>
 
             <div class="excluded-info">
                 <a href={species_href} class="excluded-species-name">
-                    <span class="common-name">{&species.common_name}</span>
-                    <span class="sci-name">{&species.scientific_name}</span>
+                    <span class="common-name">{species.common_name.clone()}</span>
+                    <span class="sci-name">{species.scientific_name.clone()}</span>
                 </a>
                 <div class="excluded-meta">
-                    <span class="domain-badge">{&species.domain}</span>
+                    <span class="domain-badge">{species.domain.clone()}</span>
                     <span class="confidence high">{confidence_pct}</span>
                     <span class="count-label">{count_label}</span>
                     {species.last_seen.as_ref().map(|d| view! {
@@ -258,7 +262,7 @@ fn ExcludedCard(
                             >
                                 {move || if busy.get() { "…" } else { "Undo" }}
                             </button>
-                        }.into_view()
+                        }.into_any()
                     } else {
                         view! {
                             <button
@@ -268,7 +272,7 @@ fn ExcludedCard(
                             >
                                 {move || if busy.get() { "Confirming…" } else { "Confirm Override" }}
                             </button>
-                        }.into_view()
+                        }.into_any()
                     }}
                 </div>
 
@@ -276,11 +280,11 @@ fn ExcludedCard(
                 {move || if expanded.get() {
                     view! {
                         <div class="excluded-detections">
-                            <Suspense fallback=move || view! { <p class="loading">"Loading recordings…"</p> }>
+                            <Suspense fallback=|| view! { <p class="loading">"Loading recordings…"</p> }>
                                 {move || detections.get().map(|res| match res {
                                     Ok(dets) if dets.is_empty() => view! {
                                         <p class="no-detections">"No audio clips available for this species."</p>
-                                    }.into_view(),
+                                    }.into_any(),
                                     Ok(dets) => view! {
                                         <div class="excluded-detection-list">
                                             <For
@@ -291,16 +295,16 @@ fn ExcludedCard(
                                                 }
                                             />
                                         </div>
-                                    }.into_view(),
+                                    }.into_any(),
                                     Err(e) => view! {
                                         <p class="error">"Error: " {e.to_string()}</p>
-                                    }.into_view(),
+                                    }.into_any(),
                                 })}
                             </Suspense>
                         </div>
-                    }.into_view()
+                    }.into_any()
                 } else {
-                    view! {}.into_view()
+                    ().into_any()
                 }}
             </div>
         </div>

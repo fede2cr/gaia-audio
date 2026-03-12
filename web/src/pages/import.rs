@@ -1,13 +1,17 @@
 //! Import page – discover BirdNET-Pi nodes and import observations.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, use_context, ElementChild, IntoView, Resource, ServerFnError,
+    Suspense,
+};
 
 use crate::model::{BackupFile, BirdnetNode, ImportReport, ImportResult};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
 /// Discover BirdNET-Pi nodes on the local network via mDNS.
-#[server(DiscoverNodes, "/api")]
+#[server(prefix = "/api")]
 pub async fn discover_nodes() -> Result<Vec<BirdnetNode>, ServerFnError> {
     use crate::server::import;
 
@@ -19,7 +23,7 @@ pub async fn discover_nodes() -> Result<Vec<BirdnetNode>, ServerFnError> {
 }
 
 /// Stream-import a BirdNET-Pi backup directly from a node on the network.
-#[server(ImportFromNode, "/api")]
+#[server(prefix = "/api")]
 pub async fn import_from_node(
     address: String,
     port: u16,
@@ -48,7 +52,7 @@ pub async fn import_from_node(
 }
 
 /// Scan the `/backups` volume for `.tar` files (legacy file-based import).
-#[server(ListBackups, "/api")]
+#[server(prefix = "/api")]
 pub async fn list_backups() -> Result<Vec<BackupFile>, ServerFnError> {
     use std::path::Path;
 
@@ -80,7 +84,7 @@ pub async fn list_backups() -> Result<Vec<BackupFile>, ServerFnError> {
 }
 
 /// Analyse a BirdNET-Pi backup tar without importing (legacy).
-#[server(AnalyseBackup, "/api")]
+#[server(prefix = "/api")]
 pub async fn analyse_backup(tar_path: String) -> Result<ImportReport, ServerFnError> {
     use crate::server::import;
     use std::path::Path;
@@ -106,7 +110,7 @@ pub async fn analyse_backup(tar_path: String) -> Result<ImportReport, ServerFnEr
 }
 
 /// Import from a tar file on disk (legacy).
-#[server(RunImport, "/api")]
+#[server(prefix = "/api")]
 pub async fn run_import(tar_path: String) -> Result<ImportResult, ServerFnError> {
     use crate::server::import;
     use std::path::Path;
@@ -132,22 +136,22 @@ pub async fn run_import(tar_path: String) -> Result<ImportResult, ServerFnError>
 #[component]
 pub fn ImportPage() -> impl IntoView {
     // ── Network import state ─────────────────────────────────────────
-    let (nodes, set_nodes) = create_signal::<Vec<BirdnetNode>>(Vec::new());
-    let (discovering, set_discovering) = create_signal(false);
-    let (importing, set_importing) = create_signal(false);
-    let (import_result, set_import_result) = create_signal::<Option<ImportResult>>(None);
-    let (error_msg, set_error_msg) = create_signal::<Option<String>>(None);
+    let (nodes, set_nodes) = signal::<Vec<BirdnetNode>>(Vec::new());
+    let (discovering, set_discovering) = signal(false);
+    let (importing, set_importing) = signal(false);
+    let (import_result, set_import_result) = signal::<Option<ImportResult>>(None);
+    let (error_msg, set_error_msg) = signal::<Option<String>>(None);
 
     // Manual entry
-    let (manual_addr, set_manual_addr) = create_signal("birdnet.local".to_string());
-    let (manual_port, set_manual_port) = create_signal(80u16);
+    let (manual_addr, set_manual_addr) = signal("birdnet.local".to_string());
+    let (manual_port, set_manual_port) = signal(80u16);
 
     // ── Legacy file-based import state ───────────────────────────────
-    let (tar_path, set_tar_path) = create_signal(String::new());
-    let (report, set_report) = create_signal::<Option<ImportReport>>(None);
-    let (file_result, set_file_result) = create_signal::<Option<ImportResult>>(None);
-    let (analysing, set_analysing) = create_signal(false);
-    let (file_importing, set_file_importing) = create_signal(false);
+    let (tar_path, set_tar_path) = signal(String::new());
+    let (report, set_report) = signal::<Option<ImportReport>>(None);
+    let (file_result, set_file_result) = signal::<Option<ImportResult>>(None);
+    let (analysing, set_analysing) = signal(false);
+    let (file_importing, set_file_importing) = signal(false);
 
     // ── Handlers ─────────────────────────────────────────────────────
 
@@ -155,7 +159,7 @@ pub fn ImportPage() -> impl IntoView {
         set_discovering.set(true);
         set_error_msg.set(None);
 
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             match discover_nodes().await {
                 Ok(found) => {
                     if found.is_empty() {
@@ -177,7 +181,7 @@ pub fn ImportPage() -> impl IntoView {
         set_error_msg.set(None);
         set_import_result.set(None);
 
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             match import_from_node(addr, port).await {
                 Ok(r) => set_import_result.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Import failed: {e}"))),
@@ -216,7 +220,7 @@ pub fn ImportPage() -> impl IntoView {
         set_file_result.set(None);
         set_analysing.set(true);
 
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             match analyse_backup(path).await {
                 Ok(r) => set_report.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Analysis failed: {e}"))),
@@ -230,7 +234,7 @@ pub fn ImportPage() -> impl IntoView {
         set_file_importing.set(true);
         set_error_msg.set(None);
 
-        spawn_local(async move {
+        leptos::task::spawn_local(async move {
             match run_import(path).await {
                 Ok(r) => set_file_result.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Import failed: {e}"))),
@@ -240,7 +244,7 @@ pub fn ImportPage() -> impl IntoView {
     };
 
     // Lazy-load backup file list for legacy section
-    let backups = create_resource(|| (), |_| async move { list_backups().await.ok() });
+    let backups = Resource::new(|| (), |_| async move { list_backups().await.ok() });
 
     view! {
         <div class="import-page">
@@ -251,6 +255,7 @@ pub fn ImportPage() -> impl IntoView {
             </p>
 
             // ── Network import section ───────────────────────────────────
+            {view! {
             <section class="import-section">
                 <h2>"Import from Network"</h2>
 
@@ -330,6 +335,7 @@ pub fn ImportPage() -> impl IntoView {
                     </button>
                 </div>
             </section>
+            }.into_any()}
 
             // ── Error message ────────────────────────────────────────────
             {move || error_msg.get().map(|msg| view! {
@@ -377,6 +383,7 @@ pub fn ImportPage() -> impl IntoView {
             })}
 
             // ── Legacy file-based import (collapsed) ─────────────────────
+            {view! {
             <details class="import-legacy">
                 <summary>"Import from backup file"</summary>
                 <p class="import-desc">
@@ -387,8 +394,9 @@ pub fn ImportPage() -> impl IntoView {
                     " volume."
                 </p>
 
+                {view! {
                 <div class="import-input-row">
-                    <Suspense fallback=move || view! { <span>"Scanning…"</span> }>
+                    <Suspense fallback=|| view! { <span>"Scanning…"</span> }>
                         {move || {
                             let files = backups.get().flatten().unwrap_or_default();
                             let is_empty = files.is_empty();
@@ -423,6 +431,7 @@ pub fn ImportPage() -> impl IntoView {
                         {move || if analysing.get() { "Analysing…" } else { "Analyse" }}
                     </button>
                 </div>
+                }.into_any()}
 
                 // Analysis report
                 {move || report.get().map(|r| {
@@ -430,6 +439,7 @@ pub fn ImportPage() -> impl IntoView {
                     view! {
                         <div class="import-report">
                             <h3>"Backup Report"</h3>
+                            {view! {
                             <div class="report-grid">
                                 <div class="report-card">
                                     <span class="report-label">"Detections"</span>
@@ -452,6 +462,7 @@ pub fn ImportPage() -> impl IntoView {
                                     <span class="report-value">{format_number(r.audio_file_count)}</span>
                                 </div>
                             </div>
+                            }.into_any()}
 
                             {(!top.is_empty()).then(|| view! {
                                 <h4>"Top Species"</h4>
@@ -483,7 +494,7 @@ pub fn ImportPage() -> impl IntoView {
                                 </button>
                             </div>
                         </div>
-                    }
+                    }.into_any()
                 })}
 
                 // File import results
@@ -493,6 +504,7 @@ pub fn ImportPage() -> impl IntoView {
                     view! {
                         <div class="import-result">
                             <h3>"Import Complete"</h3>
+                            {view! {
                             <div class="report-grid">
                                 <div class="report-card report-card-success">
                                     <span class="report-label">"Detections"</span>
@@ -507,6 +519,7 @@ pub fn ImportPage() -> impl IntoView {
                                     <span class="report-value">{format_number(r.skipped_existing)}</span>
                                 </div>
                             </div>
+                            }.into_any()}
                             {has_errors.then(|| view! {
                                 <details class="import-errors">
                                     <summary>{format!("{} errors", errs.len())}</summary>
@@ -516,9 +529,10 @@ pub fn ImportPage() -> impl IntoView {
                                 </details>
                             })}
                         </div>
-                    }
+                    }.into_any()
                 })}
             </details>
+            }.into_any()}
         </div>
     }
 }

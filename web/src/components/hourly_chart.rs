@@ -1,7 +1,9 @@
 //! Hourly detection chart – a CSS-only horizontal bar chart showing
 //! detection counts per hour (0–23), similar to BirdNET-Pi's display.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{ElementChild, IntoView};
+use leptos::either::Either;
 
 use crate::model::HourlyCount;
 
@@ -73,7 +75,7 @@ pub fn SpeciesHourlyGrid(
     data: Vec<crate::model::SpeciesHourlyCounts>,
 ) -> impl IntoView {
     if data.is_empty() {
-        return view! { <p class="text-muted">"No detections."</p> }.into_view();
+        return Either::Left(view! { <p class="text-muted">"No detections."</p> });
     }
 
     // Global max for intensity scaling.
@@ -114,9 +116,9 @@ pub fn SpeciesHourlyGrid(
                                 style={format!("--intensity: {}%", intensity)}>
                                 {count}
                             </td>
-                        }
+                        }.into_any()
                     } else {
-                        view! { <td class="shg-cell"></td> }
+                        view! { <td class="shg-cell"></td> }.into_any()
                     }
                 })
                 .collect();
@@ -125,7 +127,7 @@ pub fn SpeciesHourlyGrid(
                 <tr>
                     <td class="shg-species">
                         <a href={species_href.clone()}>
-                            {&sp.common_name}
+                            {sp.common_name.clone()}
                         </a>
                     </td>
                     <td class="shg-total">{sp.total}</td>
@@ -135,7 +137,7 @@ pub fn SpeciesHourlyGrid(
         })
         .collect();
 
-    view! {
+    Either::Right(view! {
         <div class="species-hourly-grid-wrap">
             <table class="species-hourly-grid">
                 <thead>
@@ -150,6 +152,5 @@ pub fn SpeciesHourlyGrid(
                 </tbody>
             </table>
         </div>
-    }
-    .into_view()
+    })
 }

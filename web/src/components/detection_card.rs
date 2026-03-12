@@ -1,6 +1,7 @@
 //! Card component for a single detection in the live feed.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{ElementChild, IntoView};
 
 use crate::model::WebDetection;
 
@@ -46,32 +47,28 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
                 {match species_image {
                     Some(url) => view! {
                         <img class="species-thumb" src={url} alt={common_name_alt} loading="lazy"/>
-                    }.into_view(),
+                    }.into_any(),
                     None => view! {
                         <div class="species-thumb-placeholder">
                             <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5">
                                 <path d="M12 3c-1.5 2-4 3-6 3 0 4 1.5 8 6 11 4.5-3 6-7 6-11-2 0-4.5-1-6-3z"/>
                             </svg>
                         </div>
-                    }.into_view(),
+                    }.into_any(),
                 }}
             </div>
 
             // Detection details (center)
             <div class="detection-info">
                 <a href={species_href} class="detection-species">
-                    <span class="common-name">{&detection.common_name}</span>
-                    <span class="sci-name">{&detection.scientific_name}</span>
+                    <span class="common-name">{detection.common_name.clone()}</span>
+                    <span class="sci-name">{detection.scientific_name.clone()}</span>
                 </a>
                 <div class="detection-meta">
-                    <span class="domain-badge">{&detection.domain}</span>
+                    <span class="domain-badge">{detection.domain.clone()}</span>
                     <span class={confidence_class}>{confidence_pct}</span>
                     <span class="model-badge" title="Detection model">"🧠 " {model_label}</span>
-                    {if is_excluded {
-                        view! { <span class="excluded-badge">"Excluded"</span> }.into_view()
-                    } else {
-                        view! {}.into_view()
-                    }}
+                    {is_excluded.then(|| view! { <span class="excluded-badge">"Excluded"</span> })}
                     <span class="source-badge" title="Capture node">{source_label}</span>
                 </div>
                 <div class="detection-timestamp">
@@ -105,7 +102,7 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
                 })}
             </div>
         </div>
-    }
+    }.into_any()
 }
 
 fn urlencoded(s: &str) -> String {

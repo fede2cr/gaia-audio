@@ -7,7 +7,12 @@
 //! there is nothing new to show.  Spectrogram image and prediction bars
 //! crossfade smoothly via CSS transitions.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, use_context, Effect, ElementChild, IntoView, Resource,
+    ServerFnError, StoredValue,
+};
+use leptos::either::Either;
 
 use crate::model::{LivePrediction, LiveStatus};
 
@@ -108,7 +113,7 @@ fn format_capture_time(iso: &str, offset_hours: i32) -> String {
 
 // ─── Server function ─────────────────────────────────────────────────────────
 
-#[server(GetLiveStatus, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_live_status() -> Result<Option<LiveStatus>, ServerFnError> {
     let data_dir = std::env::var("GAIA_DATA_DIR").unwrap_or_else(|_| "/data".into());
     let path = std::path::PathBuf::from(&data_dir).join("live_status.json");
@@ -126,7 +131,7 @@ pub async fn get_live_status() -> Result<Option<LiveStatus>, ServerFnError> {
     Ok(Some(status))
 }
 
-#[server(GetTzOffset, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_tz_offset() -> Result<i32, ServerFnError> {
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
@@ -144,12 +149,12 @@ pub async fn get_tz_offset() -> Result<i32, ServerFnError> {
 #[component]
 pub fn LiveAnalysis() -> impl IntoView {
     // Reactive signals that drive the view.
-    let (status, set_status) = create_signal::<Option<LiveStatus>>(None);
-    let (img_url, set_img_url) = create_signal(String::new());
-    let (tz_offset, set_tz_offset) = create_signal(0_i32);
+    let (status, set_status) = signal::<Option<LiveStatus>>(None);
+    let (img_url, set_img_url) = signal(String::new());
+    let (tz_offset, set_tz_offset) = signal(0_i32);
 
     // Track the last-seen timestamp so we can skip no-op updates.
-    let last_ts = store_value(String::new());
+    let last_ts = StoredValue::new(String::new());
 
     // Helper: only push to signals when the timestamp actually changed.
     let apply_update = move |new: Option<LiveStatus>| {
@@ -174,14 +179,14 @@ pub fn LiveAnalysis() -> impl IntoView {
     };
 
     // Initial load
-    let initial = create_resource(|| (), |_| async { get_live_status().await });
-    let tz_res = create_resource(|| (), |_| async { get_tz_offset().await });
-    create_effect(move |_| {
+    let initial = Resource::new(|| (), |_| async { get_live_status().await });
+    let tz_res = Resource::new(|| (), |_| async { get_tz_offset().await });
+    Effect::new(move || {
         if let Some(Ok(s)) = initial.get() {
             apply_update(s);
         }
     });
-    create_effect(move |_| {
+    Effect::new(move || {
         if let Some(Ok(off)) = tz_res.get() {
             set_tz_offset.set(off);
         }
@@ -190,17 +195,22 @@ pub fn LiveAnalysis() -> impl IntoView {
     // Poll every 4 seconds (hydrate/WASM only)
     #[cfg(feature = "hydrate")]
     {
-        set_interval_with_handle(
-            move || {
-                spawn_local(async move {
-                    if let Ok(s) = get_live_status().await {
-                        apply_update(s);
-                    }
-                });
-            },
-            std::time::Duration::from_secs(4),
-        )
-        .ok();
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+        let cb = Closure::wrap(Box::new(move || {
+            leptos::task::spawn_local(async move {
+                if let Ok(s) = get_live_status().await {
+                    apply_update(s);
+                }
+            });
+        }) as Box<dyn Fn()>);
+        let _ = web_sys::window()
+            .unwrap()
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                4000,
+            );
+        cb.forget();
     }
 
     view! {
@@ -212,7 +222,7 @@ pub fn LiveAnalysis() -> impl IntoView {
                         <div class="live-analysis-empty">
                             <p class="text-muted">"Waiting for processing server…"</p>
                         </div>
-                    }.into_view(),
+                    }.into_any(),
                     Some(st) => {
                         let url = img_url.get();
                         let has_det = st.has_detections;
@@ -225,9 +235,9 @@ pub fn LiveAnalysis() -> impl IntoView {
                                 <div class="live-spectrogram">
                                     <img class="live-spectrogram-img" src={url} alt="Live spectrogram"/>
                                     {if has_det {
-                                        view! { <span class="live-badge detection">"Detection!"</span> }.into_view()
+                                        Either::Left(view! { <span class="live-badge detection">"Detection!"</span> })
                                     } else {
-                                        view! { <span class="live-badge listening">"Listening…"</span> }.into_view()
+                                        Either::Right(view! { <span class="live-badge listening">"Listening…"</span> })
                                     }}
                                 </div>
                                 <div class="live-details">
@@ -240,9 +250,9 @@ pub fn LiveAnalysis() -> impl IntoView {
                                         "Now processing from "
                                         <strong>{node}</strong>
                                         {if !cap_time.is_empty() {
-                                            view! { <span>", captured at " {cap_time}</span> }.into_view()
+                                            Either::Left(view! { <span>", captured at " {cap_time}</span> })
                                         } else {
-                                            view! {}.into_view()
+                                            Either::Right(())
                                         }}
                                     </p>
                                     <div class="live-predictions">
@@ -250,7 +260,7 @@ pub fn LiveAnalysis() -> impl IntoView {
                                     </div>
                                 </div>
                             </div>
-                        }.into_view()
+                        }.into_any()
                     }
                 }
             }}
@@ -262,10 +272,10 @@ pub fn LiveAnalysis() -> impl IntoView {
 #[component]
 fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
     if predictions.is_empty() {
-        return view! { <p class="text-muted">"No predictions"</p> }.into_view();
+        return Either::Left(view! { <p class="text-muted">"No predictions"</p> });
     }
 
-    view! {
+    Either::Right(view! {
         <ul class="prediction-list">
             {predictions.into_iter().map(|p| {
                 let pct = format!("{:.0}%", p.confidence * 100.0);
@@ -288,12 +298,12 @@ fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
                 view! {
                     <li class="prediction-item">
                         <span class="pred-name" title={p.scientific_name.clone()}>
-                            {&p.common_name}
+                            {p.common_name.clone()}
                         </span>
                         {if !model_tag.is_empty() {
-                            view! { <span class="pred-model">{model_tag}</span> }.into_view()
+                            Either::Left(view! { <span class="pred-model">{model_tag}</span> })
                         } else {
-                            view! {}.into_view()
+                            Either::Right(())
                         }}
                         <div class="pred-bar-track">
                             <div class={bar_class} style={format!("width: {width}")}></div>
@@ -301,7 +311,7 @@ fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
                         <span class="pred-confidence">{pct}</span>
                     </li>
                 }
-            }).collect_view()}
+            }).collect::<Vec<_>>()}
         </ul>
-    }.into_view()
+    })
 }

@@ -1,7 +1,12 @@
 //! Species detail page – iNaturalist photo, detection history, calendar overlay.
 
-use leptos::*;
-use leptos_router::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, use_context, Action, Effect, ElementChild, IntoView, Resource,
+    ServerFnError, StoredValue, Suspense,
+};
+use leptos::either::Either;
+use leptos_router::hooks::use_params_map;
 
 use crate::components::calendar_grid::CalendarGrid;
 use crate::components::hourly_chart::HourlyChart;
@@ -9,7 +14,7 @@ use crate::model::{CalendarDay, HourlyCount, SpeciesInfo};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
-#[server(GetSpeciesInfo, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_species_info(
     scientific_name: String,
 ) -> Result<Option<SpeciesInfo>, ServerFnError> {
@@ -31,7 +36,7 @@ pub async fn get_species_info(
     Ok(info)
 }
 
-#[server(GetSpeciesCalendar, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_species_calendar(
     scientific_name: String,
     year: i32,
@@ -56,7 +61,7 @@ pub async fn get_species_calendar(
 }
 
 /// Save or update a verification for a species.
-#[server(SetSpeciesVerification, "/api")]
+#[server(prefix = "/api")]
 pub async fn set_species_verification(
     scientific_name: String,
     method: String,
@@ -71,7 +76,7 @@ pub async fn set_species_verification(
 }
 
 /// Remove verification for a species.
-#[server(RemoveSpeciesVerification, "/api")]
+#[server(prefix = "/api")]
 pub async fn remove_species_verification(
     scientific_name: String,
 ) -> Result<(), ServerFnError> {
@@ -84,7 +89,7 @@ pub async fn remove_species_verification(
 }
 
 /// Hourly detection histogram for a species (all-time).
-#[server(GetSpeciesHourly, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_species_hourly(
     scientific_name: String,
 ) -> Result<Vec<HourlyCount>, ServerFnError> {
@@ -104,13 +109,12 @@ pub fn SpeciesPage() -> impl IntoView {
     let sci_name = move || {
         params.with(|p| {
             p.get("name")
-                .cloned()
                 .unwrap_or_default()
                 .replace("%20", " ")
         })
     };
 
-    let info = create_resource(sci_name, |name| async move {
+    let info = Resource::new(sci_name, |name| async move {
         get_species_info(name).await
     });
 
@@ -118,15 +122,15 @@ pub fn SpeciesPage() -> impl IntoView {
         <div class="species-page">
             <a href="/species" class="back-link">"← All Species"</a>
 
-            <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="loading">"Loading\u{2026}"</p> }>
                 {move || info.get().map(|res| match res {
-                    Ok(Some(sp)) => view! { <SpeciesDetail species=sp /> }.into_view(),
+                    Ok(Some(sp)) => view! { <SpeciesDetail species=sp /> }.into_any(),
                     Ok(None) => view! {
                         <p class="error">"Species not found."</p>
-                    }.into_view(),
+                    }.into_any(),
                     Err(e) => view! {
                         <p class="error">"Error: " {e.to_string()}</p>
-                    }.into_view(),
+                    }.into_any(),
                 })}
             </Suspense>
         </div>
@@ -146,43 +150,43 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
 
     // ── Calendar state: default to current year/month ────────────────────
     let (now_y, now_m) = js_sys_now();
-    let (year, set_year) = create_signal(now_y);
-    let (month, set_month) = create_signal(now_m);
+    let (year, set_year) = signal(now_y);
+    let (month, set_month) = signal(now_m);
 
     let sci_name_for_cal = sci_name.clone();
-    let calendar_data = create_resource(
+    let calendar_data = Resource::new(
         move || (sci_name_for_cal.clone(), year.get()),
         |(name, y)| async move { get_species_calendar(name, y).await },
     );
 
     // ── Hourly histogram (all-time) ─────────────────────────────────────
     let sci_name_for_hourly = sci_name.clone();
-    let hourly_data = create_resource(
+    let hourly_data = Resource::new(
         move || sci_name_for_hourly.clone(),
         |name| async move { get_species_hourly(name).await },
     );
-    let common_name_for_chart = store_value(species.common_name.clone());
+    let common_name_for_chart = StoredValue::new(species.common_name.clone());
     let total_dets = species.total_detections as u32;
 
     // ── Verification state ───────────────────────────────────────────────
     let initial_verification = species.verification.clone();
-    let (verified, set_verified) = create_signal(initial_verification.is_some());
-    let (verify_method, set_verify_method) = create_signal(
+    let (verified, set_verified) = signal(initial_verification.is_some());
+    let (verify_method, set_verify_method) = signal(
         initial_verification
             .as_ref()
             .map(|v| v.method.clone())
             .unwrap_or_else(|| "ornithologist".to_string()),
     );
-    let (inat_obs, set_inat_obs) = create_signal(
+    let (inat_obs, set_inat_obs) = signal(
         initial_verification
             .as_ref()
             .map(|v| v.inaturalist_obs.clone())
             .unwrap_or_default(),
     );
-    let (verify_status, set_verify_status) = create_signal(Option::<String>::None);
+    let (verify_status, set_verify_status) = signal(Option::<String>::None);
 
     let sci_name_save = sci_name.clone();
-    let save_verification = create_action(move |(method, obs): &(String, String)| {
+    let save_verification = Action::new(move |(method, obs): &(String, String)| {
         let name = sci_name_save.clone();
         let method = method.clone();
         let obs = obs.clone();
@@ -190,13 +194,13 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
     });
 
     let sci_name_remove = sci_name.clone();
-    let remove_verification = create_action(move |_: &()| {
+    let remove_verification = Action::new(move |_: &()| {
         let name = sci_name_remove.clone();
         async move { remove_species_verification(name).await }
     });
 
     // Feedback effects.
-    create_effect(move |_| {
+    Effect::new(move || {
         if let Some(result) = save_verification.value().get() {
             match result {
                 Ok(()) => set_verify_status.set(Some("Verification saved.".into())),
@@ -204,7 +208,7 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
             }
         }
     });
-    create_effect(move |_| {
+    Effect::new(move || {
         if let Some(result) = remove_verification.value().get() {
             match result {
                 Ok(()) => set_verify_status.set(Some("Verification removed.".into())),
@@ -253,9 +257,9 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
             <div class="species-hero">
                 <img src={img_src} alt={species.common_name.clone()} class="species-hero-img" />
                 <div class="species-hero-info">
-                    <h1>{&species.common_name}</h1>
-                    <p class="species-sci-name">{&species.scientific_name}</p>
-                    <span class="domain-badge">{&species.domain}</span>
+                    <h1>{species.common_name.clone()}</h1>
+                    <p class="species-sci-name">{species.scientific_name.clone()}</p>
+                    <span class="domain-badge">{species.domain.clone()}</span>
                     <div class="species-stats-bar">
                         <div class="stat">
                             <span class="stat-value">{species.total_detections}</span>
@@ -337,22 +341,22 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
             // ── Hourly activity chart ────────────────────────────────
             <section class="species-hourly">
                 <h2>"Activity by Hour"</h2>
-                <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+                <Suspense fallback=|| view! { <p class="loading">"Loading\u{2026}"</p> }>
                     {move || {
                         let chart_name = common_name_for_chart.get_value();
                         hourly_data.get().map(|res| match res {
                             Ok(hours) => {
-                                view! {
+                                Either::Left(view! {
                                     <HourlyChart
                                         title=chart_name
                                         hours=hours
                                         total=total_dets
                                     />
-                                }.into_view()
+                                })
                             },
-                            Err(e) => view! {
+                            Err(e) => Either::Right(view! {
                                 <p class="error">"Error: " {e.to_string()}</p>
-                            }.into_view(),
+                            }),
                         })
                     }}
                 </Suspense>
@@ -385,25 +389,25 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                             view! {
                                 <option value={num.to_string()} selected=selected>{name}</option>
                             }
-                        }).collect_view()}
+                        }).collect::<Vec<_>>()}
                     </select>
                 </div>
 
-                <Suspense fallback=move || view! { <p class="loading">"Loading calendar…"</p> }>
+                <Suspense fallback=|| view! { <p class="loading">"Loading calendar\u{2026}"</p> }>
                     {move || calendar_data.get().map(|res| match res {
                         Ok((_all_days, active_dates)) => {
-                            view! {
+                            Either::Left(view! {
                                 <CalendarGrid
                                     year=year.get()
                                     month=month.get()
                                     days=vec![]
                                     highlight_dates=active_dates
                                 />
-                            }.into_view()
+                            })
                         },
-                        Err(e) => view! {
+                        Err(e) => Either::Right(view! {
                             <p class="error">"Error: " {e.to_string()}</p>
-                        }.into_view(),
+                        }),
                     })}
                 </Suspense>
             </section>

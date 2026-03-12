@@ -1,6 +1,7 @@
 //! Species card with image (from iNaturalist) and detection stats.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{ElementChild, IntoView};
 
 use crate::model::SpeciesSummary;
 
@@ -24,10 +25,10 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                 />
             </div>
             <div class="species-card-body">
-                <h3 class="species-common">{&species.common_name}</h3>
-                <p class="species-sci">{&species.scientific_name}</p>
+                <h3 class="species-common">{species.common_name.clone()}</h3>
+                <p class="species-sci">{species.scientific_name.clone()}</p>
                 <div class="species-stats">
-                    <span class="domain-badge">{&species.domain}</span>
+                    <span class="domain-badge">{species.domain.clone()}</span>
                     <span class="detection-count">
                         {species.detection_count} " detections"
                     </span>
