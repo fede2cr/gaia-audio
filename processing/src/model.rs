@@ -276,42 +276,12 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     // Higher values → steeper sigmoid → higher reported confidences.
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
 
-    // ── GPU acceleration via ONNX Runtime (MIGraphX) ─────────────────
-    // When ROCm is requested and the model was loaded by tract (i.e. no
-    // ORT fallback already in place), try to create an accelerated ORT
-    // session that will be preferred at inference time.
-    let ort_session = if ort_session.is_some() {
-        // Already using ORT (tract couldn't load the model).
-        ort_session
-    } else if crate::accel::is_rocm_requested() {
-        if let Some(onnx_path) = resolved.onnx_path() {
-            if onnx_path.exists() {
-                let cache_dir = onnx_path
-                    .parent()
-                    .unwrap_or(Path::new("/tmp"))
-                    .join("ort_cache");
-                match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
-                    Ok(sess) => {
-                        info!("ORT accelerated session ready for {}", onnx_path.display());
-                        Some(sess)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to create ORT session for {} — using tract CPU: {e:#}",
-                            onnx_path.display()
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // ── ORT session ───────────────────────────────────────────────────
+    // The ORT session is only used when tract could not load the model
+    // (e.g. unsupported DFT/STFT ops).  If tract succeeded, we keep the
+    // tract runner — it's fast and avoids the potentially slow MIGraphX
+    // compilation step.  When ORT *is* active and GAIA_ACCEL=rocm is
+    // set, it will automatically try MIGraphX → ROCm → CPU.
 
     Ok(LoadedModel {
         runner,
