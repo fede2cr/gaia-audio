@@ -729,15 +729,53 @@ button {
 }
 
 .species-hero-img {
-    width: 260px;
-    height: 260px;
+    width: 340px;
+    height: 340px;
     border-radius: var(--radius);
-    object-fit: cover;
+    object-fit: contain;
     background: var(--bg-card);
     flex-shrink: 0;
 }
 @media (max-width: 640px) {
-    .species-hero-img { width: 100%; height: 220px; }
+    .species-hero-img { width: 100%; height: auto; max-height: 340px; }
+}
+
+/* ── Sexual dimorphism section ──────────────────────────────────────────── */
+
+.species-dimorphism {
+    margin-top: 1.5rem;
+}
+.species-dimorphism h2 {
+    font-size: 1.1rem;
+    margin-bottom: .75rem;
+}
+.dimorphism-pair {
+    display: flex;
+    gap: 1rem;
+}
+@media (max-width: 640px) {
+    .dimorphism-pair { flex-direction: column; }
+}
+.dimorphism-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+.dimorphism-img {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: contain;
+    background: var(--bg-card);
+}
+.dimorphism-label {
+    padding: .4rem 0;
+    font-size: .85rem;
+    font-weight: 600;
+    color: var(--text-muted);
 }
 
 .species-hero-info { flex: 1; }

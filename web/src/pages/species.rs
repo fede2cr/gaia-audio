@@ -28,6 +28,8 @@ pub async fn get_species_info(
         if let Some(photo) = inaturalist::lookup(&state.photo_cache, &scientific_name).await {
             sp.image_url = Some(photo.medium_url);
             sp.wikipedia_url = photo.wikipedia_url;
+            sp.male_image_url = photo.male_image_url;
+            sp.female_image_url = photo.female_image_url;
         }
         // Load verification state.
         sp.verification = db::get_species_verification(&state.db_path, &scientific_name)
@@ -156,6 +158,10 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
         .image_url
         .clone()
         .unwrap_or_else(|| "/pkg/placeholder.svg".to_string());
+
+    let male_img = species.male_image_url.clone();
+    let female_img = species.female_image_url.clone();
+    let has_dimorphism = male_img.is_some() || female_img.is_some();
 
     let wiki_link = species.wikipedia_url.clone();
     let sci_name = species.scientific_name.clone();
@@ -300,6 +306,27 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                     })}
                 </div>
             </div>
+
+            // ── Sexual dimorphism photos ─────────────────────────────
+            {has_dimorphism.then(|| view! {
+                <section class="species-dimorphism">
+                    <h2>"Male & Female"</h2>
+                    <div class="dimorphism-pair">
+                        {male_img.clone().map(|url| view! {
+                            <div class="dimorphism-card">
+                                <img src={url} alt="Male" class="dimorphism-img" loading="lazy" />
+                                <span class="dimorphism-label">"♂ Male"</span>
+                            </div>
+                        })}
+                        {female_img.clone().map(|url| view! {
+                            <div class="dimorphism-card">
+                                <img src={url} alt="Female" class="dimorphism-img" loading="lazy" />
+                                <span class="dimorphism-label">"♀ Female"</span>
+                            </div>
+                        })}
+                    </div>
+                </section>
+            })}
 
             // ── Verification section ─────────────────────────────────
             <section class="species-verification">

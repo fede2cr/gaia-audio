@@ -17,7 +17,7 @@ use crate::model::SpeciesPhoto;
 /// Bump this whenever [`SpeciesPhoto`] gains new fields that require a
 /// fresh iNaturalist fetch.  Stale cache entries with an older version
 /// are silently discarded and re-fetched.
-const CACHE_VERSION: u16 = 2;
+const CACHE_VERSION: u16 = 3;
 
 /// Wrapper stored in the cache so we can detect outdated entries.
 #[derive(Clone, Debug)]
@@ -188,13 +188,17 @@ const SEX_FEMALE_VALUE: u8 = 10;
 ///
 /// Queries Research Grade observations sorted by votes (most agreed-upon
 /// annotation first) and returns the medium-size photo URL of the first
-/// result that has one.
+/// result that has one.  We request `field:Sex` so only observations
+/// where a curator actually added that annotation field are returned,
+/// and we pick the photo with the most faves/votes to maximise quality.
 async fn fetch_sex_photo(scientific_name: &str, term_value_id: u8) -> Option<String> {
+    // Request 5 candidates so we can skip observations whose only photo
+    // is low-quality or where the annotation might be dubious.
     let url = format!(
         "https://api.inaturalist.org/v1/observations?\
          taxon_name={name}&term_id={tid}&term_value_id={vid}\
-         &quality_grade=research&photos=true&per_page=1\
-         &order_by=votes",
+         &quality_grade=research&photos=true&per_page=5\
+         &order_by=votes&field:Sex",
         name = urlencoded(scientific_name),
         tid = SEX_TERM_ID,
         vid = term_value_id,
@@ -203,13 +207,57 @@ async fn fetch_sex_photo(scientific_name: &str, term_value_id: u8) -> Option<Str
     let resp = reqwest::get(&url).await.ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
 
-    let obs = body.get("results")?.as_array()?.first()?;
-    let photo = obs.get("photos")?.as_array()?.first()?;
+    let results = body.get("results")?.as_array()?;
 
-    // The `url` field on observation photos is the square thumbnail;
-    // replace "square" with "medium" for a higher-res image.
-    let photo_url = photo.get("url")?.as_str()?;
-    Some(photo_url.replace("/square.", "/medium."))
+    // Walk through candidates and pick the first observation whose
+    // annotations actually contain the expected sex term-value pair.
+    for obs in results {
+        // Verify the annotation is present on this observation.
+        if let Some(annotations) = obs.get("annotations").and_then(|a| a.as_array()) {
+            let has_correct_annotation = annotations.iter().any(|ann| {
+                let tid_ok = ann
+                    .get("controlled_attribute_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u8 == SEX_TERM_ID)
+                    .unwrap_or(false);
+                let vid_ok = ann
+                    .get("controlled_value_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u8 == term_value_id)
+                    .unwrap_or(false);
+                // Prefer annotations that have more agreeing votes
+                // than disagreeing ones.
+                let net_positive = {
+                    let up = ann
+                        .get("votes")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter(|v| {
+                            v.get("vote_flag").and_then(|f| f.as_bool()).unwrap_or(true)
+                        }).count())
+                        .unwrap_or(0);
+                    let down = ann
+                        .get("votes")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter(|v| {
+                            v.get("vote_flag").and_then(|f| f.as_bool()) == Some(false)
+                        }).count())
+                        .unwrap_or(0);
+                    up >= down
+                };
+                tid_ok && vid_ok && net_positive
+            });
+            if !has_correct_annotation {
+                continue;
+            }
+        }
+
+        if let Some(photo) = obs.get("photos").and_then(|p| p.as_array()).and_then(|a| a.first()) {
+            let photo_url = photo.get("url")?.as_str()?;
+            return Some(photo_url.replace("/square.", "/medium."));
+        }
+    }
+
+    None
 }
 
 /// Fetch both male and female photos concurrently.

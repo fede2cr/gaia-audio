@@ -255,6 +255,8 @@ pub fn species_info(
             last_seen: row.get(4)?,
             image_url: None,
             wikipedia_url: None,
+            male_image_url: None,
+            female_image_url: None,
             verification: None,
         })
     })?;

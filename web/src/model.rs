@@ -126,6 +126,12 @@ pub struct SpeciesInfo {
     pub total_detections: u64,
     pub first_seen: Option<String>,
     pub last_seen: Option<String>,
+    /// Male specimen photo URL (from iNaturalist sex-annotated observations).
+    #[serde(default)]
+    pub male_image_url: Option<String>,
+    /// Female specimen photo URL (from iNaturalist sex-annotated observations).
+    #[serde(default)]
+    pub female_image_url: Option<String>,
     /// Verification state (loaded separately).
     #[serde(default)]
     pub verification: Option<SpeciesVerification>,
