@@ -10,7 +10,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::calendar_grid::CalendarGrid;
 use crate::components::hourly_chart::HourlyChart;
-use crate::model::{CalendarDay, HourlyCount, SpeciesInfo};
+use crate::model::{CalendarDay, HourlyCount, SpeciesInfo, TopRecording};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
@@ -100,6 +100,18 @@ pub async fn get_species_hourly(
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
+/// Top recordings for a species (from the nightly cache).
+#[server(prefix = "/api")]
+pub async fn get_species_top_recordings(
+    scientific_name: String,
+) -> Result<Vec<TopRecording>, ServerFnError> {
+    use crate::server::db;
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    db::get_top_recordings(&state.db_path, &scientific_name, 10)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+}
+
 // ─── Page component ──────────────────────────────────────────────────────────
 
 /// Detail page for a single species.
@@ -167,6 +179,13 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
     );
     let common_name_for_chart = StoredValue::new(species.common_name.clone());
     let total_dets = species.total_detections as u32;
+
+    // ── Top recordings ──────────────────────────────────────────────────
+    let sci_name_for_recs = sci_name.clone();
+    let recordings = Resource::new(
+        move || sci_name_for_recs.clone(),
+        |name| async move { get_species_top_recordings(name).await },
+    );
 
     // ── Verification state ───────────────────────────────────────────────
     let initial_verification = species.verification.clone();
@@ -359,6 +378,49 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                             }),
                         })
                     }}
+                </Suspense>
+            </section>
+
+            // ── Top recordings ────────────────────────────────────────
+            <section class="species-recordings">
+                <h2>"Top Recordings"</h2>
+                <Suspense fallback=|| view! { <p class="loading">"Loading recordings\u{2026}"</p> }>
+                    {move || recordings.get().map(|res| match res {
+                        Ok(recs) if recs.is_empty() => Either::Left(view! {
+                            <p class="no-data">"No recordings cached yet."</p>
+                        }),
+                        Ok(recs) => Either::Right(Either::Left(view! {
+                            <div class="recordings-grid">
+                                {recs.into_iter().map(|r| {
+                                    let spec_url = r.spectrogram_url();
+                                    let clip     = r.clip_url();
+                                    let conf_pct = format!("{:.0}%", r.confidence * 100.0);
+                                    let date     = r.date.clone();
+                                    let time     = r.time.clone();
+                                    view! {
+                                        <div class="recording-card">
+                                            <img
+                                                src={spec_url}
+                                                alt="spectrogram"
+                                                class="recording-spectrogram"
+                                                loading="lazy"
+                                            />
+                                            <div class="recording-info">
+                                                <span class="recording-confidence">{conf_pct}</span>
+                                                <span class="recording-datetime">{date} " " {time}</span>
+                                            </div>
+                                            <audio controls preload="none" class="recording-audio">
+                                                <source src={clip} type="audio/mp3" />
+                                            </audio>
+                                        </div>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        })),
+                        Err(e) => Either::Right(Either::Right(view! {
+                            <p class="error">"Error: " {e.to_string()}</p>
+                        })),
+                    })}
                 </Suspense>
             </section>
 

@@ -541,20 +541,23 @@ button {
     padding-top: 0; /* override the padding-top aspect ratio trick */
     position: relative;
     background: var(--bg-elevated);
+    /* Fixed height matching the normal 4:3 card image area */
+    aspect-ratio: 4 / 3;
 }
 .sex-half {
     flex: 1;
     position: relative;
-    overflow: hidden;
-    /* 4:3 aspect ratio per half → 2:3 combined card width */
-    padding-top: 75%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-elevated);
+    min-width: 0; /* prevent flex blowout */
 }
 .sex-half .species-img {
-    position: absolute;
-    inset: 0;
+    position: static;
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: contain;
 }
 .sex-label {
     position: absolute;
@@ -565,6 +568,7 @@ button {
     border-radius: 3px;
     line-height: 1;
     pointer-events: none;
+    z-index: 1;
 }
 .sex-label.male {
     left: .25rem;
@@ -890,6 +894,54 @@ button {
 }
 .verification-ok { color: var(--accent); }
 .verification-error { color: #e5534b; }
+
+/* ── Top Recordings ─────────────────────────────────────────────────────── */
+
+.species-recordings {
+    margin-top: 1.5rem;
+}
+.species-recordings h2 {
+    font-size: 1.1rem;
+    margin-bottom: .75rem;
+}
+.recordings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1rem;
+}
+.recording-card {
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.recording-spectrogram {
+    width: 100%;
+    aspect-ratio: 5 / 2;
+    object-fit: cover;
+    display: block;
+}
+.recording-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: .5rem .75rem;
+    font-size: .85rem;
+}
+.recording-confidence {
+    font-weight: 700;
+    color: var(--accent);
+}
+.recording-datetime {
+    color: var(--text-muted);
+    font-size: .8rem;
+}
+.recording-audio {
+    width: 100%;
+    height: 36px;
+    border-radius: 0;
+}
 
 /* ── Hourly bar chart (single species) ──────────────────────────────────── */
 

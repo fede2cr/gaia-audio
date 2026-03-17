@@ -43,6 +43,39 @@ async fn main() {
     }
     tracing::info!("Database ready at {}", db_path.display());
 
+    // Refresh the species stats cache at startup so the species list loads
+    // instantly from the cache table.
+    {
+        let db = db_path.clone();
+        if let Err(e) = gaia_web::server::db::refresh_species_stats(&db) {
+            tracing::warn!("Initial species-stats refresh failed: {e}");
+        } else {
+            tracing::info!("Species stats cache populated");
+        }
+    }
+
+    // Spawn a background task that refreshes the species stats cache every
+    // night at ~02:00 local time (or every 24 h if tz is unknown).
+    {
+        let db = db_path.clone();
+        tokio::spawn(async move {
+            loop {
+                // Sleep until the next 02:00 or 24 h, whichever is simpler.
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                tracing::info!("Nightly species-stats refresh starting…");
+                let db2 = db.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    gaia_web::server::db::refresh_species_stats(&db2)
+                }).await;
+                match res {
+                    Ok(Ok(())) => tracing::info!("Nightly species-stats refresh complete"),
+                    Ok(Err(e)) => tracing::warn!("Nightly species-stats refresh failed: {e}"),
+                    Err(e) => tracing::warn!("Nightly species-stats task panicked: {e}"),
+                }
+            }
+        });
+    }
+
     let extracted_dir = PathBuf::from(
         std::env::var("GAIA_EXTRACTED_DIR").unwrap_or_else(|_| "data/extracted".into()),
     );

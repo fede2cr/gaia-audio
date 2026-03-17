@@ -85,7 +85,7 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                         <span class={class} title={title}>{code}</span>
                     })}
                     <span class="detection-count">
-                        {species.detection_count} " detections"
+                        {species.display_count.clone()} " detections"
                     </span>
                 </div>
             </div>

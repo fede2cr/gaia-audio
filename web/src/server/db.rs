@@ -11,7 +11,7 @@ use std::path::Path;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration};
 use rusqlite::{params, Connection};
 
-use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection,
+use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, TopRecording, UrbanNoiseSummary, WebDetection,
                     HourlyCount, SpeciesHourlyCounts};
 
 // ─── Timezone helpers ────────────────────────────────────────────────────────
@@ -380,11 +380,13 @@ pub fn top_species_for_date(
     )?;
 
     let rows = stmt.query_map(params![date, limit], |row| {
+        let count: u32 = row.get(3)?;
         Ok(SpeciesSummary {
             scientific_name: row.get(0)?,
             common_name: row.get(1)?,
             domain: row.get(2)?,
-            detection_count: row.get(3)?,
+            detection_count: count,
+            display_count: round_count(count),
             last_seen: row.get(4)?,
             image_url: None,
             conservation_status: None,
@@ -398,13 +400,73 @@ pub fn top_species_for_date(
 
 /// Top species (for species list on home page).
 ///
-/// Excluded detections are omitted unless the species has been overridden
-/// in the `exclusion_overrides` table.
+/// Reads from the `species_stats` cache table for fast loading.
+/// Falls back to a live COUNT(*) query if the cache is empty.
 pub fn top_species(
     db_path: &Path,
     limit: u32,
 ) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
     let conn = open(db_path)?;
+
+    // Check if the cache table exists and has data.
+    let cache_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='species_stats'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if cache_count > 0 {
+        let has_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM species_stats", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if has_rows > 0 {
+            return top_species_from_cache(&conn, limit);
+        }
+    }
+
+    // Fallback: live query (slow on large databases).
+    top_species_live(&conn, limit)
+}
+
+/// Read species from the cached `species_stats` table.
+fn top_species_from_cache(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
+         FROM species_stats \
+         ORDER BY detection_count DESC LIMIT ?1",
+    )?;
+
+    let rows = stmt.query_map(params![limit], |row| {
+        let count: u32 = row.get(3)?;
+        Ok(SpeciesSummary {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            domain: row.get(2)?,
+            detection_count: count,
+            display_count: round_count(count),
+            last_seen: row.get(4)?,
+            image_url: None,
+            conservation_status: None,
+            male_image_url: None,
+            female_image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Live COUNT(*) query — used as fallback when the cache is empty.
+fn top_species_live(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
@@ -415,16 +477,223 @@ pub fn top_species(
     )?;
 
     let rows = stmt.query_map(params![limit], |row| {
+        let count: u32 = row.get(3)?;
         Ok(SpeciesSummary {
             scientific_name: row.get(0)?,
             common_name: row.get(1)?,
             domain: row.get(2)?,
-            detection_count: row.get(3)?,
+            detection_count: count,
+            display_count: round_count(count),
             last_seen: row.get(4)?,
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Round a detection count for display:
+///   - 0–100: exact
+///   - 101–1000: round to nearest 10
+///   - 1001+: round to nearest 100
+///
+/// Returns a display string like `"42"`, `"~230"`, `"~4,200"`.
+pub fn round_count(n: u32) -> String {
+    if n <= 100 {
+        format_with_commas(n)
+    } else if n <= 1000 {
+        let rounded = ((n + 5) / 10) * 10;
+        format!("~{}", format_with_commas(rounded))
+    } else {
+        let rounded = ((n + 50) / 100) * 100;
+        format!("~{}", format_with_commas(rounded))
+    }
+}
+
+/// Format an integer with comma separators (e.g. 1234 → "1,234").
+fn format_with_commas(n: u32) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Refresh the `species_stats` cache table.
+///
+/// This does a full recount from the `detections` table.  Designed to be
+/// called once at startup and then nightly.
+pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+
+    // Ensure the table exists (in case this runs before ensure_gaia_schema).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS species_stats (
+            Sci_Name       VARCHAR(100) NOT NULL,
+            Com_Name       VARCHAR(100) NOT NULL,
+            Domain         VARCHAR(50)  NOT NULL DEFAULT 'birds',
+            detection_count INTEGER     NOT NULL DEFAULT 0,
+            last_seen      TEXT,
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (Sci_Name, Domain)
+        );",
+    )?;
+
+    conn.execute_batch(
+        "DELETE FROM species_stats;
+         INSERT INTO species_stats (Sci_Name, Com_Name, Domain, detection_count, last_seen)
+         SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*), MAX(d.Date || ' ' || d.Time)
+         FROM detections d
+         WHERE COALESCE(d.Excluded, 0) = 0
+            OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)
+         GROUP BY d.Sci_Name, d.Domain;",
+    )?;
+
+    // ── Refresh top recordings per species ───────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS species_top_recordings (
+            Sci_Name       VARCHAR(100) NOT NULL,
+            Com_Name       VARCHAR(100) NOT NULL,
+            Date           DATE         NOT NULL,
+            Time           TIME         NOT NULL,
+            Confidence     FLOAT        NOT NULL,
+            File_Name      VARCHAR(100) NOT NULL,
+            Source_Node    VARCHAR(200) NOT NULL DEFAULT '',
+            Model_Name     VARCHAR(200) NOT NULL DEFAULT '',
+            rank           INTEGER      NOT NULL DEFAULT 0,
+            PRIMARY KEY (Sci_Name, rank)
+        );",
+    )?;
+
+    // Keep the 10 highest-confidence recordings per species.
+    conn.execute_batch("DELETE FROM species_top_recordings;")?;
+    conn.execute_batch(
+        "INSERT INTO species_top_recordings
+            (Sci_Name, Com_Name, Date, Time, Confidence, File_Name, Source_Node, Model_Name, rank)
+         SELECT Sci_Name, Com_Name, Date, Time, Confidence, File_Name,
+                COALESCE(Source_Node, ''), COALESCE(Model_Name, ''), rn
+         FROM (
+             SELECT d.Sci_Name, d.Com_Name, d.Date, d.Time, d.Confidence,
+                    d.File_Name, d.Source_Node, d.Model_Name,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.Sci_Name
+                        ORDER BY d.Confidence DESC, d.Date DESC, d.Time DESC
+                    ) AS rn
+             FROM detections d
+             WHERE COALESCE(d.Excluded, 0) = 0
+               AND d.File_Name != ''
+               AND d.Confidence >= 0.5
+         ) ranked
+         WHERE rn <= 10;",
+    )?;
+
+    Ok(())
+}
+
+/// Fetch the top recordings for a species from the cache table.
+///
+/// Returns up to `limit` recordings sorted by confidence descending.
+/// Falls back to a live query if the cache table is empty or missing.
+pub fn get_top_recordings(
+    db_path: &Path,
+    scientific_name: &str,
+    limit: u32,
+) -> Result<Vec<TopRecording>, rusqlite::Error> {
+    let conn = open(db_path)?;
+
+    // Try the cached table first.
+    let has_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='species_top_recordings'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if has_table {
+        let has_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM species_top_recordings WHERE Sci_Name = ?1",
+                params![scientific_name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        if has_rows > 0 {
+            return get_top_recordings_cached(&conn, scientific_name, limit);
+        }
+    }
+
+    // Fallback: live query.
+    get_top_recordings_live(&conn, scientific_name, limit)
+}
+
+fn get_top_recordings_cached(
+    conn: &Connection,
+    scientific_name: &str,
+    limit: u32,
+) -> Result<Vec<TopRecording>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT Sci_Name, Com_Name, Date, Time, Confidence, File_Name, \
+         Source_Node, Model_Name \
+         FROM species_top_recordings \
+         WHERE Sci_Name = ?1 \
+         ORDER BY Confidence DESC, Date DESC, Time DESC \
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![scientific_name, limit], |row| {
+        Ok(TopRecording {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            date: row.get(2)?,
+            time: row.get(3)?,
+            confidence: row.get(4)?,
+            file_name: row.get(5)?,
+            source_node: row.get(6)?,
+            model_name: row.get(7)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
+fn get_top_recordings_live(
+    conn: &Connection,
+    scientific_name: &str,
+    limit: u32,
+) -> Result<Vec<TopRecording>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT d.Sci_Name, d.Com_Name, d.Date, d.Time, d.Confidence, d.File_Name, \
+         COALESCE(d.Source_Node, ''), COALESCE(d.Model_Name, '') \
+         FROM detections d \
+         WHERE d.Sci_Name = ?1 \
+           AND COALESCE(d.Excluded, 0) = 0 \
+           AND d.File_Name != '' \
+           AND d.Confidence >= 0.5 \
+         ORDER BY d.Confidence DESC, d.Date DESC, d.Time DESC \
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![scientific_name, limit], |row| {
+        Ok(TopRecording {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            date: row.get(2)?,
+            time: row.get(3)?,
+            confidence: row.get(4)?,
+            file_name: row.get(5)?,
+            source_node: row.get(6)?,
+            model_name: row.get(7)?,
         })
     })?;
 
@@ -702,7 +971,7 @@ pub fn remove_species_verification(
 /// Select 4 random quiz-worthy detections (one per species).
 ///
 /// A detection qualifies when:
-///   * confidence ≥ 0.85
+///   * confidence ≥ 0.75
 ///   * not excluded
 ///   * has an extracted audio file
 ///   * every detection for that same `File_Name` shares the same `Sci_Name`
@@ -715,9 +984,14 @@ pub fn quiz_candidates(
 ) -> Result<Vec<QuizItem>, rusqlite::Error> {
     let conn = open(db_path)?;
 
-    // Step 1: find File_Names that have exactly one distinct species and
-    //         at least one row with confidence ≥ 0.85 and Excluded = 0.
-    let date_filter = if today_only {
+    // Use separate date filters: the CTE has no table alias while the
+    // outer query uses `d`.
+    let cte_date_filter = if today_only {
+        "AND Date = DATE('now')"
+    } else {
+        ""
+    };
+    let outer_date_filter = if today_only {
         "AND d.Date = DATE('now')"
     } else {
         ""
@@ -729,18 +1003,18 @@ pub fn quiz_candidates(
              FROM detections
              WHERE File_Name != ''
                AND COALESCE(Excluded, 0) = 0
-               {date_filter}
+               {cte_date_filter}
              GROUP BY File_Name
              HAVING COUNT(DISTINCT Sci_Name) = 1
-                AND MAX(Confidence) >= 0.85
+                AND MAX(Confidence) >= 0.75
          )
          SELECT d.Sci_Name, d.Com_Name, d.Date, d.File_Name, d.Confidence
          FROM detections d
          INNER JOIN clean_files cf ON d.File_Name = cf.File_Name
-         WHERE d.Confidence >= 0.85
+         WHERE d.Confidence >= 0.75
            AND COALESCE(d.Excluded, 0) = 0
            AND d.File_Name != ''
-           {date_filter}
+           {outer_date_filter}
          ORDER BY RANDOM()"
     );
 

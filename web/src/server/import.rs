@@ -853,6 +853,53 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
         "ALTER TABLE detections ADD COLUMN Model_Name VARCHAR(200) NOT NULL DEFAULT '';",
     );
 
+    // ── Species stats cache table ────────────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS species_stats (
+            Sci_Name       VARCHAR(100) NOT NULL,
+            Com_Name       VARCHAR(100) NOT NULL,
+            Domain         VARCHAR(50)  NOT NULL DEFAULT 'birds',
+            detection_count INTEGER     NOT NULL DEFAULT 0,
+            last_seen      TEXT,
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (Sci_Name, Domain)
+        );",
+    )
+    .map_err(|e| format!("species_stats table error: {e}"))?;
+
+    // Populate the cache if it's empty (first run or after table creation).
+    let stats_empty: bool = conn
+        .query_row("SELECT COUNT(*) FROM species_stats", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        == 0;
+    if stats_empty {
+        let _ = conn.execute_batch(
+            "INSERT OR REPLACE INTO species_stats (Sci_Name, Com_Name, Domain, detection_count, last_seen)
+             SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*), MAX(d.Date || ' ' || d.Time)
+             FROM detections d
+             WHERE COALESCE(d.Excluded, 0) = 0
+                OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)
+             GROUP BY d.Sci_Name, d.Domain;",
+        );
+    }
+
+    // ── Top recordings per species ───────────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS species_top_recordings (
+            Sci_Name       VARCHAR(100) NOT NULL,
+            Com_Name       VARCHAR(100) NOT NULL,
+            Date           DATE         NOT NULL,
+            Time           TIME         NOT NULL,
+            Confidence     FLOAT        NOT NULL,
+            File_Name      VARCHAR(100) NOT NULL,
+            Source_Node    VARCHAR(200) NOT NULL DEFAULT '',
+            Model_Name     VARCHAR(200) NOT NULL DEFAULT '',
+            rank           INTEGER      NOT NULL DEFAULT 0,
+            PRIMARY KEY (Sci_Name, rank)
+        );",
+    )
+    .map_err(|e| format!("species_top_recordings table error: {e}"))?;
+
     Ok(())
 }
 

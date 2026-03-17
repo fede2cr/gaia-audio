@@ -172,6 +172,43 @@ pub struct SpeciesHourlyCounts {
     pub hours: Vec<HourlyCount>,
 }
 
+// ─── Top recordings (cached per species) ─────────────────────────────────────
+
+/// A high-confidence recording cached in `species_top_recordings`.
+///
+/// Displayed on the species detail page so users can listen to the best
+/// examples without running an expensive live query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopRecording {
+    pub scientific_name: String,
+    pub common_name: String,
+    pub date: String,
+    pub time: String,
+    pub confidence: f64,
+    pub file_name: String,
+    pub source_node: String,
+    pub model_name: String,
+}
+
+impl TopRecording {
+    /// URL to the extracted audio clip.
+    pub fn clip_url(&self) -> Option<String> {
+        if self.file_name.is_empty() {
+            return None;
+        }
+        let safe_name = self.common_name.replace('\'', "").replace(' ', "_");
+        Some(format!(
+            "/extracted/By_Date/{}/{}/{}",
+            self.date, safe_name, self.file_name
+        ))
+    }
+
+    /// URL to the spectrogram PNG.
+    pub fn spectrogram_url(&self) -> Option<String> {
+        self.clip_url().map(|url| format!("{url}.png"))
+    }
+}
+
 /// All detections for a single species within one day, grouped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DayDetectionGroup {
@@ -325,6 +362,9 @@ pub struct SpeciesSummary {
     pub common_name: String,
     pub domain: String,
     pub detection_count: u32,
+    /// Human-friendly count for display (e.g. `"~230"`, `"42"`).
+    #[serde(default)]
+    pub display_count: String,
     pub last_seen: Option<String>,
     pub image_url: Option<String>,
     /// IUCN conservation status (populated from iNaturalist).
