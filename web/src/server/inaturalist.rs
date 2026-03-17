@@ -1,7 +1,9 @@
 //! iNaturalist API client with an in-memory cache.
 //!
-//! Uses the public `v1/taxa` endpoint to look up species photos and Wikipedia
-//! links by scientific name.
+//! Uses the public `v1/taxa` endpoint to look up species photos, Wikipedia
+//! links, and conservation status by scientific name.  Also fetches
+//! sex-annotated observation photos (male / female) from the
+//! `v1/observations` endpoint so both sexes can be shown on species cards.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -67,11 +69,83 @@ async fn fetch_from_inaturalist(scientific_name: &str) -> Option<SpeciesPhoto> {
         .and_then(|w| w.as_str())
         .map(String::from);
 
+    // Parse conservation status from the iNaturalist response.
+    // The `conservation_status` object has an `iucn` field with the numeric
+    // IUCN code, and/or a `status` field with a short string like "VU".
+    let conservation_status = result
+        .get("conservation_status")
+        .and_then(|cs| {
+            // Try numeric `iucn` field first (most reliable).
+            cs.get("iucn")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| crate::model::ConservationStatus::from_iucn(n as u8))
+                // Fall back to the short string `status` field.
+                .or_else(|| {
+                    cs.get("status")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::model::ConservationStatus::from_code)
+                })
+        });
+
+    // Fetch male and female observation photos.
+    // iNaturalist annotation term_id 9 = "Sex", value 10 = Female, 11 = Male.
+    let (male_image_url, female_image_url) =
+        fetch_sex_photos(scientific_name).await;
+
     Some(SpeciesPhoto {
         medium_url,
         attribution,
         wikipedia_url,
+        conservation_status,
+        male_image_url,
+        female_image_url,
     })
+}
+
+// ─── Sex-annotated observation photos ────────────────────────────────────────
+
+/// iNaturalist annotation term IDs.
+const SEX_TERM_ID: u8 = 9;
+const SEX_MALE_VALUE: u8 = 11;
+const SEX_FEMALE_VALUE: u8 = 10;
+
+/// Fetch a single observation photo annotated with the given sex value.
+///
+/// Queries Research Grade observations sorted by votes (most agreed-upon
+/// annotation first) and returns the medium-size photo URL of the first
+/// result that has one.
+async fn fetch_sex_photo(scientific_name: &str, term_value_id: u8) -> Option<String> {
+    let url = format!(
+        "https://api.inaturalist.org/v1/observations?\
+         taxon_name={name}&term_id={tid}&term_value_id={vid}\
+         &quality_grade=research&photos=true&per_page=1\
+         &order_by=votes",
+        name = urlencoded(scientific_name),
+        tid = SEX_TERM_ID,
+        vid = term_value_id,
+    );
+
+    let resp = reqwest::get(&url).await.ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+
+    let obs = body.get("results")?.as_array()?.first()?;
+    let photo = obs.get("photos")?.as_array()?.first()?;
+
+    // The `url` field on observation photos is the square thumbnail;
+    // replace "square" with "medium" for a higher-res image.
+    let photo_url = photo.get("url")?.as_str()?;
+    Some(photo_url.replace("/square.", "/medium."))
+}
+
+/// Fetch both male and female photos concurrently.
+///
+/// Returns `(male_url, female_url)`.  Either or both may be `None`.
+async fn fetch_sex_photos(scientific_name: &str) -> (Option<String>, Option<String>) {
+    let (male, female) = tokio::join!(
+        fetch_sex_photo(scientific_name, SEX_MALE_VALUE),
+        fetch_sex_photo(scientific_name, SEX_FEMALE_VALUE),
+    );
+    (male, female)
 }
 
 /// Minimal URL-encoding for the query parameter.

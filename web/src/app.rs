@@ -15,6 +15,7 @@ use crate::pages::{
     excluded::ExcludedPage,
     home::Home,
     import::ImportPage,
+    learning::LearningPage,
     settings::SettingsPage,
     species::SpeciesPage,
     species_list::SpeciesListPage,
@@ -75,6 +76,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("species") view=SpeciesListPage/>
                     <Route path=(StaticSegment("species"), ParamSegment("name")) view=SpeciesPage/>
                     <Route path=StaticSegment("excluded") view=ExcludedPage/>
+                    <Route path=StaticSegment("learning") view=LearningPage/>
                     <Route path=StaticSegment("import") view=ImportPage/>
                     <Route path=StaticSegment("settings") view=SettingsPage/>
                 </FlatRoutes>

@@ -475,8 +475,107 @@ button {
 .species-card-body { padding: .6rem .75rem; }
 .species-common    { font-size: .95rem; font-weight: 600; margin: 0; }
 .species-sci       { font-size: .78rem; color: var(--text-muted); font-style: italic; margin: .15rem 0 .3rem; }
-.species-stats     { display: flex; gap: .4rem; align-items: center; font-size: .78rem; }
+.species-stats     { display: flex; gap: .4rem; align-items: center; font-size: .78rem; flex-wrap: wrap; }
 .detection-count   { color: var(--text-muted); }
+
+/* ── Sort bar ───────────────────────────────────────────────────────────── */
+
+.sort-bar {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+.sort-label {
+    font-size: .85rem;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+.sort-btn {
+    padding: .3rem .75rem;
+    border: 1px solid rgba(78,205,196,.2);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    color: var(--text-muted);
+    font-size: .8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .2s, color .2s, border-color .2s;
+}
+.sort-btn:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+.sort-btn.active {
+    background: rgba(78,205,196,.15);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+/* ── Conservation status badges ─────────────────────────────────────────── */
+
+.conservation-badge {
+    padding: .1rem .4rem;
+    border-radius: 4px;
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    white-space: nowrap;
+    cursor: help;
+}
+.status-extinct         { background: rgba(120,  40,  40,.2);  color: #c0392b; }
+.status-critical        { background: rgba(192,  57,  43,.18); color: #e74c3c; }
+.status-endangered      { background: rgba(211, 84,   0,.15);  color: #e67e22; }
+.status-vulnerable      { background: rgba(243,156,  18,.12); color: #f1c40f; }
+.status-near-threatened { background: rgba(241,196,  15,.10); color: #d4ac0d; }
+.status-least-concern   { background: rgba(46, 204, 113,.12); color: #2ecc71; }
+.status-unknown         { background: rgba(149,165, 166,.12); color: #95a5a6; }
+
+/* ── Male / Female split image ──────────────────────────────────────────── */
+
+.species-img-wrap.sex-split {
+    display: flex;
+    padding-top: 0; /* override the padding-top aspect ratio trick */
+    position: relative;
+    background: var(--bg-elevated);
+}
+.sex-half {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    /* 4:3 aspect ratio per half → 2:3 combined card width */
+    padding-top: 75%;
+}
+.sex-half .species-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.sex-label {
+    position: absolute;
+    bottom: .25rem;
+    font-size: .75rem;
+    font-weight: 700;
+    padding: .05rem .35rem;
+    border-radius: 3px;
+    line-height: 1;
+    pointer-events: none;
+}
+.sex-label.male {
+    left: .25rem;
+    background: rgba(52,152,219,.7);
+    color: #fff;
+}
+.sex-label.female {
+    right: .25rem;
+    background: rgba(231,76,60,.7);
+    color: #fff;
+}
 
 /* ── Calendar ───────────────────────────────────────────────────────────── */
 
@@ -1491,4 +1590,178 @@ button {
     text-align: center;
     padding: 3rem;
     color: var(--text-muted);
+}
+
+/* ─── Learning / Quiz ─────────────────────────────────────────────────── */
+
+.learning-page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 1.5rem;
+}
+.learning-page h1 {
+    margin-bottom: 0.25rem;
+}
+.learning-page .page-description {
+    color: var(--text-muted);
+    margin-bottom: 1.5rem;
+}
+
+/* Mode buttons */
+.quiz-mode-selector {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+}
+.btn-mode {
+    padding: 0.6rem 1.4rem;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 1rem;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.btn-mode:hover {
+    border-color: var(--accent);
+}
+.btn-mode.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+
+/* Question cards */
+.quiz-questions {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    margin-bottom: 1.5rem;
+}
+.quiz-card {
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    background: var(--surface);
+    transition: border-color 0.3s;
+}
+.quiz-card.quiz-correct {
+    border-color: #3a3;
+    background: rgba(50, 180, 50, 0.06);
+}
+.quiz-card.quiz-wrong {
+    border-color: #c44;
+    background: rgba(200, 60, 60, 0.06);
+}
+.quiz-card-header {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+
+.quiz-spectrogram {
+    margin-bottom: 0.5rem;
+}
+.quiz-spectrogram .spectrogram-img {
+    width: 100%;
+    max-height: 120px;
+    object-fit: contain;
+    border-radius: 6px;
+    background: #111;
+}
+
+.quiz-audio {
+    margin-bottom: 0.75rem;
+}
+.quiz-audio audio {
+    width: 100%;
+    height: 36px;
+}
+
+.quiz-answer {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+.quiz-answer label {
+    font-weight: 500;
+    white-space: nowrap;
+}
+.quiz-answer select {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.95rem;
+}
+
+/* Reveal panel */
+.quiz-reveal {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+}
+.quiz-species-photo {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+.quiz-correct-answer strong {
+    display: block;
+    font-size: 1rem;
+}
+.quiz-correct-answer em {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+/* Actions bar */
+.quiz-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+.btn-evaluate,
+.btn-retry {
+    padding: 0.55rem 1.6rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: opacity 0.15s;
+}
+.btn-evaluate {
+    background: var(--accent);
+    color: #fff;
+}
+.btn-evaluate:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.btn-retry {
+    background: var(--surface);
+    border: 2px solid var(--border);
+    color: var(--text);
+}
+.btn-retry:hover {
+    border-color: var(--accent);
+}
+
+.quiz-result {
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+.quiz-result .score {
+    margin-right: 0.4rem;
 }

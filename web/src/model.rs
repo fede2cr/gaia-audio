@@ -183,6 +183,120 @@ pub struct DayDetectionGroup {
     pub max_confidence: f64,
 }
 
+// ─── Conservation status ─────────────────────────────────────────────────────
+
+/// IUCN Red List conservation status codes, ordered from most to least
+/// threatened.  The numeric values match the iNaturalist `iucn` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConservationStatus {
+    /// Extinct
+    EX = 70,
+    /// Extinct in the Wild
+    EW = 60,
+    /// Critically Endangered
+    CR = 50,
+    /// Endangered
+    EN = 40,
+    /// Vulnerable
+    VU = 30,
+    /// Near Threatened
+    NT = 20,
+    /// Least Concern
+    LC = 10,
+    /// Data Deficient
+    DD = 5,
+    /// Not Evaluated
+    NE = 0,
+}
+
+impl ConservationStatus {
+    /// Parse from the iNaturalist numeric `iucn` field.
+    pub fn from_iucn(code: u8) -> Option<Self> {
+        match code {
+            70 => Some(Self::EX),
+            60 => Some(Self::EW),
+            50 => Some(Self::CR),
+            40 => Some(Self::EN),
+            30 => Some(Self::VU),
+            20 => Some(Self::NT),
+            10 => Some(Self::LC),
+            5  => Some(Self::DD),
+            0  => Some(Self::NE),
+            _  => None,
+        }
+    }
+
+    /// Parse from a short IUCN code string (e.g. `"VU"`, `"EN"`).
+    pub fn from_code(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "EX" => Some(Self::EX),
+            "EW" => Some(Self::EW),
+            "CR" => Some(Self::CR),
+            "EN" => Some(Self::EN),
+            "VU" => Some(Self::VU),
+            "NT" => Some(Self::NT),
+            "LC" => Some(Self::LC),
+            "DD" => Some(Self::DD),
+            "NE" => Some(Self::NE),
+            _    => None,
+        }
+    }
+
+    /// Short IUCN code (e.g. `"CR"`, `"LC"`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::EX => "EX",
+            Self::EW => "EW",
+            Self::CR => "CR",
+            Self::EN => "EN",
+            Self::VU => "VU",
+            Self::NT => "NT",
+            Self::LC => "LC",
+            Self::DD => "DD",
+            Self::NE => "NE",
+        }
+    }
+
+    /// Human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EX => "Extinct",
+            Self::EW => "Extinct in the Wild",
+            Self::CR => "Critically Endangered",
+            Self::EN => "Endangered",
+            Self::VU => "Vulnerable",
+            Self::NT => "Near Threatened",
+            Self::LC => "Least Concern",
+            Self::DD => "Data Deficient",
+            Self::NE => "Not Evaluated",
+        }
+    }
+
+    /// Numeric sort key — higher = more threatened.
+    pub fn threat_level(self) -> u8 {
+        self as u8
+    }
+
+    /// CSS modifier class for colour-coding the badge.
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::EX | Self::EW => "status-extinct",
+            Self::CR => "status-critical",
+            Self::EN => "status-endangered",
+            Self::VU => "status-vulnerable",
+            Self::NT => "status-near-threatened",
+            Self::LC => "status-least-concern",
+            Self::DD | Self::NE => "status-unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ConservationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.label(), self.code())
+    }
+}
+
 // ─── iNaturalist API response subset ─────────────────────────────────────────
 
 /// A cached photo record from iNaturalist.
@@ -191,6 +305,15 @@ pub struct SpeciesPhoto {
     pub medium_url: String,
     pub attribution: String,
     pub wikipedia_url: Option<String>,
+    /// IUCN conservation status (from iNaturalist `conservation_status`).
+    #[serde(default)]
+    pub conservation_status: Option<ConservationStatus>,
+    /// Male specimen photo URL (from sex-annotated observations).
+    #[serde(default)]
+    pub male_image_url: Option<String>,
+    /// Female specimen photo URL (from sex-annotated observations).
+    #[serde(default)]
+    pub female_image_url: Option<String>,
 }
 
 // ─── Species summary (for species list) ──────────────────────────────────────
@@ -204,6 +327,15 @@ pub struct SpeciesSummary {
     pub detection_count: u32,
     pub last_seen: Option<String>,
     pub image_url: Option<String>,
+    /// IUCN conservation status (populated from iNaturalist).
+    #[serde(default)]
+    pub conservation_status: Option<ConservationStatus>,
+    /// Male specimen photo URL (from iNaturalist sex-annotated observations).
+    #[serde(default)]
+    pub male_image_url: Option<String>,
+    /// Female specimen photo URL (from iNaturalist sex-annotated observations).
+    #[serde(default)]
+    pub female_image_url: Option<String>,
 }
 
 // ─── Import (BirdNET-Pi backup) ──────────────────────────────────────────────
@@ -337,4 +469,22 @@ pub struct DetectionSettings {
 
 fn default_colormap() -> String {
     "default".to_string()
+}
+
+// ─── Learning quiz ───────────────────────────────────────────────────────────
+
+/// A single quiz question: one audio clip the user must identify.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuizItem {
+    /// Scientific name (the correct answer).
+    pub scientific_name: String,
+    /// Common name (the correct answer).
+    pub common_name: String,
+    /// URL to the audio clip.
+    pub clip_url: String,
+    /// URL to the spectrogram PNG.
+    pub spectrogram_url: String,
+    /// Species photo from iNaturalist (if available).
+    #[serde(default)]
+    pub image_url: Option<String>,
 }

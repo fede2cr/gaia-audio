@@ -11,7 +11,7 @@ use std::path::Path;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration};
 use rusqlite::{params, Connection};
 
-use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection,
+use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, UrbanNoiseSummary, WebDetection,
                     HourlyCount, SpeciesHourlyCounts};
 
 // ─── Timezone helpers ────────────────────────────────────────────────────────
@@ -387,6 +387,9 @@ pub fn top_species_for_date(
             detection_count: row.get(3)?,
             last_seen: row.get(4)?,
             image_url: None,
+            conservation_status: None,
+            male_image_url: None,
+            female_image_url: None,
         })
     })?;
 
@@ -419,6 +422,9 @@ pub fn top_species(
             detection_count: row.get(3)?,
             last_seen: row.get(4)?,
             image_url: None,
+            conservation_status: None,
+            male_image_url: None,
+            female_image_url: None,
         })
     })?;
 
@@ -689,4 +695,91 @@ pub fn remove_species_verification(
         params![scientific_name],
     );
     Ok(())
+}
+
+// ─── Learning quiz ───────────────────────────────────────────────────────────
+
+/// Select 4 random quiz-worthy detections (one per species).
+///
+/// A detection qualifies when:
+///   * confidence ≥ 0.85
+///   * not excluded
+///   * has an extracted audio file
+///   * every detection for that same `File_Name` shares the same `Sci_Name`
+///     (i.e. the clip contains only one species)
+///
+/// When `today_only` is `true` only detections from today (UTC) are returned.
+pub fn quiz_candidates(
+    db_path: &Path,
+    today_only: bool,
+) -> Result<Vec<QuizItem>, rusqlite::Error> {
+    let conn = open(db_path)?;
+
+    // Step 1: find File_Names that have exactly one distinct species and
+    //         at least one row with confidence ≥ 0.85 and Excluded = 0.
+    let date_filter = if today_only {
+        "AND d.Date = DATE('now')"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        "WITH clean_files AS (
+             SELECT File_Name
+             FROM detections
+             WHERE File_Name != ''
+               AND COALESCE(Excluded, 0) = 0
+               {date_filter}
+             GROUP BY File_Name
+             HAVING COUNT(DISTINCT Sci_Name) = 1
+                AND MAX(Confidence) >= 0.85
+         )
+         SELECT d.Sci_Name, d.Com_Name, d.Date, d.File_Name, d.Confidence
+         FROM detections d
+         INNER JOIN clean_files cf ON d.File_Name = cf.File_Name
+         WHERE d.Confidence >= 0.85
+           AND COALESCE(d.Excluded, 0) = 0
+           AND d.File_Name != ''
+           {date_filter}
+         ORDER BY RANDOM()"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let sci_name: String = row.get(0)?;
+        let com_name: String = row.get(1)?;
+        let date: String = row.get(2)?;
+        let file_name: String = row.get(3)?;
+        Ok((sci_name, com_name, date, file_name))
+    })?;
+
+    // Pick one clip per species, up to 4 distinct species.
+    let mut seen_species = std::collections::HashSet::new();
+    let mut items = Vec::new();
+
+    for row in rows {
+        let (sci_name, com_name, date, file_name) = row?;
+        if seen_species.contains(&sci_name) {
+            continue;
+        }
+        seen_species.insert(sci_name.clone());
+
+        let safe_name = com_name.replace('\'', "").replace(' ', "_");
+        let clip_url = format!("/extracted/By_Date/{date}/{safe_name}/{file_name}");
+        let spectrogram_url = format!("{clip_url}.png");
+
+        items.push(QuizItem {
+            scientific_name: sci_name,
+            common_name: com_name,
+            clip_url,
+            spectrogram_url,
+            image_url: None,
+        });
+
+        if items.len() >= 4 {
+            break;
+        }
+    }
+
+    Ok(items)
 }
