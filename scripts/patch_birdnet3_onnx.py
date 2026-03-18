@@ -451,6 +451,234 @@ def _clear_residual_symbolic_dims(
     return count
 
 
+def propagate_constants(model: onnx.ModelProto) -> dict[str, "np.ndarray"]:
+    """Mini constant-propagation pass over the frozen graph.
+
+    After ``freeze_input_shapes`` + shape inference every tensor has a
+    concrete shape.  Many ops that *look* dynamic (Shape, Gather, Cast,
+    arithmetic) now have fully static inputs and can be evaluated at
+    patch time.
+
+    Returns a dict mapping tensor name → numpy array for every value
+    that could be resolved statically.
+    """
+    import numpy as np
+
+    graph = model.graph
+
+    known: dict[str, np.ndarray] = {}
+
+    # Seed with initializers.
+    for init in graph.initializer:
+        try:
+            known[init.name] = numpy_helper.to_array(init)
+        except Exception:
+            pass
+
+    # Seed with Constant node outputs.
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) == 1:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t is not None:
+                    try:
+                        known[node.output[0]] = numpy_helper.to_array(attr.t)
+                    except Exception:
+                        pass
+
+    # Build shape map from value_info / inputs / outputs.
+    shape_map: dict[str, list[int]] = {}
+    for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if not vi.type.HasField("tensor_type"):
+            continue
+        shape = vi.type.tensor_type.shape
+        dims = []
+        all_concrete = True
+        for d in shape.dim:
+            if d.dim_value > 0:
+                dims.append(int(d.dim_value))
+            else:
+                all_concrete = False
+                break
+        if all_concrete and dims:
+            shape_map[vi.name] = dims
+
+    # Multiple passes to resolve chains (Shape→Gather→Cast→Add→…).
+    for _pass in range(5):
+        progress = False
+        for node in graph.node:
+            # Skip if output already known.
+            if len(node.output) == 0:
+                continue
+            out_name = node.output[0]
+            if out_name in known:
+                continue
+
+            try:
+                result = _eval_node(node, known, shape_map)
+            except Exception:
+                result = None
+
+            if result is not None:
+                known[out_name] = result
+                progress = True
+
+        if not progress:
+            break
+
+    return known
+
+
+def _eval_node(
+    node: "onnx.NodeProto",
+    known: dict[str, "np.ndarray"],
+    shape_map: dict[str, list[int]],
+) -> "np.ndarray | None":
+    """Try to statically evaluate a single node."""
+    import numpy as np
+
+    op = node.op_type
+
+    def _inp(idx: int) -> "np.ndarray | None":
+        if idx < len(node.input) and node.input[idx] in known:
+            return known[node.input[idx]]
+        return None
+
+    if op == "Shape":
+        name = node.input[0] if len(node.input) > 0 else ""
+        if name in shape_map:
+            return np.array(shape_map[name], dtype=np.int64)
+        return None
+
+    if op == "Gather":
+        data = _inp(0)
+        indices = _inp(1)
+        if data is None or indices is None:
+            return None
+        axis = 0
+        for attr in node.attribute:
+            if attr.name == "axis":
+                axis = int(attr.i)
+        return np.take(data, indices, axis=axis)
+
+    if op == "Cast":
+        x = _inp(0)
+        if x is None:
+            return None
+        to = TensorProto.FLOAT
+        for attr in node.attribute:
+            if attr.name == "to":
+                to = int(attr.i)
+        dtype_map = {
+            TensorProto.FLOAT: np.float32,
+            TensorProto.DOUBLE: np.float64,
+            TensorProto.INT32: np.int32,
+            TensorProto.INT64: np.int64,
+            TensorProto.INT16: np.int16,
+            TensorProto.BOOL: np.bool_,
+        }
+        return x.astype(dtype_map.get(to, np.float32))
+
+    if op == "Unsqueeze":
+        x = _inp(0)
+        axes = _inp(1)
+        if x is None:
+            return None
+        if axes is not None:
+            for ax in sorted(axes.flatten()):
+                x = np.expand_dims(x, axis=int(ax))
+            return x
+        # axes from attribute (opset < 13)
+        for attr in node.attribute:
+            if attr.name == "axes":
+                for ax in sorted(attr.ints):
+                    x = np.expand_dims(x, axis=int(ax))
+                return x
+        return None
+
+    if op == "Squeeze":
+        x = _inp(0)
+        if x is None:
+            return None
+        axes = _inp(1)
+        if axes is not None:
+            for ax in sorted(axes.flatten(), reverse=True):
+                x = np.squeeze(x, axis=int(ax))
+            return x
+        return np.squeeze(x)
+
+    if op == "Reshape":
+        x = _inp(0)
+        shape = _inp(1)
+        if x is None or shape is None:
+            return None
+        return x.reshape(shape.flatten().astype(int).tolist())
+
+    if op in ("Add", "Sub", "Mul", "Div"):
+        a, b = _inp(0), _inp(1)
+        if a is None or b is None:
+            return None
+        ops = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}
+        return ops[op](a, b)
+
+    if op == "Floor":
+        x = _inp(0)
+        return np.floor(x) if x is not None else None
+
+    if op == "Ceil":
+        x = _inp(0)
+        return np.ceil(x) if x is not None else None
+
+    if op == "Concat":
+        axis = 0
+        for attr in node.attribute:
+            if attr.name == "axis":
+                axis = int(attr.i)
+        parts = [_inp(i) for i in range(len(node.input))]
+        if any(p is None for p in parts):
+            return None
+        return np.concatenate(parts, axis=axis)
+
+    if op == "Range":
+        start, limit, delta = _inp(0), _inp(1), _inp(2)
+        if start is None or limit is None or delta is None:
+            return None
+        return np.arange(
+            start.flat[0], limit.flat[0], delta.flat[0],
+            dtype=type(start.flat[0]) if isinstance(start.flat[0], (np.integer,)) else np.float32,
+        )
+
+    if op == "ConstantOfShape":
+        shape = _inp(0)
+        if shape is None:
+            return None
+        val = np.float32(0)
+        for attr in node.attribute:
+            if attr.name == "value" and attr.t is not None:
+                val = numpy_helper.to_array(attr.t).flat[0]
+        return np.full(shape.flatten().astype(int).tolist(), val)
+
+    if op == "Slice":
+        data = _inp(0)
+        starts = _inp(1)
+        ends = _inp(2)
+        if data is None or starts is None or ends is None:
+            return None
+        axes = _inp(3)
+        steps = _inp(4)
+        # Simple single-axis case
+        ndim = data.ndim
+        slices = [slice(None)] * ndim
+        ax_list = axes.flatten().tolist() if axes is not None else list(range(len(starts.flatten())))
+        st_list = starts.flatten().tolist()
+        en_list = ends.flatten().tolist()
+        sp_list = steps.flatten().tolist() if steps is not None else [1] * len(ax_list)
+        for a, s, e, p in zip(ax_list, st_list, en_list, sp_list):
+            slices[int(a)] = slice(int(s), int(e), int(p))
+        return data[tuple(slices)]
+
+    return None
+
+
 def fix_range_scalar_inputs(model: onnx.ModelProto) -> int:
     """Ensure all Range node inputs are true scalars (shape ``[]``).
 
@@ -581,19 +809,26 @@ def fix_range_scalar_inputs(model: onnx.ModelProto) -> int:
     return fixed
 
 
-def fold_static_range_nodes(model: onnx.ModelProto) -> int:
+def fold_static_range_nodes(model: onnx.ModelProto, known: dict[str, "np.ndarray"] | None = None) -> int:
     """Constant-fold Range nodes whose inputs are all static.
 
     tract-onnx fails on ``Range`` nodes that produce I64 tensors:
 
         ``TDim == outputs[0].datum_type: Impossible to unify TDim with I64``
 
-    After ``freeze_input_shapes`` + shape inference, most Range inputs
-    become constant (initializers or Constant-node outputs).  When all
-    three inputs (start, limit, delta) are known, we precompute the
-    output tensor and replace the Range node with a Constant.
+    After ``freeze_input_shapes`` + ``propagate_constants``, most Range
+    inputs have been resolved to concrete values.  When all three inputs
+    (start, limit, delta) are known, we precompute the output tensor and
+    replace the Range node with a Constant.
 
-    This eliminates the Range op entirely, bypassing the tract limitation.
+    Parameters
+    ----------
+    model : onnx.ModelProto
+        The model to patch in-place.
+    known : dict, optional
+        Pre-computed constant values from ``propagate_constants``.
+        If ``None``, only initializers and Constant-node outputs are
+        checked (less coverage).
 
     Returns the number of Range nodes folded.
     """
@@ -601,31 +836,34 @@ def fold_static_range_nodes(model: onnx.ModelProto) -> int:
 
     graph = model.graph
 
-    # Build lookup tables for static scalar values.
-    init_values: dict[str, np.ndarray] = {}
-    for init in graph.initializer:
-        try:
-            init_values[init.name] = numpy_helper.to_array(init)
-        except Exception:
-            pass
+    if known is None:
+        known = {}
 
-    const_values: dict[str, np.ndarray] = {}
+    # Also include initializers and Constant-node values for completeness.
+    all_known: dict[str, np.ndarray] = dict(known)
+    for init in graph.initializer:
+        if init.name not in all_known:
+            try:
+                all_known[init.name] = numpy_helper.to_array(init)
+            except Exception:
+                pass
     for node in graph.node:
         if node.op_type == "Constant" and len(node.output) == 1:
-            for attr in node.attribute:
-                if attr.name == "value" and attr.t is not None:
-                    try:
-                        const_values[node.output[0]] = numpy_helper.to_array(attr.t)
-                    except Exception:
-                        pass
+            out = node.output[0]
+            if out not in all_known:
+                for attr in node.attribute:
+                    if attr.name == "value" and attr.t is not None:
+                        try:
+                            all_known[out] = numpy_helper.to_array(attr.t)
+                        except Exception:
+                            pass
 
     def _get_scalar(name: str):
         """Return a scalar value for a tensor name, or None."""
-        for src in (init_values, const_values):
-            if name in src:
-                arr = src[name]
-                if arr.size == 1:
-                    return arr.flat[0]
+        if name in all_known:
+            arr = all_known[name]
+            if arr.size == 1:
+                return arr.flat[0]
         return None
 
     nodes_to_remove: list[onnx.NodeProto] = []
@@ -740,7 +978,14 @@ def main() -> None:
     if range_fixed:
         print(f"Fixed {range_fixed} Range-node scalar input(s)")
 
-    range_folded = fold_static_range_nodes(model)
+    # Propagate constants through Shape/Gather/Cast/arithmetic chains
+    # so that Range inputs (often derived from shape computations) become
+    # known scalars.
+    print("Running constant propagation ...")
+    known = propagate_constants(model)
+    print(f"  Resolved {len(known)} static tensors")
+
+    range_folded = fold_static_range_nodes(model, known=known)
     if range_folded:
         print(f"Constant-folded {range_folded} Range node(s)")
 
