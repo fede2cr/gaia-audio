@@ -581,6 +581,110 @@ def fix_range_scalar_inputs(model: onnx.ModelProto) -> int:
     return fixed
 
 
+def fold_static_range_nodes(model: onnx.ModelProto) -> int:
+    """Constant-fold Range nodes whose inputs are all static.
+
+    tract-onnx fails on ``Range`` nodes that produce I64 tensors:
+
+        ``TDim == outputs[0].datum_type: Impossible to unify TDim with I64``
+
+    After ``freeze_input_shapes`` + shape inference, most Range inputs
+    become constant (initializers or Constant-node outputs).  When all
+    three inputs (start, limit, delta) are known, we precompute the
+    output tensor and replace the Range node with a Constant.
+
+    This eliminates the Range op entirely, bypassing the tract limitation.
+
+    Returns the number of Range nodes folded.
+    """
+    import numpy as np
+
+    graph = model.graph
+
+    # Build lookup tables for static scalar values.
+    init_values: dict[str, np.ndarray] = {}
+    for init in graph.initializer:
+        try:
+            init_values[init.name] = numpy_helper.to_array(init)
+        except Exception:
+            pass
+
+    const_values: dict[str, np.ndarray] = {}
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) == 1:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t is not None:
+                    try:
+                        const_values[node.output[0]] = numpy_helper.to_array(attr.t)
+                    except Exception:
+                        pass
+
+    def _get_scalar(name: str):
+        """Return a scalar value for a tensor name, or None."""
+        for src in (init_values, const_values):
+            if name in src:
+                arr = src[name]
+                if arr.size == 1:
+                    return arr.flat[0]
+        return None
+
+    nodes_to_remove: list[onnx.NodeProto] = []
+    nodes_to_add: list[onnx.NodeProto] = []
+    folded = 0
+
+    for node in list(graph.node):
+        if node.op_type != "Range":
+            continue
+        if len(node.input) < 3:
+            continue
+
+        start = _get_scalar(node.input[0])
+        limit = _get_scalar(node.input[1])
+        delta = _get_scalar(node.input[2])
+
+        if start is None or limit is None or delta is None:
+            print(
+                f"  WARNING: Range node '{node.name}' has non-static inputs "
+                f"(start={start}, limit={limit}, delta={delta}) — cannot fold"
+            )
+            continue
+
+        # Determine dtype from start (ONNX Range preserves input dtype).
+        if isinstance(start, (np.integer, int)):
+            dtype = np.int64
+        else:
+            dtype = np.float32
+
+        result = np.arange(start, limit, delta, dtype=dtype)
+        print(
+            f"  Folding Range '{node.name}': "
+            f"arange({start}, {limit}, {delta}) → Constant [{len(result)}] ({dtype.__name__})"
+        )
+
+        # Create a Constant node that produces the precomputed tensor.
+        out_name = node.output[0]
+        tensor = numpy_helper.from_array(result, name=out_name)
+        const_node = helper.make_node(
+            "Constant",
+            inputs=[],
+            outputs=[out_name],
+            name=f"{node.name}_folded",
+            value=tensor,
+        )
+
+        nodes_to_remove.append(node)
+        nodes_to_add.append(const_node)
+        folded += 1
+
+    # Remove old Range nodes and add new Constant nodes.
+    for n in nodes_to_remove:
+        graph.node.remove(n)
+    for n in nodes_to_add:
+        graph.node.append(n)
+
+    return folded
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Patch BirdNET+ V3.0 ONNX for tract-onnx")
     parser.add_argument("-o", "--output", required=True, help="Output path for patched ONNX model")
@@ -635,6 +739,10 @@ def main() -> None:
     range_fixed = fix_range_scalar_inputs(model)
     if range_fixed:
         print(f"Fixed {range_fixed} Range-node scalar input(s)")
+
+    range_folded = fold_static_range_nodes(model)
+    if range_folded:
+        print(f"Constant-folded {range_folded} Range node(s)")
 
     # Save
     print(f"Saving patched model to {args.output} ...")
