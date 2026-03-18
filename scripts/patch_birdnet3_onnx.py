@@ -121,8 +121,18 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
     and insert a ``Slice`` node after to truncate the frequency axis
     to ``floor(N/2)+1`` bins, matching what downstream nodes expect.
 
-    This must run **before** ``freeze_input_shapes`` so that shape
-    inference can propagate the correct concrete dimensions.
+    This function uses three strategies to determine the DFT length:
+
+      1. Read ``dft_length`` from a graph initializer.
+      2. Read ``dft_length`` from a Constant node output.
+      3. When ``dft_length`` is not provided as an input, infer from
+         the signal tensor's resolved shape at the DFT ``axis``
+         dimension (works after ``freeze_input_shapes`` has been run).
+
+    Call this function **both** before and after ``freeze_input_shapes``
+    to maximise coverage: the first pass handles nodes whose length is
+    statically known, and the second pass handles nodes whose signal
+    shapes become concrete only after shape inference.
 
     Returns the number of DFT nodes patched.
     """
@@ -132,6 +142,28 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
     nodes_to_add: list[onnx.NodeProto] = []
     inits_to_add: list[onnx.TensorProto] = []
     fixed = 0
+
+    # Build lookup: Constant-node output name → scalar int value.
+    const_values: dict[str, int] = {}
+    for cnode in graph.node:
+        if cnode.op_type == "Constant" and len(cnode.output) == 1:
+            for attr in cnode.attribute:
+                if attr.name == "value" and attr.t is not None:
+                    try:
+                        arr = numpy_helper.to_array(attr.t)
+                        const_values[cnode.output[0]] = int(arr.flat[0])
+                    except Exception:
+                        pass
+
+    # Build shape lookup from value_info, graph inputs, and graph outputs.
+    shape_map: dict[str, list[int | None]] = {}
+    for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if not vi.type.HasField("tensor_type"):
+            continue
+        dims: list[int | None] = []
+        for d in vi.type.tensor_type.shape.dim:
+            dims.append(int(d.dim_value) if d.dim_value > 0 else None)
+        shape_map[vi.name] = dims
 
     for node in list(graph.node):
         if node.op_type not in ("DFT", "STFT"):
@@ -147,11 +179,19 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
         if onesided_attr is None or onesided_attr.i != 1:
             continue
 
-        # Determine the signal length from the dft_length input
-        # (input index 1 for DFT, index 2 for STFT) or from
-        # value_info / initializers.
+        # ── Read the axis attribute (used for shape inference + Slice) ─
+        # ONNX DFT default axis varies by opset; BirdNET V3 uses axis 2
+        # (frequency axis in the STFT frame layout).
+        axis = 2
+        for attr in node.attribute:
+            if attr.name == "axis":
+                axis = int(attr.i)
+                break
+
+        # ── Determine the DFT length ──────────────────────────────────
         dft_length = None
 
+        # Strategy 1: dft_length input from graph initializers.
         # For DFT: input[1] is dft_length (optional)
         # For STFT: input[2] is frame_length (the per-frame DFT size)
         dft_len_idx = 1 if node.op_type == "DFT" else 2
@@ -164,17 +204,35 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
                     dft_length = int(arr.flat[0])
                     break
 
+        # Strategy 2: dft_length input from a Constant node output.
+        if dft_length is None and len(node.input) > dft_len_idx and node.input[dft_len_idx]:
+            dft_len_name = node.input[dft_len_idx]
+            if dft_len_name in const_values:
+                dft_length = const_values[dft_len_name]
+
+        # Strategy 3: no explicit dft_length input — the DFT operates on
+        # the full extent of the signal along `axis`.  Read the concrete
+        # dimension from value_info (available after freeze_input_shapes).
+        if dft_length is None:
+            signal_name = node.input[0]
+            if signal_name in shape_map:
+                dims = shape_map[signal_name]
+                ndim = len(dims)
+                resolved_axis = axis if axis >= 0 else ndim + axis
+                if 0 <= resolved_axis < ndim and dims[resolved_axis] is not None:
+                    dft_length = dims[resolved_axis]
+
         if dft_length is None:
             print(
                 f"  WARNING: cannot determine DFT length for {node.name} "
-                f"— skipping onesided patch"
+                f"— skipping onesided patch (will retry after shape freeze)"
             )
             continue
 
         onesided_bins = dft_length // 2 + 1
         print(
             f"  Patching {node.op_type} node '{node.name}': "
-            f"onesided=1 → onesided=0 + Slice(axis=2, end={onesided_bins})"
+            f"onesided=1 → onesided=0 + Slice(axis={axis}, end={onesided_bins})"
         )
 
         # 1. Set onesided = 0
@@ -185,7 +243,7 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
         full_output = f"{orig_output}_full_dft"
         node.output[0] = full_output
 
-        # Slice parameters: axis=2 (frequency axis), start=0, end=onesided_bins
+        # Slice parameters: start=0, end=onesided_bins on the DFT axis.
         # Using the ONNX Slice op (opset 10+): inputs = [data, starts, ends, axes]
         uid = f"_dft_slice_{node.name}"
 
@@ -205,12 +263,10 @@ def patch_onesided_dft_nodes(model: onnx.ModelProto) -> int:
         )
         inits_to_add.append(
             numpy_helper.from_array(
-                np.array([2], dtype=np.int64), name=axes_name
+                np.array([axis], dtype=np.int64), name=axes_name
             )
         )
 
-        # For STFT output shape is [batch, frames, freq_bins, 2]
-        # The frequency axis is axis 2 in both DFT and STFT outputs.
         slice_node = helper.make_node(
             "Slice",
             inputs=[full_output, starts_name, ends_name, axes_name],
@@ -562,6 +618,19 @@ def main() -> None:
 
     frozen = freeze_input_shapes(model)
     print(f"Froze {frozen} input dimension(s)")
+
+    # Second DFT pass — after freeze, signal shapes are concrete so
+    # nodes whose dft_length was not statically known can now be patched.
+    dft_fixed_2 = patch_onesided_dft_nodes(model)
+    if dft_fixed_2:
+        print(f"Second-pass: patched {dft_fixed_2} additional one-sided DFT node(s)")
+        # Re-run shape inference to propagate the corrected shapes.
+        try:
+            model_inferred = shape_inference.infer_shapes(model, check_type=True)
+            model.graph.CopyFrom(model_inferred.graph)
+            print("  Updated shape inference after second DFT pass")
+        except Exception as e:
+            print(f"  WARNING: post-DFT shape inference failed ({e})")
 
     range_fixed = fix_range_scalar_inputs(model)
     if range_fixed:
