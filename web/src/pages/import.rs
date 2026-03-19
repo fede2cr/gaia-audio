@@ -27,6 +27,8 @@ pub async fn discover_nodes() -> Result<Vec<BirdnetNode>, ServerFnError> {
 pub async fn import_from_node(
     address: String,
     port: u16,
+    username: String,
+    password: String,
 ) -> Result<ImportResult, ServerFnError> {
     use crate::server::import;
 
@@ -37,7 +39,7 @@ pub async fn import_from_node(
     let extracted_dir = state.extracted_dir.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        import::stream_import(&address, port, &db_path, &extracted_dir)
+        import::stream_import(&address, port, &db_path, &extracted_dir, &username, &password)
     })
     .await
     .map_err(|e| ServerFnError::new(format!("Task error: {e}")))?
@@ -146,6 +148,10 @@ pub fn ImportPage() -> impl IntoView {
     let (manual_addr, set_manual_addr) = signal("birdnet.local".to_string());
     let (manual_port, set_manual_port) = signal(80u16);
 
+    // Credentials (BirdNET-Pi default: user=birdnet, password empty)
+    let (auth_user, set_auth_user) = signal("birdnet".to_string());
+    let (auth_pass, set_auth_pass) = signal(String::new());
+
     // ── Legacy file-based import state ───────────────────────────────
     let (tar_path, set_tar_path) = signal(String::new());
     let (report, set_report) = signal::<Option<ImportReport>>(None);
@@ -181,8 +187,10 @@ pub fn ImportPage() -> impl IntoView {
         set_error_msg.set(None);
         set_import_result.set(None);
 
+        let user = auth_user.get();
+        let pass = auth_pass.get();
         leptos::task::spawn_local(async move {
-            match import_from_node(addr, port).await {
+            match import_from_node(addr, port, user, pass).await {
                 Ok(r) => set_import_result.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Import failed: {e}"))),
             }
@@ -333,6 +341,30 @@ pub fn ImportPage() -> impl IntoView {
                             "Import"
                         }}
                     </button>
+                </div>
+
+                // Credentials
+                <h3>"Credentials"</h3>
+                <p class="import-desc">
+                    "BirdNET-Pi default: username "
+                    <code>"birdnet"</code>
+                    " with an empty password."
+                </p>
+                <div class="import-input-row">
+                    <input
+                        type="text"
+                        class="import-input"
+                        placeholder="Username"
+                        prop:value=move || auth_user.get()
+                        on:input=move |ev| set_auth_user.set(event_target_value(&ev))
+                    />
+                    <input
+                        type="password"
+                        class="import-input"
+                        placeholder="Password (empty = default)"
+                        prop:value=move || auth_pass.get()
+                        on:input=move |ev| set_auth_pass.set(event_target_value(&ev))
+                    />
                 </div>
             </section>
             }.into_any()}

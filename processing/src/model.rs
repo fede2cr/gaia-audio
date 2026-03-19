@@ -492,13 +492,19 @@ impl LoadedModel {
     /// Matches BirdNET-Analyzer `flat_sigmoid`:
     ///   `1 / (1 + exp(-sensitivity * clip(x, -20, 20)))`
     /// where `sensitivity` = `cfg.SIGMOID_SENSITIVITY` (default 1.0).
+    ///
+    /// Scores ≤ 0.5 are clamped to 0: `sigmoid(0) = 0.5` is the
+    /// mathematical "no signal" baseline, so anything at or below it
+    /// carries no positive information and should not be treated as a
+    /// detection at any confidence threshold.
     fn scale_logits(&self, logits: &[f32]) -> Vec<f32> {
         let s = self.sensitivity as f32;
         logits
             .iter()
             .map(|&x| {
                 let clamped = x.clamp(-20.0, 20.0);
-                1.0 / (1.0 + (-s * clamped).exp())
+                let score = 1.0 / (1.0 + (-s * clamped).exp());
+                if score <= 0.5 { 0.0 } else { score }
             })
             .collect()
     }

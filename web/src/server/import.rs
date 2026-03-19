@@ -299,6 +299,8 @@ pub fn import_backup(
 /// Import observations by streaming the backup directly from a BirdNET-Pi node.
 ///
 /// 1. POSTs to `http://{address}:{port}/scripts/backup.php` via `curl`
+///    with both HTTP Basic Auth and form-body credentials (covers both
+///    Caddy-fronted and vanilla BirdNET-Pi setups).
 /// 2. Processes the tar response as a stream — audio clips and spectrograms
 ///    are extracted directly to `extracted_dir` without writing a temporary
 ///    archive.
@@ -311,6 +313,8 @@ pub fn stream_import(
     port: u16,
     gaia_db_path: &Path,
     extracted_dir: &Path,
+    username: &str,
+    password: &str,
 ) -> Result<ImportResult, String> {
     let url = format!("http://{}:{}/scripts/backup.php", address, port);
 
@@ -332,12 +336,46 @@ pub fn stream_import(
     let existing = get_existing_filenames(gaia_db_path)?;
 
     // ── Stream the tar from the BirdNET-Pi node via curl ─────────────
+    //
+    // Probe the endpoint first to get a clear HTTP status code on failure,
+    // then stream for real.  This avoids the confusing "curl exit 22" with
+    // no details that `-s -f` produces (silent mode swallows the body).
+    //
+    // BirdNET-Pi nodes behind Caddy require HTTP Basic Auth; vanilla
+    // installs check PHP form credentials.  We send both.
+    let basic_creds = format!("{username}:{password}");
+    let form_body = format!("user={username}&password={password}");
+
+    let probe = std::process::Command::new("curl")
+        .args([
+            "-sS",                          // silent but show errors
+            "-o", "/dev/null",              // discard body
+            "-w", "%{http_code}",           // print HTTP status
+            "-L",                           // follow redirects
+            "--max-time", "10",             // don't hang on slow nodes
+            "-u", &basic_creds,             // HTTP Basic Auth (Caddy)
+            "-d", &form_body,               // POST credentials (vanilla)
+            &url,
+        ])
+        .output()
+        .map_err(|e| format!("Cannot run curl probe (is curl installed?): {e}"))?;
+
+    let http_code = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    if !probe.status.success() || http_code.starts_with('4') || http_code.starts_with('5') {
+        let stderr_msg = String::from_utf8_lossy(&probe.stderr).trim().to_string();
+        return Err(format!(
+            "BirdNET-Pi returned HTTP {http_code} from {url}. {stderr_msg}\n\
+             Check that the node is running and /scripts/backup.php is accessible."
+        ));
+    }
+
     let mut child = std::process::Command::new("curl")
         .args([
-            "-s",                           // silent
+            "-sS",                          // silent but show errors
             "-f",                           // fail on HTTP errors
             "-L",                           // follow redirects
-            "-d", "user=birdnet&password=", // POST credentials (empty password — BirdNET-Pi default)
+            "-u", &basic_creds,             // HTTP Basic Auth (Caddy)
+            "-d", &form_body,               // POST credentials (vanilla BirdNET-Pi)
             &url,
         ])
         .stdout(std::process::Stdio::piped())
