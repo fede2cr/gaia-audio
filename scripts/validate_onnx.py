@@ -113,34 +113,106 @@ def validate(model_path: str, expected_shape: list[int]) -> None:
     num_classes = result.shape[-1]
     print(f"  Classes: {num_classes}")
 
-    # ── 5. tract-onnx compatibility: Reshape shape inputs ────────────
-    # tract-onnx rejects Reshape nodes whose shape input is computed
-    # by a subgraph rather than being a constant initializer.  Check
-    # this at build time so we catch it before runtime.
+    # ── 5. tract-onnx compatibility checks ─────────────────────────────
+    # tract-onnx is stricter than onnxruntime.  Catch incompatibilities
+    # at build time so they don't surface after publishing the container.
     try:
         import onnx
+        from onnx import numpy_helper
         model_onnx = onnx.load(model_path)
         graph = model_onnx.graph
-        const_names = {i.name for i in graph.initializer}
-        # Also count Constant op outputs as "constant".
-        for node in graph.node:
-            if node.op_type == "Constant":
-                for out in node.output:
-                    const_names.add(out)
+        tract_errors: list[str] = []
+
+        # ── 5a. Reshape shape inputs must be graph initializers ──────
+        # tract-onnx only recognises graph initializers as "constant".
+        # Constant-op outputs and compute-subgraph results are rejected
+        # with: "shape input is variable".
+        init_names = {i.name for i in graph.initializer}
         bad_reshapes = []
         for node in graph.node:
             if node.op_type == "Reshape" and len(node.input) >= 2:
-                if node.input[1] not in const_names:
+                if node.input[1] not in init_names:
                     bad_reshapes.append(
                         f"'{node.name}' (shape input: '{node.input[1]}')")
         if bad_reshapes:
-            raise RuntimeError(
-                f"Reshape node(s) with non-constant shape inputs "
+            tract_errors.append(
+                f"Reshape node(s) with non-initializer shape inputs "
                 f"(tract-onnx will reject these): "
                 + "; ".join(bad_reshapes))
-        print(f"  Reshape shapes: all constant ✓")
+        else:
+            print(f"  Reshape shapes: all initializers ✓")
+
+        # ── 5b. Reshape shape values must be valid integers ──────────
+        # Catch bogus float-valued shape tensors that would fail at
+        # runtime (e.g. [1.001953125, 188.5, 128.0]).
+        for node in graph.node:
+            if node.op_type == "Reshape" and len(node.input) >= 2:
+                shape_name = node.input[1]
+                for init in graph.initializer:
+                    if init.name == shape_name:
+                        arr = numpy_helper.to_array(init).flatten()
+                        for i, v in enumerate(arr):
+                            fv = float(v)
+                            if abs(fv - round(fv)) > 1e-6:
+                                tract_errors.append(
+                                    f"Reshape '{node.name}': shape "
+                                    f"element [{i}] = {fv} is not an "
+                                    f"integer (initializer '{shape_name}')")
+                        break
+
+        # ── 5c. Resize: no pytorch_half_pixel ────────────────────────
+        # tract-onnx does not support coordinate_transformation_mode =
+        # "pytorch_half_pixel".
+        for node in graph.node:
+            if node.op_type == "Resize":
+                for attr in node.attribute:
+                    if attr.name == "coordinate_transformation_mode":
+                        val = (attr.s.decode("utf-8")
+                               if isinstance(attr.s, bytes) else attr.s)
+                        if val == "pytorch_half_pixel":
+                            tract_errors.append(
+                                f"Resize node '{node.name}' uses "
+                                f"unsupported coordinate_transformation_mode "
+                                f"'pytorch_half_pixel'")
+
+        # ── 5d. DFT/STFT: no onesided=1 ─────────────────────────────
+        # tract's DFT shape analysis enforces input[2] == output[2],
+        # which fails for one-sided DFT (output = N/2+1).
+        for node in graph.node:
+            if node.op_type in ("DFT", "STFT"):
+                for attr in node.attribute:
+                    if attr.name == "onesided" and attr.i == 1:
+                        tract_errors.append(
+                            f"{node.op_type} node '{node.name}' has "
+                            f"onesided=1 (tract-onnx rejects this)")
+
+        # ── 5e. Residual symbolic dimensions ─────────────────────────
+        # tract-onnx cannot parse expressions like ((samples//512))+1.
+        # After patching, no dim_param should remain.
+        symbolic_dims = []
+        for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+            if not vi.type.HasField("tensor_type"):
+                continue
+            for d in vi.type.tensor_type.shape.dim:
+                if d.dim_param and d.dim_param not in ("batch_size", "N"):
+                    # Allow common benign symbolic names; reject
+                    # expressions (contain operators or //).
+                    if any(c in d.dim_param for c in ("//", "+", "*", "-")):
+                        symbolic_dims.append(
+                            f"'{vi.name}' dim='{d.dim_param}'")
+        if symbolic_dims:
+            # Only warn — some models legitimately use simple symbolic
+            # dims (e.g. "batch") that tract handles fine.
+            print(f"  WARNING: {len(symbolic_dims)} symbolic dimension(s) "
+                  f"with expressions: {'; '.join(symbolic_dims[:5])}")
+
+        if tract_errors:
+            raise RuntimeError(
+                f"{len(tract_errors)} tract-onnx compatibility issue(s):\n  "
+                + "\n  ".join(tract_errors))
+        print(f"  tract-onnx compatibility: all checks passed ✓")
     except ImportError:
-        print("  (onnx not installed, skipping Reshape check)")
+        print("  (onnx not installed, skipping tract compatibility checks)")
 
     print(f"  PASS ✓")
 

@@ -132,6 +132,119 @@ def convert(model_dir: str, output_name: str = "audio-model.onnx") -> str:
     return onnx_path
 
 
+def _promote_reshape_shapes_to_initializers(onnx_path: str, sample_input) -> None:
+    """Ensure every Reshape node's shape input is a graph initializer.
+
+    tract-onnx only recognises graph initializers as "constant" — Constant
+    op outputs and compute-subgraph results are rejected, even when they
+    are statically deterministic.
+
+    This function handles three cases:
+
+      1. Shape input is already an initializer → skip (OK).
+      2. Shape input is produced by a ``Constant`` op → extract the tensor
+         value and create an initializer.
+      3. Shape input is produced by a compute subgraph → run ORT inference
+         to capture the concrete value and create an initializer.
+
+    After processing, all Reshape nodes point to initializers.
+    """
+    import onnx
+    import onnxruntime as ort
+    from onnx import numpy_helper, helper
+    import numpy as np
+
+    model = onnx.load(onnx_path)
+    graph = model.graph
+
+    init_names = {i.name for i in graph.initializer}
+
+    # Build Constant-op value map.
+    const_values: dict[str, "np.ndarray"] = {}
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) == 1:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t is not None:
+                    try:
+                        const_values[node.output[0]] = numpy_helper.to_array(attr.t)
+                    except Exception:
+                        pass
+
+    # Collect Reshape shape inputs that need promotion.
+    # Map: original_shape_name → list of (node, input_index)
+    to_promote: dict[str, list[tuple]] = {}
+    for node in graph.node:
+        if node.op_type == "Reshape" and len(node.input) >= 2:
+            shape_inp = node.input[1]
+            if shape_inp and shape_inp not in init_names:
+                to_promote.setdefault(shape_inp, []).append((node, 1))
+
+    if not to_promote:
+        print("  All Reshape shape inputs are already initializers ✓")
+        return
+
+    print(f"  Promoting {len(to_promote)} Reshape shape input(s) to initializers …")
+    modified = False
+    counter = 0
+
+    # ── Case 2: Constant-op outputs ──────────────────────────────────
+    for shape_name in list(to_promote):
+        if shape_name in const_values:
+            val = const_values[shape_name].flatten().astype(np.int64)
+            new_name = f"_reshape_shape_promoted_{counter}"
+            counter += 1
+            tensor = numpy_helper.from_array(val, name=new_name)
+            graph.initializer.append(tensor)
+            init_names.add(new_name)
+            for node, idx in to_promote[shape_name]:
+                node.input[idx] = new_name
+            print(f"    Extracted Constant '{shape_name}' → "
+                  f"initializer '{new_name}' = {val.tolist()}")
+            del to_promote[shape_name]
+            modified = True
+
+    # ── Case 3: compute-subgraph outputs → capture via ORT ───────────
+    if to_promote:
+        # Add remaining shape inputs as temporary outputs.
+        orig_output_count = len(graph.output)
+        for shape_name in to_promote:
+            graph.output.append(
+                helper.make_tensor_value_info(
+                    shape_name, onnx.TensorProto.INT64, None
+                )
+            )
+        tmp_path = onnx_path + ".promote_tmp"
+        onnx.save(model, tmp_path)
+
+        try:
+            sess = ort.InferenceSession(tmp_path)
+            inp_name = sess.get_inputs()[0].name
+            for shape_name in list(to_promote):
+                val = sess.run([shape_name], {inp_name: sample_input})[0]
+                val = val.flatten().astype(np.int64)
+                new_name = f"_reshape_shape_promoted_{counter}"
+                counter += 1
+                tensor = numpy_helper.from_array(val, name=new_name)
+                graph.initializer.append(tensor)
+                init_names.add(new_name)
+                for node, idx in to_promote[shape_name]:
+                    node.input[idx] = new_name
+                print(f"    Captured '{shape_name}' via inference → "
+                      f"initializer '{new_name}' = {val.tolist()}")
+                modified = True
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        # Remove the temporary outputs we added.
+        while len(graph.output) > orig_output_count:
+            graph.output.pop()
+
+    if modified:
+        onnx.save(model, onnx_path)
+        print(f"  Promoted all Reshape shape inputs to initializers ✓")
+
+
 def _freeze_reshape_shape(onnx_path: str, reshape_node, shape_input_name: str,
                           sample_input) -> None:
     """Replace a Reshape node's dynamic shape input with a constant.
@@ -235,18 +348,22 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
                     name='kernel',
                     shape=(input_shape[-1], self.embeddings),
                 )
+                # Pre-build a Flatten layer to merge the last two dims.
+                # Using Flatten instead of tf.reshape avoids the dynamic
+                # Shape→Gather→Concat subgraph that tf2onnx emits for
+                # tf.reshape(x, [-1, N]) — tract-onnx rejects Reshape
+                # nodes whose shape input is not a constant initializer.
+                self._flatten = keras.layers.Flatten()
                 super().build(input_shape)
             def call(self, inputs):
                 import tensorflow as tf
                 # (batch, D, 1) * (D, E) → broadcast → (batch, D, E)
                 expanded = tf.expand_dims(inputs, axis=-1) * self.kernel
-                # Use -1 for the batch dim and the *static* product for the
-                # feature dim.  This lets Keras infer (None, D*E) and makes
-                # tf2onnx emit a constant shape [-1, D*E] in the ONNX
-                # Reshape node — required by tract which rejects variable
-                # shape inputs.
-                d = inputs.shape[-1]
-                return tf.reshape(expanded, [-1, d * self.embeddings])
+                # Flatten (batch, D, E) → (batch, D*E) without explicit
+                # shape constants — Flatten uses a Reshape whose shape
+                # is derived from the static output spec, which tf2onnx
+                # can emit as a constant initializer.
+                return self._flatten(expanded)
             def compute_output_shape(self, input_shape):
                 return (input_shape[0], input_shape[-1] * self.embeddings)
             def get_config(self):
@@ -338,23 +455,14 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
     print("  Constant-folded model saved")
 
     # ── Verify: all Reshape shape inputs must be constant ────────────
+    # tract-onnx only accepts Reshape shapes that are graph initializers.
+    # ORT constant folding may produce Constant-op outputs instead, which
+    # pass onnxruntime validation but fail at runtime in tract.  Use a
+    # comprehensive promotion step that handles both cases.
     import onnx
-    model_onnx = onnx.load(onnx_path)
-    init_names = {i.name for i in model_onnx.graph.initializer}
-    for node in model_onnx.graph.node:
-        if node.op_type == "Reshape" and len(node.input) >= 2:
-            shape_inp = node.input[1]
-            if shape_inp not in init_names:
-                # ORT constant folding didn't catch it — freeze manually.
-                # Run inference to capture the actual shape tensor value.
-                print(f"  Reshape '{node.name}' still has variable shape "
-                      f"input '{shape_inp}', freezing manually …")
-                _freeze_reshape_shape(onnx_path, node, shape_inp, test_input)
-                # Re-load to update init_names for subsequent nodes.
-                model_onnx = onnx.load(onnx_path)
-                init_names = {i.name for i in model_onnx.graph.initializer}
+    _promote_reshape_shapes_to_initializers(onnx_path, test_input)
 
-    # Final check.
+    # Final check — must use initializer-only test (matching tract).
     model_onnx = onnx.load(onnx_path)
     init_names = {i.name for i in model_onnx.graph.initializer}
     for node in model_onnx.graph.node:
