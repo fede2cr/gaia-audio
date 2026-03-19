@@ -265,6 +265,80 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
     onnx_path = os.path.join(model_dir, output_name)
     print(f"Converting metadata model to ONNX: {onnx_path} …")
     model_proto, _ = tf2onnx.convert.from_keras(model, output_path=onnx_path)
+
+    # ── Post-process: freeze Reshape shape inputs ────────────────────
+    # tf2onnx emits the Reshape shape as a computed subgraph
+    # (Shape → Gather → Unsqueeze → Concat) even when we use [-1, N]
+    # in Python.  tract-onnx rejects this ("shape input is variable").
+    # Fix by replacing each Reshape's shape input with a constant
+    # initializer inferred from onnxruntime's shape inference.
+    import onnx
+    from onnx import numpy_helper, TensorProto
+
+    model_onnx = onnx.load(onnx_path)
+    graph = model_onnx.graph
+
+    # Build a lookup of initialiser names for quick membership test.
+    init_names = {init.name for init in graph.initializer}
+
+    patched = 0
+    for node in graph.node:
+        if node.op_type != "Reshape" or len(node.input) < 2:
+            continue
+        shape_input = node.input[1]
+        if shape_input in init_names:
+            continue  # already a constant — nothing to do
+
+        # Use onnx shape inference to determine the Reshape output shape.
+        from onnx import shape_inference
+        inferred = shape_inference.infer_shapes(model_onnx)
+        # Find the shape of this Reshape node's output.
+        output_name = node.output[0]
+        target_shape = None
+        for vi in inferred.graph.value_info:
+            if vi.name == output_name:
+                dims = vi.type.tensor_type.shape.dim
+                target_shape = []
+                for d in dims:
+                    if d.dim_value > 0:
+                        target_shape.append(d.dim_value)
+                    else:
+                        target_shape.append(-1)  # dynamic batch → -1
+                break
+        # Also check graph outputs in case it's a final node.
+        if target_shape is None:
+            for vi in inferred.graph.output:
+                if vi.name == output_name:
+                    dims = vi.type.tensor_type.shape.dim
+                    target_shape = []
+                    for d in dims:
+                        if d.dim_value > 0:
+                            target_shape.append(d.dim_value)
+                        else:
+                            target_shape.append(-1)
+                    break
+
+        if target_shape is None:
+            print(f"  WARNING: could not infer shape for Reshape "
+                  f"node '{node.name}', skipping")
+            continue
+
+        # Create a constant initializer with the target shape.
+        const_name = f"{node.name}_shape_const"
+        shape_array = np.array(target_shape, dtype=np.int64)
+        tensor = numpy_helper.from_array(shape_array, name=const_name)
+        graph.initializer.append(tensor)
+        init_names.add(const_name)
+
+        # Point the Reshape node at the constant.
+        node.input[1] = const_name
+        patched += 1
+        print(f"  Froze Reshape '{node.name}' shape to {target_shape}")
+
+    if patched:
+        onnx.save(model_onnx, onnx_path)
+        print(f"  Patched {patched} Reshape node(s) with constant shapes")
+
     size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
     print(f"  Written {size_mb:.1f} MB ONNX metadata model")
 
