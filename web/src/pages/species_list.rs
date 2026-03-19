@@ -7,6 +7,7 @@ use leptos::prelude::{
 };
 use leptos::either::Either;
 
+use crate::components::model_filter::ModelFilter;
 use crate::components::species_card::SpeciesCard;
 use crate::model::SpeciesSummary;
 
@@ -48,12 +49,16 @@ impl SpeciesSort {
 /// Excluded detections are omitted unless the species has been
 /// overridden in the `exclusion_overrides` table.
 #[server(prefix = "/api")]
-pub async fn get_all_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFnError> {
+pub async fn get_all_species(
+    limit: u32,
+    model_slug: String,
+) -> Result<Vec<SpeciesSummary>, ServerFnError> {
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
-    let mut species = db::top_species(&state.db_path, limit)
+    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
+    let mut species = db::top_species_filtered(&state.db_path, limit, slug_opt)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images, conservation status, and sex photos
@@ -71,12 +76,18 @@ pub async fn get_all_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFn
 /// Browse all detected species with sort controls.
 #[component]
 pub fn SpeciesListPage() -> impl IntoView {
-    let species = Resource::new(|| (), |_| async { get_all_species(500).await });
+    let (model_slug, set_model_slug) = signal(String::new());
+    let species = Resource::new(
+        move || model_slug.get(),
+        |slug| async move { get_all_species(500, slug).await },
+    );
     let (sort, set_sort) = signal(SpeciesSort::Detections);
 
     view! {
         <div class="species-list-page">
             <h1>"All Species"</h1>
+
+            <ModelFilter selected=model_slug set_selected=set_model_slug />
 
             <div class="sort-bar">
                 <span class="sort-label">"Sort by:"</span>

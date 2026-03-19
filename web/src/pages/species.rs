@@ -9,8 +9,10 @@ use leptos::either::Either;
 use leptos_router::hooks::use_params_map;
 
 use crate::components::calendar_grid::CalendarGrid;
+use crate::components::detection_card::DetectionCard;
 use crate::components::hourly_chart::HourlyChart;
-use crate::model::{CalendarDay, HourlyCount, SpeciesInfo, TopRecording};
+use crate::components::model_filter::ModelFilter;
+use crate::model::{CalendarDay, HourlyCount, ModelInfo, SpeciesInfo, TopRecording, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
@@ -114,6 +116,63 @@ pub async fn get_species_top_recordings(
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
+/// Recent detections for a species, optionally filtered by model slug.
+#[server(prefix = "/api")]
+pub async fn get_species_detections(
+    scientific_name: String,
+    model_slug: String,
+    limit: u32,
+) -> Result<Vec<WebDetection>, ServerFnError> {
+    use crate::server::{db, inaturalist};
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
+    let mut dets = db::species_detections_by_model(&state.db_path, &scientific_name, limit, slug_opt)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    for det in dets.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &det.scientific_name).await {
+            det.image_url = Some(photo.medium_url);
+        }
+    }
+    Ok(dets)
+}
+
+/// Which models have detected this species (for the model filter bar).
+#[server(prefix = "/api")]
+pub async fn get_species_models(
+    scientific_name: String,
+) -> Result<Vec<ModelInfo>, ServerFnError> {
+    use crate::server::db;
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    // Re-use the general available_models query and filter to this species.
+    let conn = rusqlite::Connection::open_with_flags(
+        &state.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    conn.execute_batch("PRAGMA busy_timeout=3000;")
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), COUNT(*) AS cnt \
+             FROM detections \
+             WHERE Sci_Name = ?1 AND COALESCE(Model_Slug, '') != '' \
+             GROUP BY Model_Slug ORDER BY cnt DESC",
+        )
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params![scientific_name], |row| {
+            Ok(ModelInfo {
+                slug: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+}
+
 // ─── Page component ──────────────────────────────────────────────────────────
 
 /// Detail page for a single species.
@@ -191,6 +250,14 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
     let recordings = Resource::new(
         move || sci_name_for_recs.clone(),
         |name| async move { get_species_top_recordings(name).await },
+    );
+
+    // ── Model-filtered detection list ───────────────────────────────────
+    let (model_slug, set_model_slug) = signal(String::new());
+    let sci_name_for_dets = sci_name.clone();
+    let model_detections = Resource::new(
+        move || (sci_name_for_dets.clone(), model_slug.get()),
+        |(name, slug)| async move { get_species_detections(name, slug, 50).await },
     );
 
     // ── Verification state ───────────────────────────────────────────────
@@ -454,6 +521,35 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
             // ── Activity calendar ────────────────────────────────────
             <section class="species-calendar">
                 <h2>"Activity Calendar"</h2>
+
+            // ── Recent detections (model filtered) ───────────────────
+            <section class="species-detections-section">
+                <h2>"Recent Detections"</h2>
+                <ModelFilter selected=model_slug set_selected=set_model_slug />
+                <Suspense fallback=|| view! { <p class="loading">"Loading detections\u{2026}"</p> }>
+                    {move || model_detections.get().map(|res| match res {
+                        Ok(dets) if dets.is_empty() => view! {
+                            <p class="no-data">"No detections"
+                                {move || if model_slug.get().is_empty() { "" } else { " for this model" }}
+                                "."
+                            </p>
+                        }.into_any(),
+                        Ok(dets) => view! {
+                            <div class="feed-list">
+                                {dets.into_iter().map(|det| view! {
+                                    <DetectionCard detection=det />
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any(),
+                        Err(e) => view! {
+                            <p class="error">"Error: " {e.to_string()}</p>
+                        }.into_any(),
+                    })}
+                </Suspense>
+            </section>
+
+            <section class="species-calendar">
+                <h2>"Calendar"</h2>
                 <div class="species-cal-nav">
                     <button
                         class="cal-nav-btn"

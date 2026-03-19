@@ -31,6 +31,19 @@ apply_softmax = false
 # Only BirdNET V2.4's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false
 
+# ── Species-range filter (reusing BirdNET V2.4 metadata model) ───────
+#
+# BirdNET+ V3.0 does not yet ship its own species-range model.
+# We reuse the V2.4 metadata model which accepts (lat, lon, week)
+# and outputs per-species occurrence scores.  This filters detections
+# to species expected at the configured location, reducing false
+# positives.  The label overlap is high enough to be useful.
+[metadata_model]
+enabled = true
+tflite_file = "meta-model.tflite"
+onnx_file = "meta-model.onnx"
+labels_file = "meta-labels.txt"
+
 # ── Automatic download from Zenodo ───────────────────────────────────
 #
 # The ONNX model (~541 MB) is patched at build time (Resize nodes:

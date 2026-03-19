@@ -9,6 +9,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::components::detection_card::DetectionCard;
 use crate::components::hourly_chart::SpeciesHourlyGrid;
+use crate::components::model_filter::ModelFilter;
 use crate::model::{DayDetectionGroup, SpeciesHourlyCounts, WebDetection};
 
 // ─── Server functions ────────────────────────────────────────────────────────
@@ -16,11 +17,13 @@ use crate::model::{DayDetectionGroup, SpeciesHourlyCounts, WebDetection};
 #[server(prefix = "/api")]
 pub async fn get_day_detections(
     date: String,
+    model_slug: String,
 ) -> Result<Vec<DayDetectionGroup>, ServerFnError> {
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut groups = db::day_detections(&state.db_path, &date)
+    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
+    let mut groups = db::day_detections_filtered(&state.db_path, &date, slug_opt)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with images
@@ -55,14 +58,20 @@ pub fn DayView() -> impl IntoView {
     let date = move || {
         params.with(|p| p.get("date").unwrap_or_default())
     };
+    let (model_slug, set_model_slug) = signal(String::new());
 
-    let data = Resource::new(date, |d| async move { get_day_detections(d.clone()).await });
+    let data = Resource::new(
+        move || (date(), model_slug.get()),
+        |(d, slug)| async move { get_day_detections(d.clone(), slug).await },
+    );
     let hourly = Resource::new(date, |d| async move { get_day_hourly(d).await });
 
     view! {
         <div class="day-page">
             <h1>"Detections for " {date}</h1>
             <a href="/calendar" class="back-link">"← Back to Calendar"</a>
+
+            <ModelFilter selected=model_slug set_selected=set_model_slug />
 
             // ── Species × Hour heatmap ───────────────────────────────
             <Suspense fallback=|| view! { <p class="loading">"Loading chart\u{2026}"</p> }>

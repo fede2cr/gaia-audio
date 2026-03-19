@@ -76,21 +76,22 @@ os.remove('keras.zip'); \
 shutil.rmtree('/convert/keras_raw')" && \
     ls -lh /convert/keras/
 
+# Extract en_us.txt labels from the Keras zip (for species-range filtering).
+# The labels/ directory is flattened alongside the .h5 files.
+RUN cp /convert/keras/en_us.txt /convert/en_us.txt && \
+    echo "Extracted labels: $(wc -c < /convert/en_us.txt) bytes → /convert/en_us.txt"
+
 # Convert classifier sub-model to ONNX (Keras → split at concatenate → ONNX)
 RUN python3 convert_keras_to_onnx.py /convert/keras -o audio-model.onnx && \
     mv /convert/keras/audio-model.onnx /convert/audio-model.onnx && \
     ls -lh /convert/audio-model.onnx
 
 # Convert metadata model to ONNX.
-# The meta-model.h5 uses a custom MDataLayer that's hard to deserialise
-# in Keras, so we download the TFLite variant and convert it directly
-# with tf2onnx.  STRIDED_SLICE (which tract-tflite can't run) converts
-# to standard ONNX Slice/Gather ops just fine.
-RUN python3 download_meta_tflite.py && \
-    python3 -m tf2onnx.convert \
-        --tflite /convert/meta-model.tflite \
-        --output /convert/meta-model.onnx && \
-    rm /convert/meta-model.tflite && \
+# The meta-model.h5 uses a custom MDataLayer — our convert script provides
+# a stub implementation so we can convert directly from Keras to ONNX
+# without needing a separate TFLite download.
+RUN python3 convert_keras_to_onnx.py /convert/keras -o meta-model.onnx --meta-only && \
+    mv /convert/keras/meta-model.onnx /convert/meta-model.onnx && \
     ls -lh /convert/meta-model.onnx
 
 # ── BatDetect2 PyTorch → ONNX conversion at build time ────────────
@@ -190,6 +191,11 @@ COPY examples/birds_manifest.toml    /usr/local/share/gaia/manifests/birdnet/man
 COPY examples/perch_manifest.toml    /usr/local/share/gaia/manifests/perch/manifest.toml
 COPY examples/bats_manifest.toml     /usr/local/share/gaia/manifests/batdetect2/manifest.toml
 COPY examples/birdnet3_manifest.toml /usr/local/share/gaia/manifests/birdnet3/manifest.toml
+# Reuse BirdNET V2.4 metadata model + labels for species-range filtering in V3.
+COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/manifests/birdnet3/meta-model.onnx
+# The V2.4 meta-model uses V2.4 labels (en_us.txt); bundle them separately
+# so the meta-model output maps to the correct species names.
+COPY --from=converter /convert/en_us.txt /usr/local/share/gaia/manifests/birdnet3/meta-labels.txt
 
 # Seed batdetect2 labels alongside the manifest so entrypoint.sh copies
 # them into /models/batdetect2/ (no-clobber) at container start.

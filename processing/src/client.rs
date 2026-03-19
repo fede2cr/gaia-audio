@@ -145,6 +145,23 @@ pub fn poll_and_dispatch(
                     continue;
                 }
 
+                // Skip files this instance already processed in a previous
+                // run.  The dispatched HashSet is in-memory only and lost on
+                // restart, but the file_processing_log table persists.
+                let instance_id = if config.processing_instance.is_empty() {
+                    "default"
+                } else {
+                    &config.processing_instance
+                };
+                if crate::db::is_file_processed(&config.db_path, &rec.filename, instance_id) {
+                    debug!(
+                        "[{}] Skipping {} — already processed by this instance",
+                        base_url, rec.filename
+                    );
+                    dispatched.insert(key);
+                    continue;
+                }
+
                 debug!(
                     "[{}] New recording: {} ({} bytes)",
                     base_url, rec.filename, rec.size

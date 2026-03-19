@@ -43,6 +43,10 @@ pub struct LoadedModel {
     ort_session: Option<crate::accel::OrtSession>,
     meta_model: Option<MetaDataModel>,
     labels: Vec<String>,
+    /// Common-name map parsed from CSV labels (sci_name → com_name).
+    /// Used as fallback when no JSON language file is available (e.g.
+    /// BirdNET+ V3.0).
+    csv_common_names: HashMap<String, String>,
     pub manifest: ResolvedManifest,
     sensitivity: f64,
     /// When `true` the ONNX model is a classifier-only sub-model that
@@ -258,7 +262,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     } else {
         (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
     };
-    let labels = load_labels(&resolved.labels_path())?;
+    let (labels, csv_common_names) = load_labels(&resolved.labels_path())?;
 
     let meta_model = match load_meta_model(resolved, &labels, config.sf_thresh) {
         Ok(m) => m,
@@ -288,6 +292,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         ort_session,
         meta_model,
         labels,
+        csv_common_names,
         manifest: resolved.clone(),
         sensitivity,
         onnx_classifier,
@@ -339,6 +344,15 @@ impl LoadedModel {
     /// Whether this model uses V1-style metadata input.
     pub fn v1_metadata(&self) -> bool {
         self.manifest.manifest.model.v1_metadata
+    }
+
+    /// Common-name map extracted from CSV labels.
+    ///
+    /// Non-empty for models whose label file is a CSV with a `com_name`
+    /// column (e.g. BirdNET+ V3.0).  Can be used as a fallback when no
+    /// JSON language file ships with the model.
+    pub fn csv_common_names(&self) -> &HashMap<String, String> {
+        &self.csv_common_names
     }
 
     /// Run inference on a single audio chunk.
@@ -495,7 +509,7 @@ fn load_meta_model(
             info!("Loading ONNX metadata model: {}", onnx_path.display());
             let runner = load_onnx_runner(&onnx_path)
                 .with_context(|| format!("Cannot load ONNX metadata model: {}", onnx_path.display()))?;
-            let labels = load_labels(&resolved.labels_path())?;
+            let (labels, _) = load_labels(&resolved.metadata_labels_path())?;
             return Ok(Some(MetaDataModel {
                 runner,
                 labels,
@@ -527,7 +541,7 @@ fn load_meta_model(
         .into_optimized()?
         .into_runnable()?;
 
-    let labels = load_labels(&resolved.labels_path())?;
+    let (labels, _) = load_labels(&resolved.metadata_labels_path())?;
 
     Ok(Some(MetaDataModel {
         runner,
@@ -623,10 +637,16 @@ impl MetaDataModel {
 /// Supports two formats:
 ///   - **Plain text** (`.txt`): one label per line.
 ///     Labels of the form `Sci Name_Common Name` are normalised to `Sci Name`.
-///   - **CSV** (`.csv`): comma-separated values.  The first column is used
-///     as the label; an optional header row starting with `ebird` or
-///     `species` is skipped.
-fn load_labels(label_path: &Path) -> Result<Vec<String>> {
+///   - **CSV** (`.csv`): comma- or semicolon-separated values.
+///     The delimiter is auto-detected from the first non-empty line.
+///     When a header row is detected (starting with `ebird`, `species`,
+///     or `idx`), it is used to locate the `sci_name` / `com_name`
+///     columns; otherwise the first column is taken as the label.
+///
+/// Returns `(labels, common_names)`.  The common-name map is populated
+/// only for CSV files that have a recognisable `com_name` column;
+/// for plain-text labels the map is empty.
+fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String>)> {
     let text = std::fs::read_to_string(label_path)
         .with_context(|| format!("Cannot read labels: {}", label_path.display()))?;
 
@@ -634,18 +654,67 @@ fn load_labels(label_path: &Path) -> Result<Vec<String>> {
         .extension()
         .map_or(false, |ext| ext.eq_ignore_ascii_case("csv"));
 
+    let mut common_names: HashMap<String, String> = HashMap::new();
+
     let labels: Vec<String> = if is_csv {
-        text.lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            // Skip header rows (e.g. "ebird_code,..." or "species,...")
-            .filter(|line| {
-                let lower = line.to_lowercase();
-                !lower.starts_with("ebird") && !lower.starts_with("species")
-            })
+        // Auto-detect delimiter: semicolon if the first line contains `;`,
+        // otherwise comma.
+        let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let delim = if first_line.contains(';') { ';' } else { ',' };
+
+        // Detect header row and find the scientific name column index.
+        let mut lines = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+        let first = lines.next().unwrap_or("");
+        let lower_first = first.to_lowercase();
+        let is_header = lower_first.starts_with("ebird")
+            || lower_first.starts_with("species")
+            || lower_first.starts_with("idx");
+
+        // Find the column index for sci_name (or use 0 as default).
+        let sci_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| {
+                    let c = col.trim().to_lowercase();
+                    c == "sci_name" || c == "scientific_name"
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Find the column index for com_name / common_name (if present).
+        let com_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| {
+                    let c = col.trim().to_lowercase();
+                    c == "com_name" || c == "common_name"
+                })
+        } else {
+            None
+        };
+
+        let data_lines: Box<dyn Iterator<Item = &str>> = if is_header {
+            Box::new(lines)
+        } else {
+            // First line is data, not a header — include it.
+            Box::new(std::iter::once(first).chain(lines))
+        };
+
+        data_lines
             .map(|line| {
-                // Take the first CSV column
-                line.split(',').next().unwrap_or(line).trim().to_string()
+                let cols: Vec<&str> = line.split(delim).collect();
+                let sci = cols.get(sci_col).unwrap_or(&line).trim().to_string();
+                if let Some(ci) = com_col {
+                    if let Some(cn) = cols.get(ci) {
+                        let cn = cn.trim();
+                        if !cn.is_empty() {
+                            common_names.insert(sci.clone(), cn.to_string());
+                        }
+                    }
+                }
+                sci
             })
             .collect()
     } else {
@@ -653,7 +722,12 @@ fn load_labels(label_path: &Path) -> Result<Vec<String>> {
             .map(|line| {
                 let line = line.trim();
                 if line.matches('_').count() == 1 {
-                    line.split('_').next().unwrap_or(line).to_string()
+                    let sci = line.split('_').next().unwrap_or(line).to_string();
+                    let com = line.split('_').nth(1).unwrap_or("");
+                    if !com.is_empty() {
+                        common_names.insert(sci.clone(), com.to_string());
+                    }
+                    sci
                 } else {
                     line.to_string()
                 }
@@ -661,8 +735,13 @@ fn load_labels(label_path: &Path) -> Result<Vec<String>> {
             .collect()
     };
 
-    info!("Loaded {} labels from {}", labels.len(), label_path.display());
-    Ok(labels)
+    info!(
+        "Loaded {} labels ({} with common names) from {}",
+        labels.len(),
+        common_names.len(),
+        label_path.display(),
+    );
+    Ok((labels, common_names))
 }
 
 /// Load the JSON language file that maps `scientific_name → common_name`.

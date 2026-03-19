@@ -384,6 +384,24 @@ pub struct SpeciesSummary {
     pub female_image_url: Option<String>,
 }
 
+// ─── Model info (for filter dropdowns) ───────────────────────────────────────
+
+/// A detection model available in the database.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Machine slug (e.g. `"birdnet"`, `"birdnet3"`).
+    pub slug: String,
+    /// Human-readable name (e.g. `"BirdNET V2.4"`, `"BirdNET+ V3.0"`).
+    pub name: String,
+}
+
+impl ModelInfo {
+    /// Display label: prefer name, fall back to slug.
+    pub fn label(&self) -> &str {
+        if !self.name.is_empty() { &self.name } else { &self.slug }
+    }
+}
+
 // ─── Import (BirdNET-Pi backup) ──────────────────────────────────────────────
 
 /// Pre-import analysis of a BirdNET-Pi backup archive.

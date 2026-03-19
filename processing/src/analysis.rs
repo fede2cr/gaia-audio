@@ -119,9 +119,14 @@ fn run_analysis(
     }
 
     // ── language map ─────────────────────────────────────────────────
-    let names =
+    let mut names =
         model::load_language(&model.manifest.language_dir(), &config.database_lang)
             .unwrap_or_default();
+    // Fallback: when no language JSON exists (e.g. BirdNET+ V3.0), use
+    // common names parsed from the CSV labels file.
+    if names.is_empty() {
+        names = model.csv_common_names().clone();
+    }
 
     // ── read audio ───────────────────────────────────────────────────
     let chunks = match audio::read_audio(

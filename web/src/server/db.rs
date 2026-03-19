@@ -702,6 +702,321 @@ fn get_top_recordings_live(
     rows.collect()
 }
 
+// ─── Model filter helpers ────────────────────────────────────────────────────
+
+/// A model that has been used for at least one detection.
+#[derive(Debug, Clone)]
+pub struct AvailableModel {
+    pub slug: String,
+    pub name: String,
+}
+
+/// Return distinct `(Model_Slug, Model_Name)` pairs recorded in the DB.
+///
+/// Only non-empty slugs are returned, ordered by the most recent use.
+pub fn available_models(db_path: &Path) -> Result<Vec<AvailableModel>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), MAX(rowid) AS last \
+         FROM detections \
+         WHERE COALESCE(Model_Slug, '') != '' \
+         GROUP BY Model_Slug \
+         ORDER BY last DESC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(AvailableModel {
+            slug: row.get(0)?,
+            name: row.get(1)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Recent detections optionally filtered by model slug.
+pub fn recent_detections_filtered(
+    db_path: &Path,
+    limit: u32,
+    after_rowid: Option<i64>,
+    model_slug: Option<&str>,
+) -> Result<Vec<WebDetection>, rusqlite::Error> {
+    // No filter → delegate to existing function.
+    if model_slug.is_none() || model_slug == Some("") {
+        return recent_detections(db_path, limit, after_rowid);
+    }
+    let slug = model_slug.unwrap();
+
+    let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
+
+    let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
+        Some(rid) => (
+            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+             COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+             FROM detections \
+             WHERE rowid > ?1 AND COALESCE(Model_Slug, '') = ?2 \
+             ORDER BY rowid DESC LIMIT ?3"
+                .into(),
+            vec![Box::new(rid), Box::new(slug.to_string()), Box::new(limit)],
+        ),
+        None => (
+            "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+             COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+             COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+             FROM detections \
+             WHERE COALESCE(Model_Slug, '') = ?1 \
+             ORDER BY rowid DESC LIMIT ?2"
+                .into(),
+            vec![Box::new(slug.to_string()), Box::new(limit)],
+        ),
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
+        Ok(WebDetection {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+            scientific_name: row.get(2)?,
+            common_name: row.get(3)?,
+            confidence: row.get(4)?,
+            date: row.get(5)?,
+            time: row.get(6)?,
+            file_name: row.get(7)?,
+            source_node: row.get(8)?,
+            excluded: row.get::<_, i32>(9)? != 0,
+            image_url: None,
+            model_slug: row.get(10)?,
+            model_name: row.get(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
+        })
+    })?;
+
+    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
+    for d in &mut dets { stamp(d, tz); }
+    Ok(dets)
+}
+
+/// Top species (all-time) optionally filtered by model slug.
+pub fn top_species_filtered(
+    db_path: &Path,
+    limit: u32,
+    model_slug: Option<&str>,
+) -> Result<Vec<crate::model::SpeciesSummary>, rusqlite::Error> {
+    if model_slug.is_none() || model_slug == Some("") {
+        return top_species(db_path, limit);
+    }
+    let slug = model_slug.unwrap();
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+         MAX(d.Date || ' ' || d.Time) AS last \
+         FROM detections d \
+         WHERE (COALESCE(d.Excluded, 0) = 0 \
+                OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+           AND COALESCE(d.Model_Slug, '') = ?1 \
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![slug, limit], |row| {
+        let count: u32 = row.get(3)?;
+        Ok(crate::model::SpeciesSummary {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            domain: row.get(2)?,
+            detection_count: count,
+            display_count: round_count(count),
+            last_seen: row.get(4)?,
+            image_url: None,
+            conservation_status: None,
+            male_image_url: None,
+            female_image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Top species for a specific date, optionally filtered by model slug.
+pub fn top_species_for_date_filtered(
+    db_path: &Path,
+    date: &str,
+    limit: u32,
+    model_slug: Option<&str>,
+) -> Result<Vec<crate::model::SpeciesSummary>, rusqlite::Error> {
+    if model_slug.is_none() || model_slug == Some("") {
+        return top_species_for_date(db_path, date, limit);
+    }
+    let slug = model_slug.unwrap();
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+         MAX(d.Date || ' ' || d.Time) AS last \
+         FROM detections d \
+         WHERE d.Date = ?1 \
+           AND (COALESCE(d.Excluded, 0) = 0 \
+                OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
+           AND COALESCE(d.Model_Slug, '') = ?2 \
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?3",
+    )?;
+
+    let rows = stmt.query_map(params![date, slug, limit], |row| {
+        let count: u32 = row.get(3)?;
+        Ok(crate::model::SpeciesSummary {
+            scientific_name: row.get(0)?,
+            common_name: row.get(1)?,
+            domain: row.get(2)?,
+            detection_count: count,
+            display_count: round_count(count),
+            last_seen: row.get(4)?,
+            image_url: None,
+            conservation_status: None,
+            male_image_url: None,
+            female_image_url: None,
+        })
+    })?;
+
+    rows.collect()
+}
+
+/// Day detections optionally filtered by model slug.
+pub fn day_detections_filtered(
+    db_path: &Path,
+    date: &str,
+    model_slug: Option<&str>,
+) -> Result<Vec<DayDetectionGroup>, rusqlite::Error> {
+    if model_slug.is_none() || model_slug == Some("") {
+        return day_detections(db_path, date);
+    }
+    let slug = model_slug.unwrap();
+    let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
+    let mut stmt = conn.prepare(
+        "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+         COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         FROM detections \
+         WHERE Date = ?1 AND COALESCE(Model_Slug, '') = ?2 \
+         ORDER BY Sci_Name, Time DESC",
+    )?;
+
+    let rows: Vec<WebDetection> = stmt
+        .query_map(params![date, slug], |row| {
+            Ok(WebDetection {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                scientific_name: row.get(2)?,
+                common_name: row.get(3)?,
+                confidence: row.get(4)?,
+                date: row.get(5)?,
+                time: row.get(6)?,
+                file_name: row.get(7)?,
+                source_node: row.get(8)?,
+                excluded: row.get::<_, i32>(9)? != 0,
+                image_url: None,
+                model_slug: row.get(10)?,
+                model_name: row.get(11)?,
+                display_date: String::new(),
+                display_time: String::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<WebDetection> = rows.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
+
+    let mut groups: Vec<DayDetectionGroup> = Vec::new();
+    for det in rows {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|g| g.scientific_name == det.scientific_name && g.domain == det.domain)
+        {
+            if det.confidence > group.max_confidence {
+                group.max_confidence = det.confidence;
+            }
+            group.detections.push(det);
+        } else {
+            groups.push(DayDetectionGroup {
+                scientific_name: det.scientific_name.clone(),
+                common_name: det.common_name.clone(),
+                domain: det.domain.clone(),
+                image_url: None,
+                max_confidence: det.confidence,
+                detections: vec![det],
+            });
+        }
+    }
+    Ok(groups)
+}
+
+/// Species info optionally filtered by model slug.
+pub fn species_detections_by_model(
+    db_path: &Path,
+    scientific_name: &str,
+    limit: u32,
+    model_slug: Option<&str>,
+) -> Result<Vec<WebDetection>, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
+
+    let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        if let Some(slug) = model_slug.filter(|s| !s.is_empty()) {
+            (
+                "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+                 COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+                 COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+                 FROM detections \
+                 WHERE Sci_Name = ?1 AND COALESCE(Model_Slug, '') = ?2 \
+                 ORDER BY Date DESC, Time DESC LIMIT ?3"
+                    .into(),
+                vec![
+                    Box::new(scientific_name.to_string()),
+                    Box::new(slug.to_string()),
+                    Box::new(limit),
+                ],
+            )
+        } else {
+            (
+                "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
+                 COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+                 COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+                 FROM detections \
+                 WHERE Sci_Name = ?1 \
+                 ORDER BY Date DESC, Time DESC LIMIT ?2"
+                    .into(),
+                vec![
+                    Box::new(scientific_name.to_string()),
+                    Box::new(limit),
+                ],
+            )
+        };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
+        Ok(WebDetection {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+            scientific_name: row.get(2)?,
+            common_name: row.get(3)?,
+            confidence: row.get(4)?,
+            date: row.get(5)?,
+            time: row.get(6)?,
+            file_name: row.get(7)?,
+            source_node: row.get(8)?,
+            excluded: row.get::<_, i32>(9)? != 0,
+            image_url: None,
+            model_slug: row.get(10)?,
+            model_name: row.get(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
+        })
+    })?;
+
+    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
+    for d in &mut dets { stamp(d, tz); }
+    Ok(dets)
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 use std::collections::HashMap;

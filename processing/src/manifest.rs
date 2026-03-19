@@ -97,6 +97,12 @@ pub struct MetadataSection {
     /// shrink_axis_mask in BirdNET V2.4's metadata model).
     #[serde(default)]
     pub onnx_file: Option<String>,
+    /// Optional separate labels file for the metadata model.
+    /// When set, the meta-model uses this file instead of the main
+    /// model's labels.  Useful when reusing a V2.4 meta-model with
+    /// V3.0 (which has a different species set).
+    #[serde(default)]
+    pub labels_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +222,19 @@ impl ResolvedManifest {
             .filter(|m| m.enabled)
             .and_then(|m| m.onnx_file.as_ref())
             .map(|f| self.base_dir.join(f))
+    }
+
+    /// Labels file for the metadata model.
+    ///
+    /// When `[metadata_model].labels_file` is set, returns that path;
+    /// otherwise falls back to the main model's labels.
+    pub fn metadata_labels_path(&self) -> PathBuf {
+        self.manifest
+            .metadata_model
+            .as_ref()
+            .and_then(|m| m.labels_file.as_ref())
+            .map(|f| self.base_dir.join(f))
+            .unwrap_or_else(|| self.labels_path())
     }
 
     pub fn language_dir(&self) -> PathBuf {

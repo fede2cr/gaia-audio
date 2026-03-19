@@ -414,6 +414,26 @@ pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
     removed
 }
 
+/// Check whether this instance has already processed a specific file.
+///
+/// Used at startup to avoid re-downloading files that were already
+/// processed in a previous run (the in-memory `dispatched` set is
+/// lost on restart, but the DB log survives).
+pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
+    conn.query_row(
+        "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1 AND instance = ?2",
+        params![filename, instance],
+        |row| row.get::<_, u32>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
 /// Record that this instance has finished processing a file.
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
     let conn = Connection::open(db_path)?;

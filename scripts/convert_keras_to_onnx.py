@@ -165,10 +165,12 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
             custom_objects[layer_name] = getattr(mod, layer_name)
             print(f"  Loaded custom layer: {layer_name}")
 
-    # BirdNET's MDataLayer is a linear projection layer (input @ kernel).
+    # BirdNET's MDataLayer is a per-feature embedding layer.
     # The .py file is NOT shipped in the Keras zip, so define a stub.
     # Config has {'embeddings': 48} — a weight matrix of shape
-    # (input_dim, embeddings) is created and the call does a matmul.
+    # (input_dim, embeddings) is created.  For each input feature the
+    # corresponding embedding row is scaled, producing output of shape
+    # (batch, input_dim * embeddings).  E.g. (batch, 3) → (batch, 144).
     if "MDataLayer" not in custom_objects:
         class _MDataLayer(keras.layers.Layer):
             def __init__(self, embeddings=48, **kwargs):
@@ -181,18 +183,71 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
                 )
                 super().build(input_shape)
             def call(self, inputs):
-                return keras.backend.dot(inputs, self.kernel)
+                import tensorflow as tf
+                # (batch, D, 1) * (D, E) → broadcast → (batch, D, E)
+                expanded = tf.expand_dims(inputs, axis=-1) * self.kernel
+                # Use the *static* input dim so Keras can infer the output
+                # shape for downstream Dense layers (avoids "None" dims).
+                d = inputs.shape[-1]
+                return tf.reshape(expanded,
+                                  [tf.shape(inputs)[0], d * self.embeddings])
+            def compute_output_shape(self, input_shape):
+                return (input_shape[0], input_shape[-1] * self.embeddings)
             def get_config(self):
                 config = super().get_config()
                 config['embeddings'] = self.embeddings
                 return config
         custom_objects["MDataLayer"] = _MDataLayer
-        print("  Using stub MDataLayer (identity layer)")
+        print("  Using stub MDataLayer (per-feature embedding)")
 
     print(f"Loading metadata Keras model from {h5_path} …")
-    model = keras.models.load_model(
-        h5_path, custom_objects=custom_objects, compile=False
-    )
+    try:
+        model = keras.models.load_model(
+            h5_path, custom_objects=custom_objects, compile=False
+        )
+    except ValueError as e:
+        if "Layer count mismatch" not in str(e) and "Weight count mismatch" not in str(e):
+            raise
+        # Keras 3 struggles with Keras-2 h5 files that use custom layers:
+        #  - "Layer count mismatch" — extra implicit InputLayer
+        #  - "Weight count mismatch" — by_name loader can't match custom
+        #    layer weights across the Keras 2→3 boundary.
+        # Fall back to fully manual loading via h5py.
+        print(f"  Working around Keras 3 compatibility issue …")
+        import h5py, json
+
+        with h5py.File(h5_path, "r") as f:
+            cfg = f.attrs.get("model_config")
+            if isinstance(cfg, bytes):
+                cfg = cfg.decode("utf-8")
+            model = keras.models.model_from_config(
+                json.loads(cfg), custom_objects=custom_objects
+            )
+            # Force build so every layer allocates its weight tensors.
+            dummy = np.zeros((1, 3), dtype=np.float32)
+            model(dummy)
+
+            # Walk the Keras-2 h5 weight groups and set weights by name.
+            root = f["model_weights"] if "model_weights" in f else f
+            layer_names = [
+                n.decode("utf-8") if isinstance(n, bytes) else n
+                for n in root.attrs["layer_names"]
+            ]
+            for lname in layer_names:
+                g = root[lname]
+                wnames = [
+                    n.decode("utf-8") if isinstance(n, bytes) else n
+                    for n in g.attrs.get("weight_names", [])
+                ]
+                if not wnames:
+                    continue
+                weight_values = [g[wn][()] for wn in wnames]
+                for layer in model.layers:
+                    if layer.name == lname:
+                        layer.set_weights(weight_values)
+                        print(f"    Loaded {len(weight_values)} weight(s) "
+                              f"for layer '{lname}'")
+                        break
     print(f"  {model.name}: {len(model.layers)} layers, "
           f"input={model.input_shape} → output={model.output_shape}")
 
@@ -238,12 +293,17 @@ def main():
         help="Also convert meta-model.h5 to ONNX"
     )
     parser.add_argument(
+        "--meta-only", action="store_true",
+        help="Convert ONLY meta-model.h5 to ONNX (skip audio model)"
+    )
+    parser.add_argument(
         "--meta-output", default="meta-model.onnx",
         help="Output filename for metadata ONNX model (default: meta-model.onnx)"
     )
     args = parser.parse_args()
-    convert(args.model_dir, args.output)
-    if args.meta:
+    if not args.meta_only:
+        convert(args.model_dir, args.output)
+    if args.meta or args.meta_only:
         meta_h5 = os.path.join(args.model_dir, "meta-model.h5")
         if os.path.exists(meta_h5):
             convert_meta_model(args.model_dir, args.meta_output)
