@@ -99,36 +99,55 @@ jobs:
             arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-    # Skip if no relevant files changed — but always build on tags.
-    if: |
-      startsWith(github.ref, 'refs/tags/') ||
-      needs.changes.outputs[matrix.image] == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
 
     steps:
+      # Determine whether this matrix entry should actually build.
+      # Tags always build; pushes/PRs only build when relevant files changed.
+      - name: Check if build is needed
+        id: skip
+        env:
+          IMAGE: ${{ matrix.image }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          CHANGED_CAPTURE: ${{ needs.changes.outputs.capture }}
+          CHANGED_PROCESSING: ${{ needs.changes.outputs.processing }}
+          CHANGED_WEB: ${{ needs.changes.outputs.web }}
+        run: |
+          if [[ "$IS_TAG" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            # Look up the change-detection result for this image.
+            var="CHANGED_${IMAGE^^}"
+            echo "should_build=${!var}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
+        if: steps.skip.outputs.should_build == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: steps.skip.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.skip.outputs.should_build == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
 
       - name: Build and push by digest
+        if: steps.skip.outputs.should_build == 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -141,14 +160,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.image }}-${{ matrix.arch }}
