@@ -162,6 +162,32 @@ RUN ARCH=$(uname -m) && \
     cp "/tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /usr/lib/ && \
     ln -sf "libonnxruntime.so.${ORT_VERSION}" /usr/lib/libonnxruntime.so
 
+# ── tract-onnx dry-run validation ──────────────────────────────────
+# Actually load every ONNX model through tract-onnx (the runtime
+# inference engine) to catch incompatibilities that the Python
+# validator cannot detect — e.g. "shape input is variable", unsupported
+# ops, or broken shape inference.
+#
+# This uses the same code path as the production server (load →
+# optimise → runnable).  Any model that fails here WILL fail at
+# deployment time, so we abort the build early.
+#
+# NOTE: BirdNET+ V3.0 (birdnet3.onnx) uses DFT/STFT ops that
+# tract-onnx does not support — it falls back to ONNX Runtime at
+# runtime.  We skip it here; it was already validated with
+# onnxruntime in the birdnet3converter stage.
+FROM debian:trixie-slim AS tract-validator
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder    /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+COPY --from=converter  /convert/audio-model.onnx /validate/audio-model.onnx
+COPY --from=converter  /convert/meta-model.onnx  /validate/meta-model.onnx
+COPY --from=batconverter /convert/batdetect2.onnx /validate/batdetect2.onnx
+RUN gaia-processing validate-model \
+        /validate/audio-model.onnx \
+        /validate/meta-model.onnx \
+        /validate/batdetect2.onnx
+
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
 # No Python, no TensorFlow — all inference runs in native Rust.

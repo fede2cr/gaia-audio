@@ -12,9 +12,50 @@ env:
   IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
 
 jobs:
+  # ── Detect which containers need rebuilding ──────────────────────────────
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      capture: ${{ steps.filter.outputs.capture }}
+      processing: ${{ steps.filter.outputs.processing }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Path filter
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # On tags, always build everything (release).
+          # On push to main / PRs, only build what changed.
+          predicate-quantifier: some
+          filters: |
+            capture:
+              - Cargo.toml
+              - Cargo.lock
+              - common/**
+              - capture/**
+            processing:
+              - Cargo.toml
+              - Cargo.lock
+              - common/**
+              - processing/**
+              - scripts/**
+              - examples/**
+            web:
+              - Cargo.toml
+              - Cargo.lock
+              - common/**
+              - web/**
+
   # ── Per-arch build (native runners) ──────────────────────────────────────
   build:
     name: Build ${{ matrix.image }} (${{ matrix.arch }})
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +99,10 @@ jobs:
             arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+    # Skip if no relevant files changed — but always build on tags.
+    if: |
+      startsWith(github.ref, 'refs/tags/') ||
+      needs.changes.outputs[matrix.image] == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -112,11 +157,14 @@ jobs:
           retention-days: 1
 
   # ── Merge multi-arch manifests ───────────────────────────────────────────
+  # `if: always()` ensures the merge job runs even when some build matrix
+  # entries were skipped (no relevant file changes).  Each image checks
+  # for its digest artifacts before attempting the merge.
   merge:
     name: Merge ${{ matrix.image }} manifest
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !failure() && !cancelled()
     runs-on: ubuntu-latest
-    needs: build
+    needs: [changes, build]
     strategy:
       matrix:
         image: [capture, processing, web]
@@ -125,22 +173,34 @@ jobs:
 
     steps:
       - name: Download digests
+        id: download
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
           pattern: digest-${{ matrix.image }}-*
           merge-multiple: true
 
+      - name: Skip if no digests
+        if: steps.download.outcome == 'failure'
+        run: |
+          echo "No digest artifacts for ${{ matrix.image }} — image was not built, skipping merge."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        id: skip-notice
+
       - name: Set up Docker Buildx
+        if: steps.download.outcome == 'success'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
+        if: steps.download.outcome == 'success'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata (tags)
+        if: steps.download.outcome == 'success'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -153,6 +213,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Create and push multi-arch manifest
+        if: steps.download.outcome == 'success'
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \

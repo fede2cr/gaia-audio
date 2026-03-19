@@ -325,6 +325,19 @@ fn load_onnx_runner(path: &Path) -> Result<TypedRunnableModel<TypedModel>> {
         .context("Cannot make ONNX model runnable")
 }
 
+/// Validate that an ONNX file can be loaded, optimised, and made
+/// runnable by tract-onnx.
+///
+/// This exercises the exact same code path as the runtime model
+/// loader.  It is meant to be called at container **build** time
+/// (via `gaia-processing validate-model <path>`) so that
+/// incompatibilities (unsupported ops, variable Reshape shapes, etc.)
+/// are caught before the image is published.
+pub fn validate_onnx_with_tract(path: &Path) -> Result<()> {
+    let _runner = load_onnx_runner(path)?;
+    Ok(())
+}
+
 impl LoadedModel {
     /// The model's domain (e.g. "birds", "bats").
     pub fn domain(&self) -> &str {

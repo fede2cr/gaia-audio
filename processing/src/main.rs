@@ -48,6 +48,38 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // ── validate-model subcommand (build-time dry-run) ───────────────
+    // Usage: gaia-processing validate-model <path.onnx> [<path2.onnx> …]
+    //
+    // Loads each model with tract-onnx (load → optimise → runnable),
+    // identical to the runtime code path.  Exits 0 on success, 1 on
+    // failure.  This is invoked during `docker build` to catch
+    // tract-incompatible ONNX files before the container is published.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("validate-model") {
+        let paths = &args[2..];
+        if paths.is_empty() {
+            eprintln!("Usage: gaia-processing validate-model <model.onnx> [<model2.onnx> …]");
+            std::process::exit(2);
+        }
+        let mut failed = false;
+        for path in paths {
+            let p = std::path::Path::new(path);
+            info!("Validating with tract-onnx: {}", p.display());
+            match model::validate_onnx_with_tract(p) {
+                Ok(()) => info!("  PASS ✓  {}", p.display()),
+                Err(e) => {
+                    tracing::error!("  FAIL ✗  {}: {e:#}", p.display());
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     if std::env::var("RUST_LOG").map_or(false, |v| v.contains("debug")) {
         info!("🔍 Debug logging ENABLED (RUST_LOG={})", std::env::var("RUST_LOG").unwrap_or_default());
     }
