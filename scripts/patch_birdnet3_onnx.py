@@ -809,6 +809,128 @@ def fix_range_scalar_inputs(model: onnx.ModelProto) -> int:
     return fixed
 
 
+def fold_reshape_shapes(model: onnx.ModelProto, known: dict[str, "np.ndarray"]) -> int:
+    """Materialize Reshape shape inputs as constant graph initializers.
+
+    tract-onnx rejects Reshape nodes whose shape input is produced by a
+    compute subgraph (Shape → Gather → Concat …) rather than stored as a
+    constant initializer.
+
+    This function derives the correct shape from two sources, in order:
+
+      1. **value_info** — after ``freeze_input_shapes`` + shape inference
+         every Reshape output has a concrete shape recorded in the graph's
+         ``value_info``.  This is the ground-truth target shape.
+      2. **propagated constants** — the ``known`` dict from
+         ``propagate_constants``.  Used as a fallback when value_info
+         is incomplete.  Values are only accepted when every element is
+         an exact integer (rejects bogus float propagation results).
+
+    New initializers are written with a ``_frozen`` suffix to avoid
+    "Duplicate definition of name" errors (the original compute node
+    that produced the tensor still exists in the graph).
+
+    Parameters
+    ----------
+    model : onnx.ModelProto
+        The model to patch in-place.
+    known : dict
+        Pre-computed constant values from ``propagate_constants``.
+
+    Returns the number of Reshape nodes whose shape input was replaced.
+    """
+    import numpy as np
+
+    graph = model.graph
+
+    # Names already considered "constant" by the validator.
+    const_names: set[str] = {init.name for init in graph.initializer}
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) == 1:
+            const_names.add(node.output[0])
+
+    # Build concrete-shape map from value_info/inputs/outputs.
+    shape_map: dict[str, list[int]] = {}
+    for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if not vi.type.HasField("tensor_type"):
+            continue
+        dims: list[int] = []
+        all_concrete = True
+        for d in vi.type.tensor_type.shape.dim:
+            if d.dim_value > 0:
+                dims.append(int(d.dim_value))
+            else:
+                all_concrete = False
+                break
+        if all_concrete and dims:
+            shape_map[vi.name] = dims
+
+    materialised = 0
+    # Cache: shape_values (tuple) → initializer name — so multiple
+    # Reshape nodes that need the same target shape reuse one tensor.
+    shape_to_init: dict[tuple[int, ...], str] = {}
+    counter = 0
+
+    for node in graph.node:
+        if node.op_type != "Reshape" or len(node.input) < 2:
+            continue
+
+        shape_name = node.input[1]
+        if not shape_name or shape_name in const_names:
+            continue
+
+        # ── Strategy 1: derive from the Reshape output's value_info ──
+        target: list[int] | None = None
+        out_name = node.output[0]
+        if out_name in shape_map:
+            target = shape_map[out_name]
+
+        # ── Strategy 2: propagated constant (must be exact integers) ──
+        if target is None and shape_name in known:
+            arr = known[shape_name].flatten()
+            candidate: list[int] = []
+            valid = True
+            for v in arr:
+                fv = float(v)
+                iv = int(round(fv))
+                if abs(fv - iv) > 1e-6:
+                    valid = False
+                    break
+                candidate.append(iv)
+            if valid:
+                target = candidate
+
+        if target is None:
+            print(
+                f"  WARNING: cannot resolve Reshape shape '{shape_name}' "
+                f"for node '{node.name}' — skipping"
+            )
+            continue
+
+        shape_key = tuple(target)
+        if shape_key in shape_to_init:
+            # Reuse an existing initializer with the same values.
+            new_name = shape_to_init[shape_key]
+        else:
+            new_name = f"_reshape_shape_frozen_{counter}"
+            counter += 1
+            tensor = numpy_helper.from_array(
+                np.array(target, dtype=np.int64), name=new_name
+            )
+            graph.initializer.append(tensor)
+            const_names.add(new_name)
+            shape_to_init[shape_key] = new_name
+
+        node.input[1] = new_name
+        materialised += 1
+        print(
+            f"  Materialised Reshape shape '{shape_name}' → "
+            f"{list(target)} (node '{node.name}')"
+        )
+
+    return materialised
+
+
 def fold_static_range_nodes(model: onnx.ModelProto, known: dict[str, "np.ndarray"] | None = None) -> int:
     """Constant-fold Range nodes whose inputs are all static.
 
@@ -984,6 +1106,10 @@ def main() -> None:
     print("Running constant propagation ...")
     known = propagate_constants(model)
     print(f"  Resolved {len(known)} static tensors")
+
+    reshape_folded = fold_reshape_shapes(model, known=known)
+    if reshape_folded:
+        print(f"Materialised {reshape_folded} Reshape shape input(s) as initializers")
 
     range_folded = fold_static_range_nodes(model, known=known)
     if range_folded:

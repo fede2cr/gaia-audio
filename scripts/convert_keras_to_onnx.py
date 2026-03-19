@@ -132,6 +132,60 @@ def convert(model_dir: str, output_name: str = "audio-model.onnx") -> str:
     return onnx_path
 
 
+def _freeze_reshape_shape(onnx_path: str, reshape_node, shape_input_name: str,
+                          sample_input) -> None:
+    """Replace a Reshape node's dynamic shape input with a constant.
+
+    Adds the shape tensor as a temporary model output, runs inference
+    with onnxruntime to capture its concrete value, then replaces it
+    with a constant initializer in the graph.
+    """
+    import onnx
+    import onnxruntime as ort
+    from onnx import numpy_helper, helper
+    import numpy as np
+
+    model = onnx.load(onnx_path)
+    graph = model.graph
+
+    # Add the shape tensor as a temporary output so ORT will expose it.
+    graph.output.append(
+        helper.make_tensor_value_info(shape_input_name, onnx.TensorProto.INT64, None)
+    )
+    tmp_path = onnx_path + ".freeze_tmp"
+    onnx.save(model, tmp_path)
+
+    try:
+        sess = ort.InferenceSession(tmp_path)
+        inp_name = sess.get_inputs()[0].name
+        shape_val = sess.run([shape_input_name], {inp_name: sample_input})[0]
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    shape_val = shape_val.flatten().astype(np.int64)
+    print(f"    Captured shape value: {shape_val.tolist()}")
+
+    # Reload original model (without the temporary output).
+    model = onnx.load(onnx_path)
+    graph = model.graph
+
+    # Create a constant initializer with the captured shape.
+    const_name = f"{reshape_node.name}_frozen_shape"
+    tensor = numpy_helper.from_array(shape_val, name=const_name)
+    graph.initializer.append(tensor)
+
+    # Point every Reshape that references this shape input at the constant.
+    for node in graph.node:
+        if node.op_type == "Reshape":
+            for i, inp in enumerate(node.input):
+                if inp == shape_input_name:
+                    node.input[i] = const_name
+
+    onnx.save(model, onnx_path)
+    print(f"    Froze as constant initializer '{const_name}' = {shape_val.tolist()}")
+
+
 def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> str:
     """Convert meta-model.h5 → ONNX.
 
@@ -266,92 +320,61 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
     print(f"Converting metadata model to ONNX: {onnx_path} …")
     model_proto, _ = tf2onnx.convert.from_keras(model, output_path=onnx_path)
 
-    # ── Post-process: freeze Reshape shape inputs ────────────────────
+    # ── Post-process: constant-fold via onnxruntime ──────────────────
     # tf2onnx emits the Reshape shape as a computed subgraph
     # (Shape → Gather → Unsqueeze → Concat) even when we use [-1, N]
     # in Python.  tract-onnx rejects this ("shape input is variable").
-    # Fix by replacing each Reshape's shape input with a constant
-    # initializer inferred from onnxruntime's shape inference.
+    #
+    # ORT's basic graph optimizer includes constant folding, which
+    # collapses these subgraphs into constant initializers.
+    import onnxruntime as ort
+    print("  Running onnxruntime constant-folding …")
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    optimized_path = onnx_path + ".optimized"
+    opts.optimized_model_filepath = optimized_path
+    ort.InferenceSession(onnx_path, opts)  # triggers optimize + save
+    os.replace(optimized_path, onnx_path)
+    print("  Constant-folded model saved")
+
+    # ── Verify: all Reshape shape inputs must be constant ────────────
     import onnx
-    from onnx import numpy_helper, TensorProto
-
     model_onnx = onnx.load(onnx_path)
-    graph = model_onnx.graph
+    init_names = {i.name for i in model_onnx.graph.initializer}
+    for node in model_onnx.graph.node:
+        if node.op_type == "Reshape" and len(node.input) >= 2:
+            shape_inp = node.input[1]
+            if shape_inp not in init_names:
+                # ORT constant folding didn't catch it — freeze manually.
+                # Run inference to capture the actual shape tensor value.
+                print(f"  Reshape '{node.name}' still has variable shape "
+                      f"input '{shape_inp}', freezing manually …")
+                _freeze_reshape_shape(onnx_path, node, shape_inp, test_input)
+                # Re-load to update init_names for subsequent nodes.
+                model_onnx = onnx.load(onnx_path)
+                init_names = {i.name for i in model_onnx.graph.initializer}
 
-    # Build a lookup of initialiser names for quick membership test.
-    init_names = {init.name for init in graph.initializer}
-
-    patched = 0
-    for node in graph.node:
-        if node.op_type != "Reshape" or len(node.input) < 2:
-            continue
-        shape_input = node.input[1]
-        if shape_input in init_names:
-            continue  # already a constant — nothing to do
-
-        # Use onnx shape inference to determine the Reshape output shape.
-        from onnx import shape_inference
-        inferred = shape_inference.infer_shapes(model_onnx)
-        # Find the shape of this Reshape node's output.
-        output_name = node.output[0]
-        target_shape = None
-        for vi in inferred.graph.value_info:
-            if vi.name == output_name:
-                dims = vi.type.tensor_type.shape.dim
-                target_shape = []
-                for d in dims:
-                    if d.dim_value > 0:
-                        target_shape.append(d.dim_value)
-                    else:
-                        target_shape.append(-1)  # dynamic batch → -1
-                break
-        # Also check graph outputs in case it's a final node.
-        if target_shape is None:
-            for vi in inferred.graph.output:
-                if vi.name == output_name:
-                    dims = vi.type.tensor_type.shape.dim
-                    target_shape = []
-                    for d in dims:
-                        if d.dim_value > 0:
-                            target_shape.append(d.dim_value)
-                        else:
-                            target_shape.append(-1)
-                    break
-
-        if target_shape is None:
-            print(f"  WARNING: could not infer shape for Reshape "
-                  f"node '{node.name}', skipping")
-            continue
-
-        # Create a constant initializer with the target shape.
-        const_name = f"{node.name}_shape_const"
-        shape_array = np.array(target_shape, dtype=np.int64)
-        tensor = numpy_helper.from_array(shape_array, name=const_name)
-        graph.initializer.append(tensor)
-        init_names.add(const_name)
-
-        # Point the Reshape node at the constant.
-        node.input[1] = const_name
-        patched += 1
-        print(f"  Froze Reshape '{node.name}' shape to {target_shape}")
-
-    if patched:
-        onnx.save(model_onnx, onnx_path)
-        print(f"  Patched {patched} Reshape node(s) with constant shapes")
+    # Final check.
+    model_onnx = onnx.load(onnx_path)
+    init_names = {i.name for i in model_onnx.graph.initializer}
+    for node in model_onnx.graph.node:
+        if node.op_type == "Reshape" and len(node.input) >= 2:
+            if node.input[1] not in init_names:
+                raise RuntimeError(
+                    f"FATAL: Reshape node '{node.name}' still has "
+                    f"non-constant shape input '{node.input[1]}' — "
+                    f"tract-onnx will reject this model")
 
     size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
     print(f"  Written {size_mb:.1f} MB ONNX metadata model")
+    print(f"  All Reshape shape inputs verified as constant ✓")
 
     # Validate with onnxruntime.
-    try:
-        import onnxruntime as ort
-        sess = ort.InferenceSession(onnx_path)
-        inp_name = sess.get_inputs()[0].name
-        onnx_pred = sess.run(None, {inp_name: test_input})[0]
-        max_diff = np.max(np.abs(keras_pred - onnx_pred))
-        print(f"  ONNX validation: max diff vs Keras = {max_diff:.2e}")
-    except ImportError:
-        print("  (onnxruntime not installed, skipping ONNX validation)")
+    sess = ort.InferenceSession(onnx_path)
+    inp_name = sess.get_inputs()[0].name
+    onnx_pred = sess.run(None, {inp_name: test_input})[0]
+    max_diff = np.max(np.abs(keras_pred - onnx_pred))
+    print(f"  ONNX validation: max diff vs Keras = {max_diff:.2e}")
 
     print("Metadata model conversion done.")
     return onnx_path

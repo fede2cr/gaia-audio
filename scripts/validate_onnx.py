@@ -112,6 +112,36 @@ def validate(model_path: str, expected_shape: list[int]) -> None:
 
     num_classes = result.shape[-1]
     print(f"  Classes: {num_classes}")
+
+    # ── 5. tract-onnx compatibility: Reshape shape inputs ────────────
+    # tract-onnx rejects Reshape nodes whose shape input is computed
+    # by a subgraph rather than being a constant initializer.  Check
+    # this at build time so we catch it before runtime.
+    try:
+        import onnx
+        model_onnx = onnx.load(model_path)
+        graph = model_onnx.graph
+        const_names = {i.name for i in graph.initializer}
+        # Also count Constant op outputs as "constant".
+        for node in graph.node:
+            if node.op_type == "Constant":
+                for out in node.output:
+                    const_names.add(out)
+        bad_reshapes = []
+        for node in graph.node:
+            if node.op_type == "Reshape" and len(node.input) >= 2:
+                if node.input[1] not in const_names:
+                    bad_reshapes.append(
+                        f"'{node.name}' (shape input: '{node.input[1]}')")
+        if bad_reshapes:
+            raise RuntimeError(
+                f"Reshape node(s) with non-constant shape inputs "
+                f"(tract-onnx will reject these): "
+                + "; ".join(bad_reshapes))
+        print(f"  Reshape shapes: all constant ✓")
+    except ImportError:
+        print("  (onnx not installed, skipping Reshape check)")
+
     print(f"  PASS ✓")
 
 
