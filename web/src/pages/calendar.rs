@@ -84,10 +84,11 @@ pub fn CalendarPage() -> impl IntoView {
 /// Returns (year, month) for the current date.
 /// On WASM we cannot use `chrono::Local`, so we parse from js_sys.
 fn js_sys_now() -> (i32, u32) {
-    // Fallback for SSR – use chrono if available.
+    // Fallback for SSR – use UTC (the calendar merely defaults to a month;
+    // the actual data is queried separately with proper TZ handling).
     #[cfg(feature = "ssr")]
     {
-        let now = chrono::Local::now();
+        let now = chrono::Utc::now();
         return (now.format("%Y").to_string().parse().unwrap_or(2025),
                 now.format("%m").to_string().parse().unwrap_or(1));
     }

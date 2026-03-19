@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration, Utc};
 use rusqlite::{params, Connection};
 
 use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, TopRecording, UrbanNoiseSummary, WebDetection,
@@ -55,6 +55,33 @@ fn stamp(det: &mut WebDetection, offset: i32) {
     let (dd, dt) = apply_tz(&det.date, &det.time, offset);
     det.display_date = dd;
     det.display_time = dt;
+}
+
+/// Fill `display_date` / `display_time` on a `TopRecording` in-place.
+fn stamp_recording(rec: &mut TopRecording, offset: i32) {
+    let (dd, dt) = apply_tz(&rec.date, &rec.time, offset);
+    rec.display_date = dd;
+    rec.display_time = dt;
+}
+
+/// Return today's date string (YYYY-MM-DD) according to the user's TZ offset.
+///
+/// The database stores everything in UTC.  When `tz_offset = -6`, midnight
+/// in the user's timezone corresponds to `06:00 UTC`, so "today" starts
+/// 6 hours later than UTC midnight.  We apply the offset to `Utc::now()`
+/// to derive the correct calendar date for the user.
+fn today_for_tz(offset: i32) -> String {
+    let utc_now = Utc::now().naive_utc();
+    let local_now = utc_now + Duration::hours(offset as i64);
+    local_now.format("%Y-%m-%d").to_string()
+}
+
+/// Public version — reads the TZ offset from the database and returns today's
+/// date string.  Used by server functions that don't already hold a connection.
+pub fn today_for_tz_pub(db_path: &Path) -> Result<String, rusqlite::Error> {
+    let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
+    Ok(today_for_tz(tz))
 }
 
 /// Open a read-only connection with a busy timeout.
@@ -288,11 +315,15 @@ pub fn species_active_dates(
 }
 
 /// Hourly detection histogram for a single species (all-time).
+///
+/// Hours are shifted by the user's `tz_offset` so the histogram
+/// reflects local time, not UTC.
 pub fn species_hourly_histogram(
     db_path: &Path,
     scientific_name: &str,
 ) -> Result<Vec<HourlyCount>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
     let mut stmt = conn.prepare(
         "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
          FROM detections \
@@ -309,15 +340,32 @@ pub fn species_hourly_histogram(
         })
     })?;
 
-    rows.collect()
+    if tz == 0 {
+        return rows.collect();
+    }
+
+    // Re-bucket hours into local time.
+    let mut buckets = [0u32; 24];
+    for row in rows {
+        let hc = row?;
+        let local_hour = ((hc.hour as i32 + tz).rem_euclid(24)) as u32;
+        buckets[local_hour as usize] += hc.count;
+    }
+    Ok(buckets.iter().enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(h, &c)| HourlyCount { hour: h as u32, count: c })
+        .collect())
 }
 
 /// Per-species hourly breakdown for a specific date (for the day view chart).
+///
+/// Hours are shifted by the user's `tz_offset`.
 pub fn daily_species_hourly(
     db_path: &Path,
     date: &str,
 ) -> Result<Vec<SpeciesHourlyCounts>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
     // First get distinct species for the day, ordered by total count.
     let mut sp_stmt = conn.prepare(
         "SELECT Sci_Name, Com_Name, COUNT(*) AS cnt \
@@ -344,7 +392,7 @@ pub fn daily_species_hourly(
 
     let mut result = Vec::new();
     for (sci, com, total) in species {
-        let hours: Vec<HourlyCount> = hour_stmt
+        let raw_hours: Vec<HourlyCount> = hour_stmt
             .query_map(params![date, &sci], |row| {
                 Ok(HourlyCount {
                     hour: row.get(0)?,
@@ -352,6 +400,20 @@ pub fn daily_species_hourly(
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        let hours = if tz == 0 {
+            raw_hours
+        } else {
+            let mut buckets = [0u32; 24];
+            for hc in &raw_hours {
+                let local_hour = ((hc.hour as i32 + tz).rem_euclid(24)) as u32;
+                buckets[local_hour as usize] += hc.count;
+            }
+            buckets.iter().enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(h, &c)| HourlyCount { hour: h as u32, count: c })
+                .collect()
+        };
 
         result.push(SpeciesHourlyCounts {
             scientific_name: sci,
@@ -610,6 +672,7 @@ pub fn get_top_recordings(
     limit: u32,
 ) -> Result<Vec<TopRecording>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
 
     // Try the cached table first.
     let has_table: bool = conn
@@ -631,12 +694,16 @@ pub fn get_top_recordings(
             .unwrap_or(0);
 
         if has_rows > 0 {
-            return get_top_recordings_cached(&conn, scientific_name, limit);
+            let mut recs = get_top_recordings_cached(&conn, scientific_name, limit)?;
+            for r in &mut recs { stamp_recording(r, tz); }
+            return Ok(recs);
         }
     }
 
     // Fallback: live query.
-    get_top_recordings_live(&conn, scientific_name, limit)
+    let mut recs = get_top_recordings_live(&conn, scientific_name, limit)?;
+    for r in &mut recs { stamp_recording(r, tz); }
+    Ok(recs)
 }
 
 fn get_top_recordings_cached(
@@ -654,11 +721,15 @@ fn get_top_recordings_cached(
     )?;
 
     let rows = stmt.query_map(params![scientific_name, limit], |row| {
+        let date: String = row.get(2)?;
+        let time: String = row.get(3)?;
         Ok(TopRecording {
             scientific_name: row.get(0)?,
             common_name: row.get(1)?,
-            date: row.get(2)?,
-            time: row.get(3)?,
+            display_date: date.clone(),
+            display_time: time.clone(),
+            date,
+            time,
             confidence: row.get(4)?,
             file_name: row.get(5)?,
             source_node: row.get(6)?,
@@ -687,11 +758,15 @@ fn get_top_recordings_live(
     )?;
 
     let rows = stmt.query_map(params![scientific_name, limit], |row| {
+        let date: String = row.get(2)?;
+        let time: String = row.get(3)?;
         Ok(TopRecording {
             scientific_name: row.get(0)?,
             common_name: row.get(1)?,
-            date: row.get(2)?,
-            time: row.get(3)?,
+            display_date: date.clone(),
+            display_time: time.clone(),
+            date,
+            time,
             confidence: row.get(4)?,
             file_name: row.get(5)?,
             source_node: row.get(6)?,
@@ -1074,7 +1149,8 @@ pub fn urban_noise_summary(
     db_path: &Path,
 ) -> Result<Vec<UrbanNoiseSummary>, rusqlite::Error> {
     let conn = open(db_path)?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let tz = read_tz_offset(&conn);
+    let today = today_for_tz(tz);
 
     let mut stmt = conn.prepare(
         "SELECT Category,
@@ -1294,22 +1370,24 @@ pub fn remove_species_verification(
 ///   * every detection for that same `File_Name` shares the same `Sci_Name`
 ///     (i.e. the clip contains only one species)
 ///
-/// When `today_only` is `true` only detections from today (UTC) are returned.
+/// When `today_only` is `true` only detections from today (TZ-aware) are returned.
 pub fn quiz_candidates(
     db_path: &Path,
     today_only: bool,
 ) -> Result<Vec<QuizItem>, rusqlite::Error> {
     let conn = open(db_path)?;
+    let tz = read_tz_offset(&conn);
+    let today_str = today_for_tz(tz);
 
     // Use separate date filters: the CTE has no table alias while the
     // outer query uses `d`.
     let cte_date_filter = if today_only {
-        "AND Date = DATE('now')"
+        "AND Date = ?1"
     } else {
         ""
     };
     let outer_date_filter = if today_only {
-        "AND d.Date = DATE('now')"
+        "AND d.Date = ?1"
     } else {
         ""
     };
@@ -1336,19 +1414,27 @@ pub fn quiz_candidates(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
+
+    // When today_only we bind the TZ-aware date; otherwise no params.
+    let mapper = |row: &rusqlite::Row| {
         let sci_name: String = row.get(0)?;
         let com_name: String = row.get(1)?;
         let date: String = row.get(2)?;
         let file_name: String = row.get(3)?;
         Ok((sci_name, com_name, date, file_name))
-    })?;
+    };
+
+    let collected: Vec<Result<(String, String, String, String), rusqlite::Error>> = if today_only {
+        stmt.query_map(params![today_str], mapper)?.collect()
+    } else {
+        stmt.query_map([], mapper)?.collect()
+    };
 
     // Pick one clip per species, up to 4 distinct species.
     let mut seen_species = std::collections::HashSet::new();
     let mut items = Vec::new();
 
-    for row in rows {
+    for row in collected {
         let (sci_name, com_name, date, file_name) = row?;
         if seen_species.contains(&sci_name) {
             continue;

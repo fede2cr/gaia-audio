@@ -663,6 +663,9 @@ fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String
     let text = std::fs::read_to_string(label_path)
         .with_context(|| format!("Cannot read labels: {}", label_path.display()))?;
 
+    // Strip the UTF-8 BOM if present (BirdNET+ V3.0 labels.csv starts with one).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+
     let is_csv = label_path
         .extension()
         .map_or(false, |ext| ext.eq_ignore_ascii_case("csv"));

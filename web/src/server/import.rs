@@ -129,7 +129,7 @@ pub fn analyse_backup(tar_path: &Path) -> Result<ImportReport, String> {
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("Cannot open extracted birds.db: {e}"))?;
 
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     let total_detections: u64 = conn
         .query_row("SELECT COUNT(*) FROM detections", [], |r| r.get(0))
@@ -337,7 +337,7 @@ pub fn stream_import(
             "-s",                           // silent
             "-f",                           // fail on HTTP errors
             "-L",                           // follow redirects
-            "-d", "user=birdnet&password=", // POST credentials
+            "-d", "user=birdnet&password=", // POST credentials (empty password — BirdNET-Pi default)
             &url,
         ])
         .stdout(std::process::Stdio::piped())
@@ -1076,7 +1076,7 @@ mod tests {
         println!("║ Audio files (mp3): {:>7}", report.audio_file_count);
         println!("║ Spectrograms:      {:>7}", report.spectrogram_count);
         if let Some(lat) = report.latitude {
-            println!("║ Location:          {:.4}°, {:.4}°", lat, report.longitude.unwrap_or(0.0));
+            println!("║ Location:          (present, redacted from log)");
         }
         println!("╠══════════════════════════════════════╣");
         println!("║ Top 10 Species:");

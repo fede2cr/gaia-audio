@@ -489,8 +489,8 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                                     let spec_url = r.spectrogram_url();
                                     let clip     = r.clip_url();
                                     let conf_pct = format!("{:.0}%", r.confidence * 100.0);
-                                    let date     = r.date.clone();
-                                    let time     = r.time.clone();
+                                    let date     = if r.display_date.is_empty() { r.date.clone() } else { r.display_date.clone() };
+                                    let time     = if r.display_time.is_empty() { r.time.clone() } else { r.display_time.clone() };
                                     view! {
                                         <div class="recording-card">
                                             <img
@@ -600,7 +600,7 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
 fn js_sys_now() -> (i32, u32) {
     #[cfg(feature = "ssr")]
     {
-        let now = chrono::Local::now();
+        let now = chrono::Utc::now();
         return (
             now.format("%Y").to_string().parse().unwrap_or(2025),
             now.format("%m").to_string().parse().unwrap_or(1),

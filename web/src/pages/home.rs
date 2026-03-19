@@ -48,7 +48,9 @@ pub async fn get_top_species(
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     // Show today's top species instead of all-time.
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // Use the user's TZ offset so "today" matches their local midnight.
+    let today = db::today_for_tz_pub(&state.db_path)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut species = db::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;

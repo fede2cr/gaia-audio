@@ -194,6 +194,12 @@ pub struct TopRecording {
     pub file_name: String,
     pub source_node: String,
     pub model_name: String,
+    /// TZ-adjusted date for display (same as `date` when offset = 0).
+    #[serde(default)]
+    pub display_date: String,
+    /// TZ-adjusted time for display (same as `time` when offset = 0).
+    #[serde(default)]
+    pub display_time: String,
 }
 
 impl TopRecording {

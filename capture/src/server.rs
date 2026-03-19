@@ -27,6 +27,40 @@ use gaia_common::protocol::{HealthResponse, RecordingInfo};
 
 use crate::DiskState;
 
+/// Resolve a user-supplied filename to an absolute path inside `base_dir`.
+///
+/// Returns `Err(StatusCode::BAD_REQUEST)` if the name contains path
+/// separators or traversal sequences, or if the canonicalized result
+/// escapes the base directory.  This guards against path-injection
+/// attacks (CodeQL `rust/path-injection`).
+fn safe_recording_path(
+    base_dir: &std::path::Path,
+    name: &str,
+) -> Result<PathBuf, StatusCode> {
+    // Reject obvious traversal / separator characters up-front so we
+    // never even touch the filesystem for clearly malicious inputs.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let candidate = base_dir.join(name);
+
+    // Canonicalize both paths (resolves symlinks + normalises) then
+    // verify the candidate is strictly inside the base directory.
+    let canon_base = base_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let canon_file = candidate
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    if !canon_file.starts_with(&canon_base) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(canon_file)
+}
+
 /// Shared state for route handlers.
 #[derive(Clone)]
 struct AppState {
@@ -44,6 +78,12 @@ pub async fn run(
     shutdown: Arc<AtomicBool>,
     disk: Arc<DiskState>,
 ) -> anyhow::Result<()> {
+    // Canonicalize the stream directory so all downstream path operations
+    // (read_dir, join, metadata, open, remove) use a fully-resolved base.
+    // This satisfies CodeQL's path-injection analysis by proving the base
+    // is not attacker-controlled.
+    let stream_dir = stream_dir.canonicalize().unwrap_or(stream_dir);
+
     let state = AppState {
         stream_dir,
         start_time: Instant::now(),
@@ -159,12 +199,7 @@ async fn download_recording(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Sanitise: prevent directory traversal
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let file_path = state.stream_dir.join(&name);
+    let file_path = safe_recording_path(&state.stream_dir, &name)?;
 
     let meta = tokio::fs::metadata(&file_path)
         .await
@@ -204,16 +239,17 @@ async fn delete_recording(
 ) -> StatusCode {
     debug!(file = %name, "DELETE request received from processing node");
 
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        debug!(file = %name, "DELETE rejected: invalid path characters");
-        return StatusCode::BAD_REQUEST;
-    }
-
-    let file_path = state.stream_dir.join(&name);
-    if !file_path.exists() {
-        debug!(file = %name, "DELETE rejected: file not found");
-        return StatusCode::NOT_FOUND;
-    }
+    let file_path = match safe_recording_path(&state.stream_dir, &name) {
+        Ok(p) => p,
+        Err(StatusCode::NOT_FOUND) => {
+            debug!(file = %name, "DELETE rejected: file not found");
+            return StatusCode::NOT_FOUND;
+        }
+        Err(code) => {
+            debug!(file = %name, "DELETE rejected: invalid path");
+            return code;
+        }
+    };
 
     // Grab file size before deleting so we can log how much space was freed.
     let size_bytes = tokio::fs::metadata(&file_path)
