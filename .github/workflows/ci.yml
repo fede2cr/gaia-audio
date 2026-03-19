@@ -10,6 +10,8 @@ on:
 env:
   REGISTRY: docker.io
   IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
+  # Opt into Node.js 24 for all JavaScript actions.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── Detect which containers need rebuilding ──────────────────────────────
@@ -30,9 +32,6 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
-          # On tags, always build everything (release).
-          # On push to main / PRs, only build what changed.
-          predicate-quantifier: some
           filters: |
             capture:
               - Cargo.toml
@@ -233,8 +232,8 @@ jobs:
 
       - name: Create and push multi-arch manifest
         if: steps.download.outcome == 'success'
-        working-directory: /tmp/digests
         run: |
+          cd /tmp/digests
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}@sha256:%s ' *)
