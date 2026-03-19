@@ -515,3 +515,54 @@ pub fn cleanup_processing_log(db_path: &Path) {
         debug!("cleanup_processing_log: purged {removed} stale entries");
     }
 }
+
+/// One-time migration: backfill the `Domain` column with per-species
+/// taxonomic class values parsed from the labels CSV.
+///
+/// For models whose labels CSV has a `class` column (e.g. BirdNET+ V3.0),
+/// this updates existing rows where `Domain` still holds the coarse
+/// model-wide value (e.g. `"birds"`) to use the correct per-species
+/// class (e.g. `"Aves"`, `"Mammalia"`, `"Insecta"`, …).
+///
+/// The update is idempotent: rows that already have the correct class
+/// are not touched, and model_slug scoping prevents cross-model clashes.
+pub fn migrate_domain_classes(
+    db_path: &Path,
+    model_slug: &str,
+    old_domain: &str,
+    class_map: &std::collections::HashMap<String, String>,
+) {
+    if class_map.is_empty() {
+        return;
+    }
+
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("migrate_domain_classes: cannot open DB: {e}");
+            return;
+        }
+    };
+    conn.execute_batch("PRAGMA busy_timeout=5000;").ok();
+
+    let mut updated: usize = 0;
+    for (sci_name, class) in class_map {
+        if class == old_domain {
+            continue; // nothing to change
+        }
+        let n = conn
+            .execute(
+                "UPDATE detections SET Domain = ?1 \
+                 WHERE Sci_Name = ?2 AND Domain = ?3 AND Model_Slug = ?4",
+                params![class, sci_name, old_domain, model_slug],
+            )
+            .unwrap_or(0);
+        updated += n;
+    }
+    if updated > 0 {
+        info!(
+            "migrate_domain_classes: backfilled {updated} detection(s) \
+             for model {model_slug} ('{old_domain}' → per-species class)",
+        );
+    }
+}

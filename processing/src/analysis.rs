@@ -94,6 +94,7 @@ fn run_analysis(
     config: &Config,
 ) -> Result<(Vec<Detection>, Vec<LivePrediction>)> {
     let domain = model.domain().to_string();
+    let class_map = model.csv_classes().clone();
     let model_slug = model.manifest.slug();
     let model_name = model.manifest.manifest.model.name.clone();
     // Tag for log messages: "BirdNET V2.4/birds" or "Google Perch 2.0/wildlife"
@@ -243,8 +244,15 @@ fn run_analysis(
                 );
             }
 
+            // Use per-species taxonomic class when the labels CSV
+            // provides one (e.g. BirdNET+ V3.0: Aves, Mammalia, …),
+            // otherwise fall back to the model-wide domain.
+            let det_domain = class_map
+                .get(sci_name.as_str())
+                .map_or(&domain, |c| c);
+
             let mut det = Detection::new(
-                &domain,
+                det_domain,
                 file.file_date,
                 *start,
                 *end,

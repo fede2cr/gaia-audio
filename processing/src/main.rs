@@ -211,6 +211,22 @@ fn main() -> Result<()> {
         );
     }
 
+    // ── backfill per-species taxonomic class ─────────────────────────
+    // Models whose labels CSV contains a `class` column (e.g. BirdNET+
+    // V3.0) now set Domain per-species.  Migrate existing detections
+    // that still carry the old model-wide domain.
+    for m in &models {
+        let class_map = m.csv_classes();
+        if !class_map.is_empty() {
+            db::migrate_domain_classes(
+                &config.db_path,
+                &m.manifest.slug(),
+                m.domain(),
+                class_map,
+            );
+        }
+    }
+
     let num_workers = config.processing_threads;
     info!(
         "Processing threads: {} (set PROCESSING_THREADS to change)",

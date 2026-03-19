@@ -47,6 +47,10 @@ pub struct LoadedModel {
     /// Used as fallback when no JSON language file is available (e.g.
     /// BirdNET+ V3.0).
     csv_common_names: HashMap<String, String>,
+    /// Taxonomic class map parsed from CSV labels (sci_name → class).
+    /// Populated for models whose label file has a `class` column
+    /// (e.g. BirdNET+ V3.0: Aves, Mammalia, Insecta, …).
+    csv_classes: HashMap<String, String>,
     pub manifest: ResolvedManifest,
     sensitivity: f64,
     /// When `true` the ONNX model is a classifier-only sub-model that
@@ -262,7 +266,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     } else {
         (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
     };
-    let (labels, csv_common_names) = load_labels(&resolved.labels_path())?;
+    let (labels, csv_common_names, csv_classes) = load_labels(&resolved.labels_path())?;
 
     let meta_model = match load_meta_model(resolved, &labels, config.sf_thresh) {
         Ok(m) => m,
@@ -293,6 +297,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         meta_model,
         labels,
         csv_common_names,
+        csv_classes,
         manifest: resolved.clone(),
         sensitivity,
         onnx_classifier,
@@ -366,6 +371,16 @@ impl LoadedModel {
     /// JSON language file ships with the model.
     pub fn csv_common_names(&self) -> &HashMap<String, String> {
         &self.csv_common_names
+    }
+
+    /// Taxonomic class map extracted from CSV labels.
+    ///
+    /// Non-empty for models whose label file has a `class` column
+    /// (e.g. BirdNET+ V3.0: Aves, Mammalia, Insecta, …).  Returns
+    /// `sci_name → class`.  When the map is empty (V2.4, Perch, …)
+    /// callers should fall back to [`Self::domain()`].
+    pub fn csv_classes(&self) -> &HashMap<String, String> {
+        &self.csv_classes
     }
 
     /// Run inference on a single audio chunk.
@@ -522,7 +537,7 @@ fn load_meta_model(
             info!("Loading ONNX metadata model: {}", onnx_path.display());
             let runner = load_onnx_runner(&onnx_path)
                 .with_context(|| format!("Cannot load ONNX metadata model: {}", onnx_path.display()))?;
-            let (labels, _) = load_labels(&resolved.metadata_labels_path())?;
+            let (labels, _, _) = load_labels(&resolved.metadata_labels_path())?;
             return Ok(Some(MetaDataModel {
                 runner,
                 labels,
@@ -554,7 +569,7 @@ fn load_meta_model(
         .into_optimized()?
         .into_runnable()?;
 
-    let (labels, _) = load_labels(&resolved.metadata_labels_path())?;
+    let (labels, _, _) = load_labels(&resolved.metadata_labels_path())?;
 
     Ok(Some(MetaDataModel {
         runner,
@@ -659,7 +674,14 @@ impl MetaDataModel {
 /// Returns `(labels, common_names)`.  The common-name map is populated
 /// only for CSV files that have a recognisable `com_name` column;
 /// for plain-text labels the map is empty.
-fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String>)> {
+///
+/// When the CSV also contains a `class` column (e.g. BirdNET+ V3.0:
+/// `Aves`, `Mammalia`, `Insecta`, …), a third map `sci_name → class`
+/// is returned so that callers can use per-species taxonomic class
+/// instead of the coarse per-model domain.
+fn load_labels(
+    label_path: &Path,
+) -> Result<(Vec<String>, HashMap<String, String>, HashMap<String, String>)> {
     let text = std::fs::read_to_string(label_path)
         .with_context(|| format!("Cannot read labels: {}", label_path.display()))?;
 
@@ -671,6 +693,7 @@ fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String
         .map_or(false, |ext| ext.eq_ignore_ascii_case("csv"));
 
     let mut common_names: HashMap<String, String> = HashMap::new();
+    let mut classes: HashMap<String, String> = HashMap::new();
 
     let labels: Vec<String> = if is_csv {
         // Auto-detect delimiter: semicolon if the first line contains `;`,
@@ -711,6 +734,15 @@ fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String
             None
         };
 
+        // Find the column index for `class` (taxonomic class, e.g. Aves).
+        let class_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| col.trim().eq_ignore_ascii_case("class"))
+        } else {
+            None
+        };
+
         let data_lines: Box<dyn Iterator<Item = &str>> = if is_header {
             Box::new(lines)
         } else {
@@ -727,6 +759,14 @@ fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String
                         let cn = cn.trim();
                         if !cn.is_empty() {
                             common_names.insert(sci.clone(), cn.to_string());
+                        }
+                    }
+                }
+                if let Some(ci) = class_col {
+                    if let Some(cls) = cols.get(ci) {
+                        let cls = cls.trim();
+                        if !cls.is_empty() {
+                            classes.insert(sci.clone(), cls.to_string());
                         }
                     }
                 }
@@ -752,12 +792,13 @@ fn load_labels(label_path: &Path) -> Result<(Vec<String>, HashMap<String, String
     };
 
     info!(
-        "Loaded {} labels ({} with common names) from {}",
+        "Loaded {} labels ({} with common names, {} with class) from {}",
         labels.len(),
         common_names.len(),
+        classes.len(),
         label_path.display(),
     );
-    Ok((labels, common_names))
+    Ok((labels, common_names, classes))
 }
 
 /// Load the JSON language file that maps `scientific_name → common_name`.
