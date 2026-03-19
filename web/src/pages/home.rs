@@ -9,6 +9,7 @@ use leptos::either::Either;
 
 use crate::components::detection_card::DetectionCard;
 use crate::components::live_analysis::LiveAnalysis;
+use crate::components::model_filter::ModelFilter;
 use crate::components::species_card::SpeciesCard;
 use crate::components::urban_noise::UrbanNoise;
 use crate::model::{SpeciesSummary, WebDetection};
@@ -19,11 +20,13 @@ use crate::model::{SpeciesSummary, WebDetection};
 pub async fn get_recent_detections(
     limit: u32,
     after_rowid: Option<i64>,
+    model_slug: String,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut detections = db::recent_detections(&state.db_path, limit, after_rowid)
+    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
+    let mut detections = db::recent_detections_filtered(&state.db_path, limit, after_rowid, slug_opt)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist species photos
@@ -36,14 +39,18 @@ pub async fn get_recent_detections(
 }
 
 #[server(prefix = "/api")]
-pub async fn get_top_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFnError> {
+pub async fn get_top_species(
+    limit: u32,
+    model_slug: String,
+) -> Result<Vec<SpeciesSummary>, ServerFnError> {
     use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     // Show today's top species instead of all-time.
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut species = db::top_species_for_date(&state.db_path, &today, limit)
+    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
+    let mut species = db::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images
@@ -60,11 +67,20 @@ pub async fn get_top_species(limit: u32) -> Result<Vec<SpeciesSummary>, ServerFn
 /// Live detection feed with auto-polling + top species sidebar.
 #[component]
 pub fn Home() -> impl IntoView {
-    // Latest detections resource (initial load)
-    let detections = Resource::new(|| (), |_| async { get_recent_detections(50, None).await });
+    // Model filter
+    let (model_slug, set_model_slug) = signal(String::new());
 
-    // Top species
-    let top_species = Resource::new(|| (), |_| async { get_top_species(12).await });
+    // Latest detections resource (initial load) – re-fetches when model changes
+    let detections = Resource::new(
+        move || model_slug.get(),
+        |slug| async move { get_recent_detections(50, None, slug).await },
+    );
+
+    // Top species – also re-fetches when model changes
+    let top_species = Resource::new(
+        move || model_slug.get(),
+        |slug| async move { get_top_species(12, slug).await },
+    );
 
     // Auto-refresh: poll every 4 seconds for new detections
     let (feed, set_feed) = signal::<Vec<WebDetection>>(vec![]);
@@ -88,8 +104,9 @@ pub fn Home() -> impl IntoView {
         use wasm_bindgen::JsCast;
         let cb = Closure::wrap(Box::new(move || {
             let rid = max_rowid.get();
+            let slug = model_slug.get();
             leptos::task::spawn_local(async move {
-                if let Ok(new) = get_recent_detections(20, rid).await {
+                if let Ok(new) = get_recent_detections(20, rid, slug).await {
                     if !new.is_empty() {
                         if let Some(first) = new.first() {
                             set_max_rowid.set(Some(first.id));
@@ -118,6 +135,7 @@ pub fn Home() -> impl IntoView {
             <section class="live-feed">
                 <LiveAnalysis/>
                 <h1>"Live Detections"</h1>
+                <ModelFilter selected=model_slug set_selected=set_model_slug />
                 <div class="feed-list">
                     <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
                         <For
