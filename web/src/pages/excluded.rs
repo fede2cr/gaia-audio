@@ -7,7 +7,7 @@
 
 use leptos::prelude::*;
 use leptos::prelude::{
-    signal, use_context, ElementChild, For, IntoView, Resource,
+    signal, ElementChild, For, IntoView, Resource,
     ServerFnError, Suspense, WriteSignal,
 };
 

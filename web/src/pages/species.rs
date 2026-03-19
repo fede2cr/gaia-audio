@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 use leptos::prelude::{
-    signal, use_context, Action, Effect, ElementChild, IntoView, Resource,
+    signal, Action, Effect, ElementChild, IntoView, Resource,
     ServerFnError, StoredValue, Suspense,
 };
 use leptos::either::Either;
@@ -517,10 +517,6 @@ fn SpeciesDetail(species: SpeciesInfo) -> impl IntoView {
                     })}
                 </Suspense>
             </section>
-
-            // ── Activity calendar ────────────────────────────────────
-            <section class="species-calendar">
-                <h2>"Activity Calendar"</h2>
 
             // ── Recent detections (model filtered) ───────────────────
             <section class="species-detections-section">
