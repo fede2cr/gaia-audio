@@ -9,216 +9,50 @@ on:
 
 env:
   REGISTRY: docker.io
+  # Override via GitHub repo settings → Secrets
   IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
-  # Opt into Node.js 24 for all JavaScript actions.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ── Detect which containers need rebuilding ──────────────────────────────
-  changes:
-    name: Detect changed paths
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      capture: ${{ steps.filter.outputs.capture }}
-      processing: ${{ steps.filter.outputs.processing }}
-      web: ${{ steps.filter.outputs.web }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Path filter
-        uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            capture:
-              - Cargo.toml
-              - Cargo.lock
-              - common/**
-              - capture/**
-            processing:
-              - Cargo.toml
-              - Cargo.lock
-              - common/**
-              - processing/**
-              - scripts/**
-              - examples/**
-            web:
-              - Cargo.toml
-              - Cargo.lock
-              - common/**
-              - web/**
-
-  # ── Per-arch build (native runners) ──────────────────────────────────────
   build:
-    name: Build ${{ matrix.image }} (${{ matrix.arch }})
-    needs: changes
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # capture
           - image: capture
             context: .
             file: capture/Containerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - image: capture
-            context: .
-            file: capture/Containerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-          # processing
           - image: processing
             context: .
             file: processing/Containerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - image: processing
-            context: .
-            file: processing/Containerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-          # web
           - image: web
             context: .
             file: web/Containerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - image: web
-            context: .
-            file: web/Containerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+
     permissions:
       contents: read
       packages: write
 
     steps:
-      # Determine whether this matrix entry should actually build.
-      # Tags always build; pushes/PRs only build when relevant files changed.
-      - name: Check if build is needed
-        id: skip
-        env:
-          IMAGE: ${{ matrix.image }}
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
-          CHANGED_CAPTURE: ${{ needs.changes.outputs.capture }}
-          CHANGED_PROCESSING: ${{ needs.changes.outputs.processing }}
-          CHANGED_WEB: ${{ needs.changes.outputs.web }}
-        run: |
-          if [[ "$IS_TAG" == "true" ]]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          else
-            # Look up the change-detection result for this image.
-            var="CHANGED_${IMAGE^^}"
-            echo "should_build=${!var}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Checkout
-        if: steps.skip.outputs.should_build == 'true'
         uses: actions/checkout@v4
 
+      - name: Set up QEMU (for cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
       - name: Set up Docker Buildx
-        if: steps.skip.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        if: steps.skip.outputs.should_build == 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
-
-      - name: Build and push by digest
-        if: steps.skip.outputs.should_build == 'true'
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
-
-      - name: Export digest
-        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        if: steps.skip.outputs.should_build == 'true' && github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.image }}-${{ matrix.arch }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  # ── Merge multi-arch manifests ───────────────────────────────────────────
-  # `if: always()` ensures the merge job runs even when some build matrix
-  # entries were skipped (no relevant file changes).  Each image checks
-  # for its digest artifacts before attempting the merge.
-  merge:
-    name: Merge ${{ matrix.image }} manifest
-    if: github.event_name != 'pull_request' && !failure() && !cancelled()
-    runs-on: ubuntu-latest
-    needs: [changes, build]
-    strategy:
-      matrix:
-        image: [capture, processing, web]
-    permissions:
-      contents: read
-
-    steps:
-      - name: Download digests
-        id: download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digest-${{ matrix.image }}-*
-          merge-multiple: true
-
-      - name: Skip if no digests
-        if: steps.download.outcome == 'failure'
-        run: |
-          echo "No digest artifacts for ${{ matrix.image }} — image was not built, skipping merge."
-          echo "found=false" >> "$GITHUB_OUTPUT"
-        id: skip-notice
-
-      - name: Set up Docker Buildx
-        if: steps.download.outcome == 'success'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        if: steps.download.outcome == 'success'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata (tags)
-        if: steps.download.outcome == 'success'
+      - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -230,10 +64,14 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Create and push multi-arch manifest
-        if: steps.download.outcome == 'success'
-        run: |
-          cd /tmp/digests
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}@sha256:%s ' *)
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
