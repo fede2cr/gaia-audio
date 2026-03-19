@@ -186,11 +186,13 @@ def convert_meta_model(model_dir: str, output_name: str = "meta-model.onnx") -> 
                 import tensorflow as tf
                 # (batch, D, 1) * (D, E) → broadcast → (batch, D, E)
                 expanded = tf.expand_dims(inputs, axis=-1) * self.kernel
-                # Use the *static* input dim so Keras can infer the output
-                # shape for downstream Dense layers (avoids "None" dims).
+                # Use -1 for the batch dim and the *static* product for the
+                # feature dim.  This lets Keras infer (None, D*E) and makes
+                # tf2onnx emit a constant shape [-1, D*E] in the ONNX
+                # Reshape node — required by tract which rejects variable
+                # shape inputs.
                 d = inputs.shape[-1]
-                return tf.reshape(expanded,
-                                  [tf.shape(inputs)[0], d * self.embeddings])
+                return tf.reshape(expanded, [-1, d * self.embeddings])
             def compute_output_shape(self, input_shape):
                 return (input_shape[0], input_shape[-1] * self.embeddings)
             def get_config(self):

@@ -56,6 +56,7 @@ RUN pip install --no-cache-dir 'pycparser<3' && \
 WORKDIR /convert
 COPY scripts/convert_keras_to_onnx.py .
 COPY scripts/download_meta_tflite.py .
+COPY scripts/validate_onnx.py .
 
 # Download Keras zip from Zenodo and extract (flatten directory structure).
 # python:3.12-slim does not include curl, so we use urllib instead.
@@ -94,6 +95,12 @@ RUN python3 convert_keras_to_onnx.py /convert/keras -o meta-model.onnx --meta-on
     mv /convert/keras/meta-model.onnx /convert/meta-model.onnx && \
     ls -lh /convert/meta-model.onnx
 
+# Validate converted ONNX models with onnxruntime before continuing.
+# audio-model.onnx: classifier input = (1, 96, 511, 2) mel spectrogram
+# meta-model.onnx:  input = (1, 3)  lat, lon, week
+RUN python3 validate_onnx.py /convert/audio-model.onnx --shape 1,96,511,2 && \
+    python3 validate_onnx.py /convert/meta-model.onnx   --shape 1,3
+
 # ── BatDetect2 PyTorch → ONNX conversion at build time ────────────
 # Downloads the batdetect2 pip package (includes the ~7.6 MB PyTorch
 # checkpoint), exports the model to ONNX using torch.onnx.export,
@@ -106,8 +113,12 @@ RUN pip install --no-cache-dir batdetect2 onnx onnxruntime
 
 WORKDIR /convert
 COPY scripts/convert_batdetect2_to_onnx.py .
+COPY scripts/validate_onnx.py .
 RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
     ls -lh /convert/batdetect2.onnx /convert/labels.csv
+
+# Validate BatDetect2 ONNX: input = (1, 1, 128, 256) pre-computed spectrogram
+RUN python3 validate_onnx.py /convert/batdetect2.onnx --shape 1,1,128,256
 
 # ── BirdNET+ V3.0 ONNX patch at build time ────────────────────────
 # Downloads the BirdNET+ V3.0 ONNX model from Zenodo, patches
@@ -123,8 +134,12 @@ RUN pip install --no-cache-dir onnx onnxruntime numpy
 
 WORKDIR /convert
 COPY scripts/patch_birdnet3_onnx.py .
+COPY scripts/validate_onnx.py .
 RUN python3 patch_birdnet3_onnx.py -o /convert/birdnet3.onnx && \
     ls -lh /convert/birdnet3.onnx
+
+# Validate BirdNET+ V3.0 ONNX: input = (1, 96000) raw audio at 32 kHz × 3s
+RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000
 
 # ── ONNX Runtime shared library (CPU inference fallback) ──────────
 # When tract-onnx cannot handle a model (e.g. DFT/STFT ops in BirdNET
