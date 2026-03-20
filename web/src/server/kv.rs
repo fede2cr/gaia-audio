@@ -26,8 +26,8 @@ fn redis_url() -> String {
 
 /// Open the Redis connection.  Must be called once at startup.
 ///
-/// Retries for up to 30 seconds so the web container can start
-/// before Valkey is fully ready.
+/// Retries indefinitely with exponential back-off (1 s → 30 s cap)
+/// so the web container survives slow Valkey starts or brief outages.
 pub async fn initialize() -> Result<(), String> {
     let url = redis_url();
     info!("Connecting to Redis: {url}");
@@ -35,20 +35,21 @@ pub async fn initialize() -> Result<(), String> {
         .map_err(|e| format!("Cannot parse Redis URL: {e}"))?;
 
     let mut attempt = 0u32;
+    let mut backoff = std::time::Duration::from_secs(1);
+    let max_backoff = std::time::Duration::from_secs(30);
     let conn = loop {
         attempt += 1;
         match client.get_multiplexed_tokio_connection().await {
             Ok(c) => break c,
-            Err(_e) if attempt < 30 => {
+            Err(e) => {
                 if attempt == 1 {
                     info!("Waiting for Redis…");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            Err(e) => {
-                return Err(format!(
-                    "Cannot connect to Redis after {attempt} attempts: {e}"
-                ))
+                if attempt % 10 == 0 {
+                    tracing::warn!("Still waiting for Redis (attempt {attempt}): {e}");
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
             }
         }
     };

@@ -37,8 +37,9 @@ fn redis_url() -> String {
 
 /// Open the Redis connection.  Must be called once at startup.
 ///
-/// Retries for up to 30 seconds so that the processing container can
-/// start before Valkey is fully ready.
+/// Retries indefinitely with exponential back-off (1 s → 30 s cap)
+/// so the processing container survives slow Valkey starts or brief
+/// outages.
 pub fn initialize() -> Result<()> {
     let url = redis_url();
     info!("Connecting to Redis: {url}");
@@ -46,17 +47,22 @@ pub fn initialize() -> Result<()> {
         .with_context(|| format!("Cannot parse Redis URL: {url}"))?;
 
     let mut attempt = 0u32;
+    let mut backoff = std::time::Duration::from_secs(1);
+    let max_backoff = std::time::Duration::from_secs(30);
     let conn = loop {
         attempt += 1;
         match client.get_connection() {
             Ok(c) => break c,
-            Err(_e) if attempt < 30 => {
+            Err(e) => {
                 if attempt == 1 {
                     info!("Waiting for Redis…");
                 }
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                if attempt % 10 == 0 {
+                    warn!("Still waiting for Redis (attempt {attempt}): {e}");
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
             }
-            Err(e) => anyhow::bail!("Cannot connect to Redis after {attempt} attempts: {e}"),
         }
     };
 
