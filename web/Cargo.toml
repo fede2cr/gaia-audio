@@ -35,7 +35,7 @@ duckdb              = { version = "1", features = ["bundled"], optional = true }
 reqwest             = { version = "0.12", features = ["json"], optional = true }
 chrono              = { version = "0.4", optional = true }
 http                = { version = "1", optional = true }
-tar                 = { version = "0.4", optional = true }
+tar                 = { version = "0.4.45", optional = true }
 mdns-sd             = { version = "0.18", optional = true }
 
 # ── Hydrate-only deps (WASM client) ─────────────────────────

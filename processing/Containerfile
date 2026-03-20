@@ -4,7 +4,7 @@ FROM debian:trixie AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     pkg-config libssl-dev \
-    gcc libc6-dev \
+    gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo

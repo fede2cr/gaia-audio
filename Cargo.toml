@@ -46,7 +46,7 @@ toml = "0.8"
 # Archive & checksum
 zip = "2"
 md5 = "0.7"
-tar = "0.4"
+tar = "0.4.45"
 
 mdns-sd = "0.18"
 

@@ -928,6 +928,235 @@ pub fn get_detections_dir() -> Option<PathBuf> {
     DET_DIR.get().cloned()
 }
 
+// ─── One-time SQLite → Parquet migration ─────────────────────────────────────
+
+/// Migrate existing SQLite detections to Parquet files.
+///
+/// Called once at startup.  If the detections directory already contains a
+/// `.migrated` marker file the function is a no-op.  Otherwise it reads
+/// every row from the SQLite `detections` table and writes a single
+/// ZSTD-compressed Parquet file, then drops the marker so subsequent
+/// starts skip the migration.
+///
+/// Columns that may be absent in older databases (`Model_Slug`,
+/// `Model_Name`, `Source_Node`, `Excluded`) are handled with `COALESCE`
+/// defaults.
+pub async fn migrate_sqlite_to_parquet(db_path: &Path) -> Result<(), String> {
+    let det_dir = match DET_DIR.get() {
+        Some(d) => d.clone(),
+        None => return Err("DuckDB not initialised yet".into()),
+    };
+
+    let marker = det_dir.join(".migrated");
+    if marker.exists() {
+        info!("SQLite→Parquet migration already done (marker present)");
+        return Ok(());
+    }
+
+    // Check if the SQLite detections table exists and has rows.
+    let conn = super::db::open_conn(db_path).await
+        .map_err(|e| format!("Cannot open SQLite for migration: {e}"))?;
+
+    let count: i64 = {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='detections'",
+                (),
+            )
+            .await
+            .map_err(|e| format!("Schema check error: {e}"))?;
+        match rows.next().await {
+            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    if count == 0 {
+        info!("No SQLite detections table found — nothing to migrate");
+        std::fs::write(&marker, b"no-table").ok();
+        return Ok(());
+    }
+
+    let total: i64 = {
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM detections", ())
+            .await
+            .map_err(|e| format!("Count error: {e}"))?;
+        match rows.next().await {
+            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    if total == 0 {
+        info!("SQLite detections table is empty — nothing to migrate");
+        std::fs::write(&marker, b"empty").ok();
+        return Ok(());
+    }
+
+    info!("Migrating {total} detections from SQLite → Parquet…");
+
+    // Read all rows from SQLite.
+    // Use COALESCE for columns that may not exist in older schemas.
+    // We try the full column set first; if that fails we fall back to
+    // the minimal column set without model columns.
+    let full_sql = "SELECT \
+        rowid, Date, Time, \
+        COALESCE(Domain, 'birds'), Sci_Name, Com_Name, Confidence, \
+        COALESCE(Lat, 0.0), COALESCE(Lon, 0.0), COALESCE(Cutoff, 0.0), \
+        COALESCE(Week, 0), COALESCE(Sens, 1.0), COALESCE(Overlap, 0.0), \
+        File_Name, \
+        COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
+        COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+        FROM detections ORDER BY Date, Time";
+
+    let mut rows_result = conn.query(full_sql, ()).await;
+
+    // If the full query fails (missing columns), try without model columns.
+    let has_model_cols = rows_result.is_ok();
+    if !has_model_cols {
+        let fallback_sql = "SELECT \
+            rowid, Date, Time, \
+            COALESCE(Domain, 'birds'), Sci_Name, Com_Name, Confidence, \
+            COALESCE(Lat, 0.0), COALESCE(Lon, 0.0), COALESCE(Cutoff, 0.0), \
+            COALESCE(Week, 0), COALESCE(Sens, 1.0), COALESCE(Overlap, 0.0), \
+            File_Name, \
+            COALESCE(Source_Node, ''), COALESCE(Excluded, 0) \
+            FROM detections ORDER BY Date, Time";
+        rows_result = conn.query(fallback_sql, ()).await;
+    }
+
+    let mut src_rows = rows_result
+        .map_err(|e| format!("SQLite query error: {e}"))?;
+
+    // Buffer into an in-memory DuckDB table.
+    let duck = duckdb::Connection::open_in_memory()
+        .map_err(|e| format!("DuckDB migration open: {e}"))?;
+    duck.execute_batch(
+        "CREATE TABLE buffer (
+            id          BIGINT   NOT NULL,
+            Date        VARCHAR  NOT NULL,
+            Time        VARCHAR  NOT NULL,
+            Domain      VARCHAR  NOT NULL,
+            Sci_Name    VARCHAR  NOT NULL,
+            Com_Name    VARCHAR  NOT NULL,
+            Confidence  DOUBLE   NOT NULL,
+            Lat         DOUBLE   NOT NULL,
+            Lon         DOUBLE   NOT NULL,
+            Cutoff      DOUBLE   NOT NULL,
+            Week        INTEGER  NOT NULL,
+            Sens        DOUBLE   NOT NULL,
+            Overlap     DOUBLE   NOT NULL,
+            File_Name   VARCHAR  NOT NULL,
+            Source_Node VARCHAR  NOT NULL,
+            Excluded    INTEGER  NOT NULL,
+            Model_Slug  VARCHAR  NOT NULL,
+            Model_Name  VARCHAR  NOT NULL
+        )",
+    )
+    .map_err(|e| format!("DuckDB buffer schema: {e}"))?;
+
+    let base_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut seq: u64 = 0;
+    let mut migrated: u64 = 0;
+
+    while let Some(row) = src_rows
+        .next()
+        .await
+        .map_err(|e| format!("Row iteration: {e}"))?
+    {
+        let date: String = row.get(1).unwrap_or_default();
+        let time: String = row.get(2).unwrap_or_default();
+        let domain: String = row.get(3).unwrap_or_else(|_| "birds".into());
+        let sci: String = row.get(4).unwrap_or_default();
+        let com: String = row.get(5).unwrap_or_default();
+        let conf: f64 = row.get(6).unwrap_or(0.0);
+        let lat: f64 = row.get(7).unwrap_or(0.0);
+        let lon: f64 = row.get(8).unwrap_or(0.0);
+        let cutoff: f64 = row.get(9).unwrap_or(0.0);
+        let week: i32 = row.get::<i64>(10).unwrap_or(0) as i32;
+        let sens: f64 = row.get(11).unwrap_or(1.0);
+        let overlap: f64 = row.get(12).unwrap_or(0.0);
+        let fname: String = row.get(13).unwrap_or_default();
+        let source: String = row.get(14).unwrap_or_default();
+        let excluded: i32 = row.get::<i64>(15).unwrap_or(0) as i32;
+        let model_slug: String = if has_model_cols {
+            row.get(16).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let model_name: String = if has_model_cols {
+            row.get(17).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        seq += 1;
+        let id = ((base_ms & 0xFFFF_FFFF_FFFF) << 16) | (seq & 0xFFFF);
+
+        if let Err(e) = duck.execute(
+            "INSERT INTO buffer VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            duckdb::params![
+                id as i64, date, time, domain, sci, com, conf,
+                lat, lon, cutoff, week, sens, overlap, fname,
+                source, excluded, model_slug, model_name
+            ],
+        ) {
+            tracing::warn!("Migration row insert error: {e}");
+            continue;
+        }
+        migrated += 1;
+
+        if migrated % 50_000 == 0 {
+            info!("Migration progress: {migrated}/{total} rows buffered…");
+        }
+    }
+
+    if migrated == 0 {
+        info!("No rows migrated (all empty or errored)");
+        std::fs::write(&marker, b"0-rows").ok();
+        return Ok(());
+    }
+
+    // Flush to Parquet.
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("migration-{ts}.parquet");
+    let final_path = det_dir.join(&filename);
+    let tmp_path = det_dir.join(format!(".{filename}.tmp"));
+
+    duck.execute(
+        &format!(
+            "COPY buffer TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+            tmp_path.display()
+        ),
+        [],
+    )
+    .map_err(|e| format!("Parquet write: {e}"))?;
+
+    std::fs::rename(&tmp_path, &final_path)
+        .map_err(|e| format!("Rename: {e}"))?;
+
+    info!(
+        "Migration complete: {migrated} detections → {}",
+        final_path.display()
+    );
+
+    // Refresh the view so the migrated data is immediately queryable.
+    if let Ok(guard) = DUCK
+        .get()
+        .ok_or("DuckDB not init")
+        .and_then(|m| m.lock().map_err(|_| "lock poisoned"))
+    {
+        refresh_view(&guard);
+    }
+
+    // Write marker so we don't re-migrate next startup.
+    std::fs::write(&marker, format!("{migrated}").as_bytes()).ok();
+
+    Ok(())
+}
+
 /// Get all existing filenames as a `HashSet`, expanded with Opus/mp3/wav
 /// variants for deduplication during import.
 ///

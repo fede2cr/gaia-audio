@@ -55,6 +55,14 @@ async fn main() {
         tracing::info!("DuckDB detection layer ready (dir={})", det_dir.display());
     }
 
+    // ── Migrate existing SQLite detections → Parquet (one-time) ──────
+    {
+        let db = db_path.clone();
+        if let Err(e) = gaia_web::server::detections_duckdb::migrate_sqlite_to_parquet(&db).await {
+            tracing::warn!("SQLite→Parquet migration failed (non-fatal): {e}");
+        }
+    }
+
     // Refresh the species stats cache at startup so the species list loads
     // instantly from the cache table.
     {
