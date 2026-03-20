@@ -45,11 +45,12 @@ md5.workspace = true
 
 # Inference via ONNX Runtime — used as a fallback when tract-onnx
 # cannot load a model (e.g. DFT/STFT ops in BirdNET V3), and as the
-# GPU-accelerated path when ROCm hardware is detected at runtime.
+# GPU-accelerated path when GPU hardware is detected at runtime.
 #
 # `load-dynamic` loads libonnxruntime.so at runtime — no native libs
-# needed at build time.  `rocm` just exposes the MIGraphX/ROCm EP
-# types; the actual GPU libraries only need to be present at runtime.
+# needed at build time.  `rocm` and `cuda` just expose the EP types
+# (MIGraphX/ROCm and TensorRT/CUDA respectively); the actual GPU
+# libraries only need to be present at runtime.
 [dependencies.ort]
 version = "2.0.0-rc.12"
-features = ["load-dynamic", "rocm"]
+features = ["load-dynamic", "rocm", "cuda"]

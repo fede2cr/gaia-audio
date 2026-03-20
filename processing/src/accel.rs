@@ -3,18 +3,19 @@
 //! [`OrtSession`] wraps an `ort::session::Session` and selects the best
 //! available execution provider at session creation time:
 //!
-//! | `GAIA_ACCEL` env var | EP chain tried                      |
-//! |----------------------|-------------------------------------|
-//! | `rocm`               | MIGraphX → ROCm → CPU              |
-//! | anything else / unset| CPU only                            |
+//! | `GAIA_ACCEL` env var | EP chain tried                          |
+//! |----------------------|-----------------------------------------|
+//! | `rocm`               | MIGraphX → ROCm → CPU                  |
+//! | `cuda`               | TensorRT → CUDA → CPU                  |
+//! | anything else / unset| CPU only                                |
 //!
 //! The `ort` crate is compiled with **`load-dynamic`**: if
 //! `libonnxruntime.so` is not installed at runtime, session creation
 //! returns an error and the caller falls through to tract-onnx or
 //! skips the model.
 //!
-//! MIGraphX caches compiled HIP plans on disk so subsequent starts
-//! skip the slow compilation step.
+//! Both MIGraphX and TensorRT cache compiled plans on disk so
+//! subsequent starts skip the slow compilation step.
 
 use std::path::Path;
 
@@ -23,15 +24,43 @@ use tracing::info;
 
 // ── Runtime check ────────────────────────────────────────────────────────
 
+/// Detected acceleration backend from the `GAIA_ACCEL` env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelKind {
+    /// AMD ROCm — MIGraphX → ROCm → CPU.
+    Rocm,
+    /// NVIDIA CUDA — TensorRT → CUDA → CPU.
+    Cuda,
+    /// No GPU acceleration requested.
+    None,
+}
+
+/// Parse the `GAIA_ACCEL` environment variable.
+pub fn accel_kind() -> AccelKind {
+    match std::env::var("GAIA_ACCEL").as_deref() {
+        Ok(v) if v.eq_ignore_ascii_case("rocm") => AccelKind::Rocm,
+        Ok(v) if v.eq_ignore_ascii_case("cuda") => AccelKind::Cuda,
+        _ => AccelKind::None,
+    }
+}
+
 /// Returns `true` when the operator has requested ROCm acceleration
 /// via the `GAIA_ACCEL` environment variable.
 ///
 /// This is set by gaia-core's `inject_rocm_args()` when AMD GPUs with
 /// `/dev/kfd` are detected on the host.
 pub fn is_rocm_requested() -> bool {
-    std::env::var("GAIA_ACCEL")
-        .map(|v| v.eq_ignore_ascii_case("rocm"))
-        .unwrap_or(false)
+    accel_kind() == AccelKind::Rocm
+}
+
+/// Returns `true` when CUDA/TensorRT acceleration is requested.
+pub fn is_cuda_requested() -> bool {
+    accel_kind() == AccelKind::Cuda
+}
+
+/// Returns `true` when any GPU acceleration is requested.
+pub fn is_gpu_requested() -> bool {
+    accel_kind() != AccelKind::None
 }
 
 // ── Adaptive ORT session ─────────────────────────────────────────────────
@@ -42,6 +71,11 @@ pub fn is_rocm_requested() -> bool {
 /// When `GAIA_ACCEL=rocm` is set, the session is configured with:
 ///   1. MIGraphX EP (compiles ONNX → optimised HIP kernels)
 ///   2. ROCm EP (MIOpen-based, broader op coverage)
+///   3. CPU fallback
+///
+/// When `GAIA_ACCEL=cuda` is set, the session is configured with:
+///   1. TensorRT EP (compiles ONNX → optimised TRT engines, ~2× faster)
+///   2. CUDA EP (cuDNN-based, broader op coverage)
 ///   3. CPU fallback
 ///
 /// Otherwise only the CPU EP is registered.
@@ -55,57 +89,94 @@ pub struct OrtSession {
 impl OrtSession {
     /// Create an ORT session for the given ONNX file.
     ///
-    /// `cache_dir` is used by MIGraphX to store compiled plans (`.mxr`
-    /// files).  Ignored when running on CPU only.
+    /// `cache_dir` is used by MIGraphX / TensorRT to store compiled
+    /// plans.  Ignored when running on CPU only.
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
-        let use_gpu = is_rocm_requested();
+        let kind = accel_kind();
 
-        if use_gpu {
-            info!(
+        match kind {
+            AccelKind::Rocm => info!(
                 "Creating ONNX Runtime session (MIGraphX → ROCm → CPU) for {}",
                 onnx_path.display()
-            );
-        } else {
-            info!(
+            ),
+            AccelKind::Cuda => info!(
+                "Creating ONNX Runtime session (TensorRT → CUDA → CPU) for {}",
+                onnx_path.display()
+            ),
+            AccelKind::None => info!(
                 "Creating ONNX Runtime session (CPU) for {}",
                 onnx_path.display()
-            );
+            ),
         }
 
         let mut builder = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?;
 
-        builder = if use_gpu {
-            // Ensure the MIGraphX cache directory exists.
-            std::fs::create_dir_all(cache_dir).ok();
+        builder = match kind {
+            AccelKind::Rocm => {
+                // Ensure the MIGraphX cache directory exists.
+                std::fs::create_dir_all(cache_dir).ok();
 
-            let model_stem = onnx_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model");
-            let cache_file = cache_dir.join(format!("{model_stem}.mxr"));
-            let cache_str = cache_file.to_string_lossy().to_string();
+                let model_stem = onnx_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model");
+                let cache_file = cache_dir.join(format!("{model_stem}.mxr"));
+                let cache_str = cache_file.to_string_lossy().to_string();
 
-            let mut migraphx = ort::ep::MIGraphX::default()
-                .with_device_id(0)
-                .with_fp16(true)
-                .with_save_model(&cache_str);
+                let mut migraphx = ort::ep::MIGraphX::default()
+                    .with_device_id(0)
+                    .with_fp16(true)
+                    .with_save_model(&cache_str);
 
-            if cache_file.exists() {
-                migraphx = migraphx.with_load_model(&cache_str);
+                if cache_file.exists() {
+                    migraphx = migraphx.with_load_model(&cache_str);
+                }
+
+                builder
+                    .with_execution_providers([
+                        migraphx.build(),
+                        ort::ep::ROCm::default().with_device_id(0).build(),
+                        ort::ep::CPU::default().build(),
+                    ])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             }
+            AccelKind::Cuda => {
+                // Ensure the TensorRT engine cache directory exists.
+                std::fs::create_dir_all(cache_dir).ok();
+                let cache_str = cache_dir.to_string_lossy().to_string();
 
-            builder
-                .with_execution_providers([
-                    migraphx.build(),
-                    ort::ep::ROCm::default().with_device_id(0).build(),
-                    ort::ep::CPU::default().build(),
-                ])
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        } else {
-            builder
-                .with_execution_providers([ort::ep::CPU::default().build()])
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                // TensorRT achieves ~2× speedup over CUDA by compiling
+                // the ONNX graph into optimised GPU kernels.  The compiled
+                // engine is cached on disk so subsequent starts are fast.
+                //
+                // FP16 is enabled for models that support it (most bird
+                // detection models do) — this halves VRAM usage and
+                // further increases throughput on Tensor Core GPUs.
+                let tensorrt = ort::ep::TensorRT::default()
+                    .with_device_id(0)
+                    .with_fp16(true)
+                    .with_engine_cache(true)
+                    .with_engine_cache_path(&cache_str)
+                    .with_timing_cache(true)
+                    .with_timing_cache_path(&cache_str);
+
+                let cuda = ort::ep::CUDA::default()
+                    .with_device_id(0);
+
+                builder
+                    .with_execution_providers([
+                        tensorrt.build(),
+                        cuda.build(),
+                        ort::ep::CPU::default().build(),
+                    ])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            AccelKind::None => {
+                builder
+                    .with_execution_providers([ort::ep::CPU::default().build()])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            }
         };
 
         let session = builder
@@ -113,11 +184,11 @@ impl OrtSession {
             .with_context(|| format!("ORT: failed to load {}", onnx_path.display()))?;
 
         info!(
-            "ORT session created for {} ({} inputs, {} outputs, gpu={})",
+            "ORT session created for {} ({} inputs, {} outputs, accel={:?})",
             onnx_path.display(),
             session.inputs().len(),
             session.outputs().len(),
-            use_gpu,
+            kind,
         );
 
         Ok(Self { session })

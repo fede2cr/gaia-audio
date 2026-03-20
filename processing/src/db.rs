@@ -13,9 +13,11 @@
 //! "database is locked" errors that occurred when every operation
 //! tried to re-set `journal_mode=WAL`.
 //!
-//! For write-heavy paths (`insert_detection`, `mark_file_processed`)
-//! we use `BEGIN CONCURRENT` so libsql can run multiple write
-//! transactions in parallel and only serialise at commit time.
+//! Write-heavy paths use plain **autocommit** — each individual
+//! `INSERT`/`UPDATE` is its own implicit transaction.  Cross-process
+//! contention (multiple containers accessing the same WAL file) is
+//! handled by `PRAGMA busy_timeout` which retries internally for up
+//! to 30 seconds.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -51,7 +53,7 @@ static DB: OnceLock<libsql::Database> = OnceLock::new();
 
 /// Cached `Connection` — created once from the cached `Database`.
 /// libsql connections are `Send + Sync`; concurrent operations are
-/// serialised internally by libsql (with `BEGIN CONCURRENT` support).
+/// serialised internally by libsql.
 static CONN: OnceLock<libsql::Connection> = OnceLock::new();
 
 /// Resolve the effective database URL.
@@ -276,8 +278,9 @@ async fn migrate_add_column(conn: &libsql::Connection, table: &str, column: &str
 
 /// Insert a single detection row.
 ///
-/// Uses `BEGIN CONCURRENT` so multiple worker threads can insert in
-/// parallel — libsql serialises only at commit time.
+/// Runs as a single autocommit statement — SQLite handles the
+/// implicit transaction.  Cross-process contention is absorbed by
+/// `PRAGMA busy_timeout` (30 s).
 pub fn insert_detection(
     db_path: &Path,
     d: &Detection,
@@ -291,8 +294,7 @@ pub fn insert_detection(
 ) -> Result<()> {
     let conn = conn(db_path)?;
     rt().block_on(async {
-        conn.execute_batch("BEGIN CONCURRENT").await.ok();
-        let res = conn.execute(
+        conn.execute(
             "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
              Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
              Model_Slug, Model_Name) \
@@ -317,13 +319,8 @@ pub fn insert_detection(
                 d.model_name.clone(),
             ],
         )
-        .await;
-        if res.is_ok() {
-            conn.execute_batch("COMMIT").await.ok();
-        } else {
-            conn.execute_batch("ROLLBACK").await.ok();
-        }
-        res.context("Failed to insert detection")?;
+        .await
+        .context("Failed to insert detection")?;
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -379,12 +376,12 @@ fn _count(db_path: &Path, sql: &str, p: Vec<libsql::Value>) -> u32 {
 
 /// Increment the urban-noise counter for a category / date / hour.
 ///
-/// Uses `INSERT OR REPLACE` with an UPSERT pattern so a single row is
-/// stored per (Date, Hour, Category) tuple.
+/// Uses `INSERT … ON CONFLICT` (UPSERT) so a single row is stored
+/// per (Date, Hour, Category) tuple.  Each statement runs in
+/// autocommit — no explicit transaction needed.
 pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &str) -> Result<()> {
     let conn = conn(db_path)?;
     rt().block_on(async {
-        conn.execute_batch("BEGIN CONCURRENT").await.ok();
         let result = conn.execute(
             "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
              ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
@@ -404,7 +401,6 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
                 ).await?;
             }
         }
-        conn.execute_batch("COMMIT").await.ok();
 
         Ok::<(), libsql::Error>(())
     })?;
@@ -584,19 +580,17 @@ pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool
 
 /// Record that this instance has finished processing a file.
 ///
-/// Uses `BEGIN CONCURRENT` so multiple workers can mark files
-/// concurrently without blocking each other.
+/// Runs as a single autocommit `INSERT OR IGNORE`.  Cross-process
+/// contention is absorbed by `PRAGMA busy_timeout` (30 s).
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
     let conn = conn(db_path)?;
 
     rt().block_on(async {
-        conn.execute_batch("BEGIN CONCURRENT").await.ok();
         conn.execute(
             "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
             params![filename.to_string(), instance.to_string()],
         )
         .await?;
-        conn.execute_batch("COMMIT").await.ok();
 
         let mut rows = conn
             .query(

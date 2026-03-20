@@ -673,7 +673,7 @@ fn format_with_commas(n: u32) -> String {
 /// called once at startup and then nightly.
 pub async fn refresh_species_stats(db_path: &Path) -> Result<(), libsql::Error> {
     let conn = open_rw(db_path).await?;
-    conn.execute_batch("BEGIN CONCURRENT").await?;
+    conn.execute_batch("BEGIN IMMEDIATE").await?;
 
     // Ensure the table exists (in case this runs before ensure_gaia_schema).
     conn.execute_batch(
@@ -1212,8 +1212,9 @@ pub async fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>,
 ///
 /// Only sets `busy_timeout` — WAL is configured once in
 /// `ensure_gaia_schema`.  Callers that modify data should wrap
-/// their writes in `BEGIN CONCURRENT … COMMIT` so that libsql
-/// can run multiple writers in parallel across containers.
+/// multi-statement writes in `BEGIN IMMEDIATE … COMMIT` so that the
+/// write lock is acquired upfront (respecting `busy_timeout` for
+/// cross-process contention).
 async fn open_rw(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
     let db = get_or_open_db(db_path).await?;
     let conn = db.connect()?;
@@ -1227,7 +1228,7 @@ pub async fn save_settings(db_path: &Path, entries: &[(&str, &str)]) -> Result<(
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     ).await;
-    conn.execute_batch("BEGIN CONCURRENT").await?;
+    conn.execute_batch("BEGIN IMMEDIATE").await?;
     for (k, v) in entries {
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) \

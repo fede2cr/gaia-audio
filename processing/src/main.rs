@@ -98,18 +98,29 @@ fn main() -> Result<()> {
 
     // ── GPU acceleration check ───────────────────────────────────────
     let accel_var = std::env::var("GAIA_ACCEL").unwrap_or_default();
-    info!(
-        "Acceleration env: GAIA_ACCEL={:?} ROCM_VISIBLE_DEVICES={:?}",
-        accel_var,
-        std::env::var("ROCM_VISIBLE_DEVICES").unwrap_or_default()
-    );
-    if accel::is_rocm_requested() {
-        info!("ROCm acceleration requested (GAIA_ACCEL=rocm) — ORT will try MIGraphX → ROCm → CPU");
-    } else {
-        info!(
-            "GPU acceleration not requested (GAIA_ACCEL={:?}) — using CPU inference (tract-onnx)",
-            accel_var
-        );
+    match accel::accel_kind() {
+        accel::AccelKind::Rocm => {
+            info!(
+                "Acceleration env: GAIA_ACCEL={:?} ROCM_VISIBLE_DEVICES={:?}",
+                accel_var,
+                std::env::var("ROCM_VISIBLE_DEVICES").unwrap_or_default()
+            );
+            info!("ROCm acceleration requested — ORT will try MIGraphX → ROCm → CPU");
+        }
+        accel::AccelKind::Cuda => {
+            info!(
+                "Acceleration env: GAIA_ACCEL={:?} CUDA_VISIBLE_DEVICES={:?}",
+                accel_var,
+                std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default()
+            );
+            info!("CUDA acceleration requested — ORT will try TensorRT → CUDA → CPU");
+        }
+        accel::AccelKind::None => {
+            info!(
+                "GPU acceleration not requested (GAIA_ACCEL={:?}) — using CPU inference (tract-onnx)",
+                accel_var
+            );
+        }
     }
 
     // ── initialize database ──────────────────────────────────────────

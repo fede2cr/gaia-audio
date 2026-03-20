@@ -38,7 +38,7 @@ pub struct LoadedModel {
     runner: Option<TypedRunnableModel<TypedModel>>,
     /// ONNX Runtime session – used when tract cannot load the model
     /// (e.g. unsupported DFT/STFT operators in BirdNET V3), **or** when
-    /// `GAIA_ACCEL=rocm` is set for GPU-accelerated inference.
+    /// `GAIA_ACCEL` is set for GPU-accelerated inference (rocm or cuda).
     /// Requires `libonnxruntime.so` to be available at runtime.
     ort_session: Option<crate::accel::OrtSession>,
     meta_model: Option<MetaDataModel>,
@@ -287,9 +287,9 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     // ── ORT session ───────────────────────────────────────────────────
     // The ORT session is only used when tract could not load the model
     // (e.g. unsupported DFT/STFT ops).  If tract succeeded, we keep the
-    // tract runner — it's fast and avoids the potentially slow MIGraphX
-    // compilation step.  When ORT *is* active and GAIA_ACCEL=rocm is
-    // set, it will automatically try MIGraphX → ROCm → CPU.
+    // tract runner — it's fast and avoids the potentially slow MIGraphX /
+    // TensorRT compilation step.  When ORT *is* active and GAIA_ACCEL is
+    // set, it will automatically try the GPU EP chain → CPU.
 
     Ok(LoadedModel {
         runner,
