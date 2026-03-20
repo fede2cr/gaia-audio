@@ -64,6 +64,16 @@ pub struct Config {
     // ── database (processing) ────────────────────────────────────────
     pub db_path: PathBuf,
 
+    // ── Turso / libsql ───────────────────────────────────────────────
+    /// Turso database URL.  When set, overrides `db_path` as the
+    /// connection target.  For local-only mode this should be a file
+    /// path (e.g. `/data/birds.db`).  For future Turso Cloud support
+    /// it can be a `libsql://` URL.
+    pub turso_database_url: Option<String>,
+    /// Turso auth token.  Required when `turso_database_url` points to a
+    /// remote Turso Cloud instance; unused in local-only mode.
+    pub turso_auth_token: Option<String>,
+
     // ── display (processing / web) ───────────────────────────────────
     /// Spectrogram colour-map name ("default", "coolwarm", "magma", "viridis", "grayscale").
     pub colormap: String,
@@ -175,7 +185,13 @@ pub fn load(path: &Path) -> Result<Config> {
         birdweather_id: get("BIRDWEATHER_ID").filter(|s| !s.is_empty()),
         heartbeat_url: get("HEARTBEAT_URL").filter(|s| !s.is_empty()),
 
-        db_path: PathBuf::from(get("DB_PATH").unwrap_or_else(|| "/data/birds.db".into())),
+        db_path: PathBuf::from(
+            get("TURSO_DATABASE_URL")
+                .or_else(|| get("DB_PATH"))
+                .unwrap_or_else(|| "/data/birds.db".into()),
+        ),
+        turso_database_url: get("TURSO_DATABASE_URL"),
+        turso_auth_token: get("TURSO_AUTH_TOKEN"),
 
         colormap: get("COLORMAP").unwrap_or_else(|| "default".into()),
 

@@ -69,6 +69,7 @@ pub struct ImportResult {
 pub use crate::model::BirdnetNode;
 
 /// Open a libsql local connection (helper for import functions).
+/// Used for **foreign** databases (BirdNET-Pi backups, source DBs).
 async fn open_local(path: &Path) -> Result<libsql::Connection, String> {
     let db = libsql::Builder::new_local(
         path.to_str().ok_or_else(|| "Non-UTF-8 database path".to_string())?,
@@ -77,6 +78,28 @@ async fn open_local(path: &Path) -> Result<libsql::Connection, String> {
     .await
     .map_err(|e| format!("Cannot open database {}: {e}", path.display()))?;
     db.connect().map_err(|e| format!("Cannot connect to {}: {e}", path.display()))
+}
+
+/// Open a connection to the **Gaia** database.
+///
+/// Reads `TURSO_DATABASE_URL` to override `db_path` when set.
+const IMPORT_BUSY_TIMEOUT_MS: u32 = 30_000;
+async fn open_gaia(db_path: &Path) -> Result<libsql::Connection, String> {
+    let url = std::env::var("TURSO_DATABASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            db_path.to_str().unwrap_or("/data/birds.db").to_string()
+        });
+    let db = libsql::Builder::new_local(&url)
+        .build()
+        .await
+        .map_err(|e| format!("Cannot open gaia database {url}: {e}"))?;
+    let conn = db.connect().map_err(|e| format!("Cannot connect to {url}: {e}"))?;
+    conn.execute_batch(&format!("PRAGMA busy_timeout={IMPORT_BUSY_TIMEOUT_MS};"))
+        .await
+        .map_err(|e| format!("Pragma error: {e}"))?;
+    Ok(conn)
 }
 
 /// Helper: query a single i64 scalar value from a connection.
@@ -666,9 +689,11 @@ fn import_detections_from_db(
 
     rt.block_on(async {
         let src_conn = open_local(source_db).await?;
-        let dst_conn = open_local(gaia_db_path).await?;
+        let dst_conn = open_gaia(gaia_db_path).await?;
         dst_conn
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .execute_batch(&format!(
+                "PRAGMA busy_timeout={IMPORT_BUSY_TIMEOUT_MS}; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+            ))
             .await
             .map_err(|e| format!("Pragma error: {e}"))?;
 
@@ -870,7 +895,7 @@ pub async fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create DB dir: {e}"))?;
     }
 
-    let conn = open_local(db_path).await?;
+    let conn = open_gaia(db_path).await?;
 
     // Enable WAL once via a read-write connection so that later read-only
     // connections inherit it without needing write access.
@@ -1011,7 +1036,7 @@ fn get_existing_filenames(db_path: &Path) -> Result<HashSet<String>, String> {
         .map_err(|e| format!("Cannot create runtime: {e}"))?;
 
     rt.block_on(async {
-        let conn = open_local(db_path).await?;
+        let conn = open_gaia(db_path).await?;
         let mut rows = conn
             .query("SELECT File_Name FROM detections", ())
             .await

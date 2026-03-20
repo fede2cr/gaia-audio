@@ -32,7 +32,9 @@ async fn main() {
     let site_root = leptos_options.site_root.clone();
 
     let db_path = PathBuf::from(
-        std::env::var("GAIA_DB_PATH").unwrap_or_else(|_| "data/birds.db".into()),
+        std::env::var("TURSO_DATABASE_URL")
+            .or_else(|_| std::env::var("GAIA_DB_PATH"))
+            .unwrap_or_else(|_| "data/birds.db".into()),
     );
 
     // Ensure the database and schema exist so the dashboard works even

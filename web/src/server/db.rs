@@ -14,6 +14,32 @@ use libsql::params;
 use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, TopRecording, UrbanNoiseSummary, WebDetection,
                     HourlyCount, SpeciesHourlyCounts};
 
+// ── Turso / libsql connection helpers ───────────────────────────────────────
+
+/// Busy-timeout in milliseconds.
+const BUSY_TIMEOUT_MS: u32 = 30_000;
+
+/// Resolve the database path: `TURSO_DATABASE_URL` overrides `db_path`.
+fn effective_db_url(db_path: &Path) -> Result<String, libsql::Error> {
+    if let Ok(url) = std::env::var("TURSO_DATABASE_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    db_path
+        .to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))
+}
+
+/// Open a `libsql::Database` from the effective URL.
+async fn build_db(db_path: &Path) -> Result<libsql::Database, libsql::Error> {
+    let url = effective_db_url(db_path)?;
+    libsql::Builder::new_local(&url)
+        .build()
+        .await
+}
+
 // ─── Timezone helpers ────────────────────────────────────────────────────────
 
 /// Read the `tz_offset` value (hours) from the settings table.
@@ -89,15 +115,22 @@ pub async fn today_for_tz_pub(db_path: &Path) -> Result<String, libsql::Error> {
 /// WAL mode is also set once at schema creation, but re-asserting it here
 /// is cheap (no-op when already active) and ensures every connection is
 /// consistent even if the database was reset externally.
+///
+/// Reads `TURSO_DATABASE_URL` to resolve the database location,
+/// falling back to `db_path`.
 async fn open(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
-    let db = libsql::Builder::new_local(
-        db_path.to_str().ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))?,
-    )
-    .build()
-    .await?;
+    let db = build_db(db_path).await?;
     let conn = db.connect()?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;").await?;
+    conn.execute_batch(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")).await?;
     Ok(conn)
+}
+
+/// Open a connection usable from outside this module (e.g. `species.rs`).
+///
+/// Reads `TURSO_DATABASE_URL` to resolve the database, falling back to
+/// `db_path`.  Sets `busy_timeout` immediately.
+pub async fn open_conn(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
+    open(db_path).await
 }
 
 // ─── Recent detections (live feed) ───────────────────────────────────────────
@@ -1155,13 +1188,11 @@ pub async fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>,
 
 /// Open a read-write connection with WAL and a busy timeout.
 async fn open_rw(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
-    let db = libsql::Builder::new_local(
-        db_path.to_str().ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))?,
-    )
-    .build()
-    .await?;
+    let db = build_db(db_path).await?;
     let conn = db.connect()?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;").await?;
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+    )).await?;
     Ok(conn)
 }
 

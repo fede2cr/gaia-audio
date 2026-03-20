@@ -31,8 +31,51 @@ fn rt() -> &'static tokio::runtime::Runtime {
 
 // ── Connection helper ────────────────────────────────────────────────────
 
-/// Default busy-timeout for short operations (reads, small writes).
-const BUSY_TIMEOUT_MS: u32 = 5000;
+/// Busy-timeout in milliseconds.  30 s gives enough headroom for the
+/// web server, backup scripts, and other processing containers that
+/// may hold the write lock momentarily.
+const BUSY_TIMEOUT_MS: u32 = 30_000;
+
+/// Cached database handle — opened once, reused for every connection.
+///
+/// Re-opening `libsql::Database` for every query is expensive (it
+/// re-opens the file descriptor, replays the WAL, etc.) and creates
+/// transient connections that may miss the `busy_timeout` PRAGMA if
+/// another process holds the write lock at open time.
+static DB: OnceLock<libsql::Database> = OnceLock::new();
+
+/// Resolve the effective database path.
+///
+/// `TURSO_DATABASE_URL` takes precedence over the `db_path` argument
+/// (which itself comes from `DB_PATH` or the config file default).
+/// In local-only mode the URL is simply a file path.
+fn effective_db_path(db_path: &Path) -> String {
+    std::env::var("TURSO_DATABASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            db_path
+                .to_str()
+                .expect("Non-UTF-8 database path")
+                .to_string()
+        })
+}
+
+/// Return (or lazily create) the cached `Database` for `db_path`.
+async fn get_or_open_db(db_path: &Path) -> Result<&'static libsql::Database> {
+    if let Some(db) = DB.get() {
+        return Ok(db);
+    }
+    let url = effective_db_path(db_path);
+    info!("Opening database: {url}");
+    let new_db = libsql::Builder::new_local(&url)
+        .build()
+        .await
+        .with_context(|| format!("Cannot open database: {url}"))?;
+    // If another thread raced us, their Database wins — ours is dropped.
+    let _ = DB.set(new_db);
+    Ok(DB.get().expect("DB was just set"))
+}
 
 /// Open a database connection with WAL journal mode and a busy timeout.
 ///
@@ -44,19 +87,18 @@ const BUSY_TIMEOUT_MS: u32 = 5000;
 /// The busy timeout tells SQLite to retry internally (using
 /// exponential backoff) when another connection holds the write lock,
 /// instead of returning SQLITE_BUSY immediately.
+///
+/// **PRAGMA order matters:** `busy_timeout` is set *first* so that the
+/// subsequent `journal_mode=WAL` (which itself requires a write lock)
+/// can wait instead of failing immediately.
 async fn open_conn_async(db_path: &Path) -> Result<libsql::Connection> {
-    let db = libsql::Builder::new_local(
-        db_path.to_str().context("Non-UTF-8 database path")?,
-    )
-    .build()
-    .await
-    .with_context(|| format!("Cannot open database: {}", db_path.display()))?;
+    let db = get_or_open_db(db_path).await?;
 
     let conn = db.connect().context("Cannot connect to database")?;
 
     conn.execute_batch(&format!(
-        "PRAGMA journal_mode=WAL; \
-         PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; \
+        "PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; \
+         PRAGMA journal_mode=WAL; \
          PRAGMA synchronous=NORMAL;"
     ))
     .await
@@ -535,43 +577,72 @@ pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool
 }
 
 /// Record that this instance has finished processing a file.
+///
+/// Retries up to 3 times with exponential backoff if the database is
+/// locked, to cope with transient contention from other processes.
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
-    let conn = open_conn(db_path)?;
-    rt().block_on(async {
-        conn.execute(
-            "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
-            params![filename.to_string(), instance.to_string()],
-        )
-        .await?;
+    const MAX_RETRIES: u32 = 3;
+    let mut last_err: Option<anyhow::Error> = None;
 
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
-                params![filename.to_string()],
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let backoff = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+            tracing::info!(
+                "mark_file_processed: retry {attempt}/{MAX_RETRIES} for {filename} after {backoff:?}"
+            );
+            std::thread::sleep(backoff);
+        }
+
+        let conn = match open_conn(db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        match rt().block_on(async {
+            conn.execute(
+                "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
+                params![filename.to_string(), instance.to_string()],
             )
             .await?;
-        let done: u32 = rows
-            .next()
-            .await?
-            .and_then(|r| r.get::<u32>(0).ok())
-            .unwrap_or(0);
 
-        let mut rows2 = conn
-            .query("SELECT COUNT(*) FROM processing_instances", ())
-            .await?;
-        let total: u32 = rows2
-            .next()
-            .await?
-            .and_then(|r| r.get::<u32>(0).ok())
-            .unwrap_or(0);
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
+                    params![filename.to_string()],
+                )
+                .await?;
+            let done: u32 = rows
+                .next()
+                .await?
+                .and_then(|r| r.get::<u32>(0).ok())
+                .unwrap_or(0);
 
-        debug!(
-            "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
-            instance
-        );
-        Ok::<(), libsql::Error>(())
-    })?;
-    Ok(())
+            let mut rows2 = conn
+                .query("SELECT COUNT(*) FROM processing_instances", ())
+                .await?;
+            let total: u32 = rows2
+                .next()
+                .await?
+                .and_then(|r| r.get::<u32>(0).ok())
+                .unwrap_or(0);
+
+            debug!(
+                "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
+                instance
+            );
+            Ok::<(), libsql::Error>(())
+        }) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e.into());
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("mark_file_processed failed after retries")))
 }
 
 /// Check whether every **active** processing instance has processed this file.

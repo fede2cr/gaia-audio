@@ -155,15 +155,7 @@ pub async fn get_species_models(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     // Re-use the general available_models query and filter to this species.
-    let db = libsql::Builder::new_local(
-        state.db_path.to_str().ok_or_else(|| ServerFnError::new("Non-UTF-8 DB path"))?,
-    )
-    .build()
-    .await
-    .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    let conn = db.connect()
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")
+    let conn = db::open_conn(&state.db_path)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     let mut rows = conn
