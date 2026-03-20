@@ -21,6 +21,7 @@ pub async fn get_calendar_data(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::calendar_data(&state.db_path, year, month)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 

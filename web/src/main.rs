@@ -37,7 +37,7 @@ async fn main() {
 
     // Ensure the database and schema exist so the dashboard works even
     // before the processing server has written any detections.
-    if let Err(e) = gaia_web::server::import::ensure_gaia_schema(&db_path) {
+    if let Err(e) = gaia_web::server::import::ensure_gaia_schema(&db_path).await {
         tracing::error!("Cannot initialise database: {e}");
         std::process::exit(1);
     }
@@ -47,7 +47,7 @@ async fn main() {
     // instantly from the cache table.
     {
         let db = db_path.clone();
-        if let Err(e) = gaia_web::server::db::refresh_species_stats(&db) {
+        if let Err(e) = gaia_web::server::db::refresh_species_stats(&db).await {
             tracing::warn!("Initial species-stats refresh failed: {e}");
         } else {
             tracing::info!("Species stats cache populated");
@@ -63,14 +63,13 @@ async fn main() {
                 // Sleep until the next 02:00 or 24 h, whichever is simpler.
                 tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
                 tracing::info!("Nightly species-stats refresh starting…");
-                let db2 = db.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    gaia_web::server::db::refresh_species_stats(&db2)
-                }).await;
+                let res = {
+                    let db2 = db.clone();
+                    gaia_web::server::db::refresh_species_stats(&db2).await
+                };
                 match res {
-                    Ok(Ok(())) => tracing::info!("Nightly species-stats refresh complete"),
-                    Ok(Err(e)) => tracing::warn!("Nightly species-stats refresh failed: {e}"),
-                    Err(e) => tracing::warn!("Nightly species-stats task panicked: {e}"),
+                    Ok(()) => tracing::info!("Nightly species-stats refresh complete"),
+                    Err(e) => tracing::warn!("Nightly species-stats refresh failed: {e}"),
                 }
             }
         });

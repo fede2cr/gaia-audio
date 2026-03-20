@@ -33,7 +33,7 @@ tract-tflite = "0.21"
 tract-onnx = "0.21"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+libsql = { version = "0.9", default-features = false, features = ["core"] }
 
 # Image / FFT
 rustfft = "6.2"

@@ -30,7 +30,7 @@ tower               = { version = "0.5", optional = true }
 tower-http          = { version = "0.6", features = ["fs", "cors"], optional = true }
 tracing             = { version = "0.1", optional = true }
 tracing-subscriber  = { version = "0.3", features = ["env-filter"], optional = true }
-rusqlite            = { version = "0.32", features = ["bundled"], optional = true }
+libsql              = { version = "0.9", default-features = false, features = ["core"], optional = true }
 reqwest             = { version = "0.12", features = ["json"], optional = true }
 chrono              = { version = "0.4", optional = true }
 http                = { version = "1", optional = true }
@@ -59,7 +59,7 @@ ssr = [
     "dep:tower-http",
     "dep:tracing",
     "dep:tracing-subscriber",
-    "dep:rusqlite",
+    "dep:libsql",
     "dep:reqwest",
     "dep:chrono",
     "dep:http",

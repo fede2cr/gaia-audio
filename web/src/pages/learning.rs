@@ -21,6 +21,7 @@ pub async fn get_quiz(today_only: bool) -> Result<Vec<QuizItem>, ServerFnError> 
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     let mut items = crate::server::db::quiz_candidates(&state.db_path, today_only)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist photos.

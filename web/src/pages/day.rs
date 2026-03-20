@@ -24,6 +24,7 @@ pub async fn get_day_detections(
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut groups = db::day_detections_filtered(&state.db_path, &date, slug_opt)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with images
@@ -46,6 +47,7 @@ pub async fn get_day_hourly(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::daily_species_hourly(&state.db_path, &date)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 

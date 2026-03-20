@@ -25,6 +25,7 @@ pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     let map = crate::server::db::get_all_settings(&state.db_path)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     let f = |key: &str, default: f64| -> f64 {
@@ -66,6 +67,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
             ("tz_offset", &tz),
         ],
     )
+    .await
     .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     Ok(())

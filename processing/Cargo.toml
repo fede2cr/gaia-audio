@@ -26,7 +26,10 @@ tract-tflite.workspace = true
 tract-onnx.workspace = true
 
 # Storage
-rusqlite.workspace = true
+libsql.workspace = true
+
+# Async runtime (for libsql block_on in sync context)
+tokio.workspace = true
 
 # Spectrogram
 rustfft.workspace = true

@@ -233,7 +233,17 @@ fn run_analysis(
             // Species-range filter: if the location model says this species
             // is unlikely here, still record the detection but flag it as
             // excluded so an ornithologist can review it later.
-            let excluded = !predicted_species_list.is_empty()
+            //
+            // The metadata model (V2.4) only knows about birds.  When
+            // BirdNET+ V3.0 detects non-bird species (Mammalia, Insecta,
+            // …) they would always be marked excluded because they are
+            // absent from the bird-only occurrence list.  Skip the check
+            // for species whose taxonomic class is not Aves.
+            let is_bird = class_map
+                .get(sci_name.as_str())
+                .map_or(true, |c| c == "Aves");
+            let excluded = is_bird
+                && !predicted_species_list.is_empty()
                 && !predicted_species_list.contains(sci_name)
                 && !whitelist.contains(sci_name);
 
@@ -277,9 +287,15 @@ fn run_analysis(
 
     // Collect top raw predictions for the live feed (all chunks, top
     // entry per chunk regardless of confidence threshold).
+    // Skip chunks where the top score is effectively zero — these are
+    // no-signal chunks (sigmoid baseline clamped to 0, or softmax with
+    // negligible probability) and would clutter the live feed.
     let mut top_preds: Vec<LivePrediction> = Vec::new();
     for (_start, _end, entries) in &labeled {
         if let Some((sci_name, confidence)) = entries.first() {
+            if *confidence < 0.01 {
+                continue; // no meaningful signal in this chunk
+            }
             let com_name = names
                 .get(sci_name.as_str())
                 .cloned()

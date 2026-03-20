@@ -1,14 +1,90 @@
-//! SQLite database layer.
+//! SQLite database layer (via libsql / Turso).
 //!
-//! Reused from `birdnet-server/src/db.rs`, with an added `Domain` column.
+//! All database access goes through the libsql crate, which uses a
+//! fork of SQLite with enhanced features.  The async API is driven by
+//! a module-level single-threaded tokio runtime so that the rest of
+//! the processing server can remain synchronous.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use libsql::params;
 use tracing::{debug, info};
 
 use gaia_common::detection::Detection;
+
+// ── Async runtime for sync callers ───────────────────────────────────
+
+/// Single-threaded tokio runtime used exclusively for database I/O.
+/// Created lazily on first use.
+static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Cannot create tokio runtime for database")
+    })
+}
+
+// ── Connection helper ────────────────────────────────────────────────────
+
+/// Default busy-timeout for short operations (reads, small writes).
+const BUSY_TIMEOUT_MS: u32 = 5000;
+
+/// Open a database connection with WAL journal mode and a busy timeout.
+///
+/// WAL mode allows concurrent readers alongside a single writer — the
+/// single most important setting for avoiding "database is locked" errors
+/// when the processing server, web server, and backup script all access
+/// the same database file simultaneously.
+///
+/// The busy timeout tells SQLite to retry internally (using
+/// exponential backoff) when another connection holds the write lock,
+/// instead of returning SQLITE_BUSY immediately.
+async fn open_conn_async(db_path: &Path) -> Result<libsql::Connection> {
+    let db = libsql::Builder::new_local(
+        db_path.to_str().context("Non-UTF-8 database path")?,
+    )
+    .build()
+    .await
+    .with_context(|| format!("Cannot open database: {}", db_path.display()))?;
+
+    let conn = db.connect().context("Cannot connect to database")?;
+
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; \
+         PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; \
+         PRAGMA synchronous=NORMAL;"
+    ))
+    .await
+    .context("Failed to set database pragmas")?;
+
+    Ok(conn)
+}
+
+/// Open a connection synchronously (blocks the calling thread).
+fn open_conn(db_path: &Path) -> Result<libsql::Connection> {
+    rt().block_on(open_conn_async(db_path))
+}
+
+/// Like [`open_conn`] but returns `None` on failure instead of an error.
+fn open_conn_opt(db_path: &Path) -> Option<libsql::Connection> {
+    open_conn(db_path).ok()
+}
+
+/// Public re-export for other crates in the processing workspace.
+pub fn open_conn_pub(db_path: &Path) -> Result<libsql::Connection> {
+    open_conn(db_path)
+}
+
+/// Execute an async operation using the module-level runtime.
+/// Public for use by other crates (e.g. compress.rs).
+pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    rt().block_on(f)
+}
 
 /// Labels that the BirdNET model emits which are not actual bird species.
 /// These are counted in the `urban_noise` table instead of `detections`.
@@ -41,123 +117,99 @@ pub fn initialize(db_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("Cannot open database: {}", db_path.display()))?;
+    let conn = open_conn(db_path)?;
 
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS detections (
-            Date       DATE,
-            Time       TIME,
-            Domain     VARCHAR(50) NOT NULL DEFAULT 'birds',
-            Sci_Name   VARCHAR(100) NOT NULL,
-            Com_Name   VARCHAR(100) NOT NULL,
-            Confidence FLOAT,
-            Lat        FLOAT,
-            Lon        FLOAT,
-            Cutoff     FLOAT,
-            Week       INT,
-            Sens       FLOAT,
-            Overlap    FLOAT,
-            File_Name  VARCHAR(100) NOT NULL,
-            Source_Node VARCHAR(200) NOT NULL DEFAULT '',
-            Excluded   INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
-        CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
-        CREATE INDEX IF NOT EXISTS detections_Domain      ON detections (Domain);
-        CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);
+    rt().block_on(async {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS detections (
+                Date       DATE,
+                Time       TIME,
+                Domain     VARCHAR(50) NOT NULL DEFAULT 'birds',
+                Sci_Name   VARCHAR(100) NOT NULL,
+                Com_Name   VARCHAR(100) NOT NULL,
+                Confidence FLOAT,
+                Lat        FLOAT,
+                Lon        FLOAT,
+                Cutoff     FLOAT,
+                Week       INT,
+                Sens       FLOAT,
+                Overlap    FLOAT,
+                File_Name  VARCHAR(100) NOT NULL,
+                Source_Node VARCHAR(200) NOT NULL DEFAULT '',
+                Excluded   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS detections_Com_Name    ON detections (Com_Name);
+            CREATE INDEX IF NOT EXISTS detections_Sci_Name    ON detections (Sci_Name);
+            CREATE INDEX IF NOT EXISTS detections_Domain      ON detections (Domain);
+            CREATE INDEX IF NOT EXISTS detections_Date_Time   ON detections (Date DESC, Time DESC);
 
-        CREATE TABLE IF NOT EXISTS urban_noise (
-            Date       DATE    NOT NULL,
-            Hour       INT     NOT NULL,
-            Category   VARCHAR(50) NOT NULL,
-            Count      INT     NOT NULL DEFAULT 1,
-            UNIQUE(Date, Hour, Category)
-        );
-        CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);
+            CREATE TABLE IF NOT EXISTS urban_noise (
+                Date       DATE    NOT NULL,
+                Hour       INT     NOT NULL,
+                Category   VARCHAR(50) NOT NULL,
+                Count      INT     NOT NULL DEFAULT 1,
+                UNIQUE(Date, Hour, Category)
+            );
+            CREATE INDEX IF NOT EXISTS urban_noise_date ON urban_noise (Date DESC);
 
-        CREATE TABLE IF NOT EXISTS settings (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS exclusion_overrides (
-            Sci_Name      VARCHAR(100) PRIMARY KEY,
-            overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
-            notes         TEXT NOT NULL DEFAULT ''
-        );
+            CREATE TABLE IF NOT EXISTS exclusion_overrides (
+                Sci_Name      VARCHAR(100) PRIMARY KEY,
+                overridden_at TEXT NOT NULL DEFAULT (datetime('now')),
+                notes         TEXT NOT NULL DEFAULT ''
+            );
 
-        CREATE TABLE IF NOT EXISTS file_processing_log (
-            filename   TEXT    NOT NULL,
-            instance   TEXT    NOT NULL,
-            processed_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (filename, instance)
-        );
+            CREATE TABLE IF NOT EXISTS file_processing_log (
+                filename   TEXT    NOT NULL,
+                instance   TEXT    NOT NULL,
+                processed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (filename, instance)
+            );
 
-        CREATE TABLE IF NOT EXISTS processing_instances (
-            instance       TEXT PRIMARY KEY,
-            registered_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-    ",
-    )
-    .context("Failed to create tables")?;
+            CREATE TABLE IF NOT EXISTS processing_instances (
+                instance       TEXT PRIMARY KEY,
+                registered_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                last_heartbeat TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        ",
+        )
+        .await
+        .context("Failed to create tables")?;
 
-    // Migration: add Source_Node to existing databases that lack it.
-    migrate_add_source_node(&conn);
-    // Migration: add Excluded column to existing databases.
-    migrate_add_excluded(&conn);
-    // Migration: add last_heartbeat to existing processing_instances tables.
-    migrate_add_heartbeat(&conn);
-    // Migration: add Model_Slug and Model_Name columns.
-    migrate_add_model_columns(&conn);
+        // Migration: add Source_Node to existing databases that lack it.
+        migrate_add_column(&conn, "detections", "Source_Node", "VARCHAR(200) NOT NULL DEFAULT ''").await;
+        // Migration: add Excluded column to existing databases.
+        migrate_add_column(&conn, "detections", "Excluded", "INTEGER NOT NULL DEFAULT 0").await;
+        // Migration: add last_heartbeat to existing processing_instances tables.
+        let added = conn.execute_batch(
+            "ALTER TABLE processing_instances ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT '';"
+        ).await;
+        if added.is_ok() {
+            conn.execute_batch(
+                "UPDATE processing_instances SET last_heartbeat = registered_at WHERE last_heartbeat = '';"
+            ).await.ok();
+        }
+        // Migration: add Model_Slug and Model_Name columns.
+        migrate_add_column(&conn, "detections", "Model_Slug", "VARCHAR(100) NOT NULL DEFAULT ''").await;
+        migrate_add_column(&conn, "detections", "Model_Name", "VARCHAR(200) NOT NULL DEFAULT ''").await;
+
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     info!("Database schema verified");
     Ok(())
 }
 
-/// Add the `Source_Node` column if it doesn't exist (idempotent).
-fn migrate_add_source_node(conn: &Connection) {
-    // SQLite's ALTER TABLE ADD COLUMN is a no-op if the column already exists
-    // — except it returns an error. We simply ignore that.
-    let _ = conn.execute_batch(
-        "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
-    );
-}
-
-/// Add the `Excluded` column if it doesn't exist (idempotent).
-fn migrate_add_excluded(conn: &Connection) {
-    let _ = conn.execute_batch(
-        "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
-    );
-}
-
-/// Add `last_heartbeat` column to `processing_instances` if missing.
-fn migrate_add_heartbeat(conn: &Connection) {
-    // SQLite ALTER TABLE ADD COLUMN with NOT NULL requires a *constant*
-    // default — datetime('now') is an expression and would be rejected.
-    // Use a constant default, then backfill existing rows.
-    let added = conn.execute_batch(
-        "ALTER TABLE processing_instances ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT '';",
-    );
-    if added.is_ok() {
-        // Backfill: set heartbeat to registered_at for existing rows.
-        conn.execute_batch(
-            "UPDATE processing_instances SET last_heartbeat = registered_at WHERE last_heartbeat = '';",
-        )
-        .ok();
-    }
-}
-
-/// Add model tracking columns if they don't exist (idempotent).
-fn migrate_add_model_columns(conn: &Connection) {
-    let _ = conn.execute_batch(
-        "ALTER TABLE detections ADD COLUMN Model_Slug VARCHAR(100) NOT NULL DEFAULT '';",
-    );
-    let _ = conn.execute_batch(
-        "ALTER TABLE detections ADD COLUMN Model_Name VARCHAR(200) NOT NULL DEFAULT '';",
-    );
+/// Idempotent column addition — ignores "duplicate column" errors.
+async fn migrate_add_column(conn: &libsql::Connection, table: &str, column: &str, typedef: &str) {
+    let _ = conn
+        .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {typedef};"))
+        .await;
 }
 
 /// Insert a single detection row.
@@ -197,33 +249,37 @@ fn try_insert(
     file_name: &str,
     source_node: &str,
 ) -> Result<()> {
-    let conn = Connection::open(db_path)?;
-    conn.execute(
-        "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
-         Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
-         Model_Slug, Model_Name) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        params![
-            d.date,
-            d.time,
-            d.domain,
-            d.scientific_name,
-            d.common_name,
-            d.confidence,
-            lat,
-            lon,
-            cutoff,
-            d.week,
-            sensitivity,
-            overlap,
-            file_name,
-            source_node,
-            d.excluded as i32,
-            d.model_slug,
-            d.model_name,
-        ],
-    )?;
-    Ok(())
+    let conn = open_conn(db_path)?;
+    rt().block_on(async {
+        conn.execute(
+            "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
+             Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
+             Model_Slug, Model_Name) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                d.date.clone(),
+                d.time.clone(),
+                d.domain.clone(),
+                d.scientific_name.clone(),
+                d.common_name.clone(),
+                d.confidence,
+                lat,
+                lon,
+                cutoff,
+                d.week as i64,
+                sensitivity,
+                overlap,
+                file_name.to_string(),
+                source_node.to_string(),
+                d.excluded as i64,
+                d.model_slug.clone(),
+                d.model_name.clone(),
+            ],
+        )
+        .await
+        .context("Failed to insert detection")?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 /// Count today's detections of a species in a given domain.
@@ -232,10 +288,13 @@ pub fn todays_count_for(db_path: &Path, domain: &str, sci_name: &str) -> u32 {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     _count(
         db_path,
-        &format!(
-            "SELECT COUNT(*) FROM detections WHERE Date = DATE('{today}') \
-             AND Domain = '{domain}' AND Sci_Name = '{sci_name}'"
-        ),
+        "SELECT COUNT(*) FROM detections WHERE Date = DATE(?1) \
+         AND Domain = ?2 AND Sci_Name = ?3",
+        vec![
+            libsql::Value::from(today),
+            libsql::Value::from(domain.to_string()),
+            libsql::Value::from(sci_name.to_string()),
+        ],
     )
 }
 
@@ -245,18 +304,31 @@ pub fn weeks_count_for(db_path: &Path, domain: &str, sci_name: &str) -> u32 {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     _count(
         db_path,
-        &format!(
-            "SELECT COUNT(*) FROM detections WHERE Date >= DATE('{today}', '-7 day') \
-             AND Domain = '{domain}' AND Sci_Name = '{sci_name}'"
-        ),
+        "SELECT COUNT(*) FROM detections WHERE Date >= DATE(?1, '-7 day') \
+         AND Domain = ?2 AND Sci_Name = ?3",
+        vec![
+            libsql::Value::from(today),
+            libsql::Value::from(domain.to_string()),
+            libsql::Value::from(sci_name.to_string()),
+        ],
     )
 }
 
-fn _count(db_path: &Path, sql: &str) -> u32 {
-    Connection::open(db_path)
-        .ok()
-        .and_then(|conn| conn.query_row(sql, [], |row| row.get::<_, u32>(0)).ok())
-        .unwrap_or(0)
+fn _count(db_path: &Path, sql: &str, p: Vec<libsql::Value>) -> u32 {
+    let conn = match open_conn_opt(db_path) {
+        Some(c) => c,
+        None => return 0,
+    };
+    rt().block_on(async {
+        let mut rows = match conn.query(sql, p).await {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        match rows.next().await {
+            Ok(Some(row)) => row.get::<u32>(0).unwrap_or(0),
+            _ => 0,
+        }
+    })
 }
 
 /// Increment the urban-noise counter for a category / date / hour.
@@ -264,26 +336,30 @@ fn _count(db_path: &Path, sql: &str) -> u32 {
 /// Uses `INSERT OR REPLACE` with an UPSERT pattern so a single row is
 /// stored per (Date, Hour, Category) tuple.
 pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &str) -> Result<()> {
-    let conn = Connection::open(db_path)?;
-    let result = conn.execute(
-        "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
-         ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
-        params![date, hour, category],
-    );
+    let conn = open_conn(db_path)?;
+    rt().block_on(async {
+        let result = conn.execute(
+            "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
+            params![date.to_string(), hour as i64, category.to_string()],
+        ).await;
 
-    if let Err(_) = result {
-        // Fallback for older schemas without the UNIQUE constraint.
-        let updated = conn.execute(
-            "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
-            params![date, hour, category],
-        )?;
-        if updated == 0 {
-            conn.execute(
-                "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
-                params![date, hour, category],
-            )?;
+        if result.is_err() {
+            // Fallback for older schemas without the UNIQUE constraint.
+            let updated = conn.execute(
+                "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
+                params![date.to_string(), hour as i64, category.to_string()],
+            ).await?;
+            if updated == 0 {
+                conn.execute(
+                    "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
+                    params![date.to_string(), hour as i64, category.to_string()],
+                ).await?;
+            }
         }
-    }
+
+        Ok::<(), libsql::Error>(())
+    })?;
 
     Ok(())
 }
@@ -293,14 +369,15 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
 /// Read a single setting from the `settings` table.
 /// Returns `None` if the table or key doesn't exist.
 pub fn get_setting(db_path: &Path, key: &str) -> Option<String> {
-    let conn = Connection::open(db_path).ok()?;
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )
-    .ok()
+    let conn = open_conn_opt(db_path)?;
+    rt().block_on(async {
+        let mut rows = conn
+            .query("SELECT value FROM settings WHERE key = ?1", params![key.to_string()])
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        row.get::<String>(0).ok()
+    })
 }
 
 /// Read a setting as `f64`, returning `None` on missing / parse error.
@@ -336,19 +413,23 @@ pub fn apply_settings_overrides(config: &mut gaia_common::config::Config) {
 /// These species have been manually confirmed by an ornithologist and
 /// should bypass the species-range occurrence-threshold filter.
 pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    let mut stmt = match conn.prepare("SELECT Sci_Name FROM exclusion_overrides") {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    stmt.query_map([], |row| row.get::<_, String>(0))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    rt().block_on(async {
+        let mut rows = match conn.query("SELECT Sci_Name FROM exclusion_overrides", ()).await {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            if let Ok(name) = row.get::<String>(0) {
+                out.push(name);
+            }
+        }
+        out
+    })
 }
 
 // ─── File processing coordination ────────────────────────────────────────────
@@ -356,20 +437,28 @@ pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
 /// Register a processing instance so other instances know about it.
 /// Called once at startup.
 pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
-    conn.execute(
-        "INSERT OR REPLACE INTO processing_instances (instance, registered_at, last_heartbeat) \
-         VALUES (?1, datetime('now'), datetime('now'))",
-        params![instance],
-    )?;
-    let total: u32 = conn
-        .query_row("SELECT COUNT(*) FROM processing_instances", [], |row| row.get(0))
-        .unwrap_or(1);
-    debug!(
-        "Registered processing instance {:?} ({total} instance(s) total)",
-        instance
-    );
+    let conn = open_conn(db_path)?;
+    rt().block_on(async {
+        conn.execute(
+            "INSERT OR REPLACE INTO processing_instances (instance, registered_at, last_heartbeat) \
+             VALUES (?1, datetime('now'), datetime('now'))",
+            params![instance.to_string()],
+        )
+        .await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM processing_instances", ())
+            .await?;
+        let total: u32 = rows
+            .next()
+            .await?
+            .and_then(|r| r.get::<u32>(0).ok())
+            .unwrap_or(1);
+        debug!(
+            "Registered processing instance {:?} ({total} instance(s) total)",
+            instance
+        );
+        Ok::<(), libsql::Error>(())
+    })?;
     Ok(())
 }
 
@@ -377,41 +466,44 @@ pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
 /// Should be called every poll cycle so `all_instances_done` can
 /// distinguish live instances from stale ones.
 pub fn update_heartbeat(db_path: &Path, instance: &str) {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return,
     };
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    conn.execute(
-        "UPDATE processing_instances SET last_heartbeat = datetime('now') WHERE instance = ?1",
-        params![instance],
-    )
-    .ok();
+    rt().block_on(async {
+        conn.execute(
+            "UPDATE processing_instances SET last_heartbeat = datetime('now') WHERE instance = ?1",
+            params![instance.to_string()],
+        )
+        .await
+        .ok();
+    });
 }
 
 /// Remove processing instances whose heartbeat is older than the given
 /// threshold (in minutes).  Returns the number of pruned rows.
 pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return 0,
     };
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    let removed = conn
-        .execute(
+    let removed = rt().block_on(async {
+        conn.execute(
             &format!(
                 "DELETE FROM processing_instances \
                  WHERE last_heartbeat < datetime('now', '-{stale_minutes} minutes')"
             ),
-            [],
+            (),
         )
-        .unwrap_or(0);
+        .await
+        .unwrap_or(0)
+    });
     if removed > 0 {
         info!(
             "Pruned {removed} stale processing instance(s) (no heartbeat in >{stale_minutes} min)"
         );
     }
-    removed
+    removed as usize
 }
 
 /// Check whether this instance has already processed a specific file.
@@ -420,42 +512,65 @@ pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
 /// processed in a previous run (the in-memory `dispatched` set is
 /// lost on restart, but the DB log survives).
 pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    conn.query_row(
-        "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1 AND instance = ?2",
-        params![filename, instance],
-        |row| row.get::<_, u32>(0),
-    )
-    .unwrap_or(0)
-        > 0
+    rt().block_on(async {
+        let mut rows = match conn
+            .query(
+                "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1 AND instance = ?2",
+                params![filename.to_string(), instance.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        match rows.next().await {
+            Ok(Some(row)) => row.get::<u32>(0).unwrap_or(0) > 0,
+            _ => false,
+        }
+    })
 }
 
 /// Record that this instance has finished processing a file.
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
-    conn.execute(
-        "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
-        params![filename, instance],
-    )?;
-    let done: u32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
-            params![filename],
-            |row| row.get(0),
+    let conn = open_conn(db_path)?;
+    rt().block_on(async {
+        conn.execute(
+            "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
+            params![filename.to_string(), instance.to_string()],
         )
-        .unwrap_or(0);
-    let total: u32 = conn
-        .query_row("SELECT COUNT(*) FROM processing_instances", [], |row| row.get(0))
-        .unwrap_or(0);
-    debug!(
-        "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
-        instance
-    );
+        .await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
+                params![filename.to_string()],
+            )
+            .await?;
+        let done: u32 = rows
+            .next()
+            .await?
+            .and_then(|r| r.get::<u32>(0).ok())
+            .unwrap_or(0);
+
+        let mut rows2 = conn
+            .query("SELECT COUNT(*) FROM processing_instances", ())
+            .await?;
+        let total: u32 = rows2
+            .next()
+            .await?
+            .and_then(|r| r.get::<u32>(0).ok())
+            .unwrap_or(0);
+
+        debug!(
+            "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
+            instance
+        );
+        Ok::<(), libsql::Error>(())
+    })?;
     Ok(())
 }
 
@@ -465,52 +580,75 @@ pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Re
 /// considered.  This prevents stale / stopped containers from blocking
 /// deletion forever.
 pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return true, // fail-open: delete if we can't check
     };
-    conn.execute_batch("PRAGMA busy_timeout=3000;").ok();
 
-    // Only count instances that are still alive (heartbeat within last
-    // 5 minutes).  Stale entries from previous runs are ignored.
-    let remaining = conn.query_row(
-        "SELECT COUNT(*) FROM processing_instances \
-         WHERE last_heartbeat >= datetime('now', '-5 minutes') \
-           AND instance NOT IN \
-             (SELECT instance FROM file_processing_log WHERE filename = ?1)",
-        params![filename],
-        |row| row.get::<_, u32>(0),
-    )
-    .unwrap_or(0);
+    rt().block_on(async {
+        // Only count instances that are still alive (heartbeat within last
+        // 5 minutes).  Stale entries from previous runs are ignored.
+        let remaining: u32 = {
+            let mut rows = match conn
+                .query(
+                    "SELECT COUNT(*) FROM processing_instances \
+                     WHERE last_heartbeat >= datetime('now', '-5 minutes') \
+                       AND instance NOT IN \
+                         (SELECT instance FROM file_processing_log WHERE filename = ?1)",
+                    params![filename.to_string()],
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => return true,
+            };
+            match rows.next().await {
+                Ok(Some(row)) => row.get::<u32>(0).unwrap_or(0),
+                _ => 0,
+            }
+        };
 
-    let active: u32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM processing_instances \
-             WHERE last_heartbeat >= datetime('now', '-5 minutes')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+        let active: u32 = {
+            let mut rows = match conn
+                .query(
+                    "SELECT COUNT(*) FROM processing_instances \
+                     WHERE last_heartbeat >= datetime('now', '-5 minutes')",
+                    (),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => return true,
+            };
+            match rows.next().await {
+                Ok(Some(row)) => row.get::<u32>(0).unwrap_or(0),
+                _ => 0,
+            }
+        };
 
-    let done = remaining == 0;
-    debug!(
-        "all_instances_done({filename}): {remaining}/{active} active instance(s) still pending → {}",
-        if done { "ready to delete" } else { "waiting" }
-    );
-    done
+        let done = remaining == 0;
+        debug!(
+            "all_instances_done({filename}): {remaining}/{active} active instance(s) still pending → {}",
+            if done { "ready to delete" } else { "waiting" }
+        );
+        done
+    })
 }
 
 /// Remove old entries from the processing log (files older than 1 hour).
 pub fn cleanup_processing_log(db_path: &Path) {
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return,
     };
-    conn.execute_batch("PRAGMA busy_timeout=1000;").ok();
-    let removed = conn.execute(
-        "DELETE FROM file_processing_log WHERE processed_at < datetime('now', '-1 hour')",
-        [],
-    ).unwrap_or(0);
+    let removed = rt().block_on(async {
+        conn.execute(
+            "DELETE FROM file_processing_log WHERE processed_at < datetime('now', '-1 hour')",
+            (),
+        )
+        .await
+        .unwrap_or(0)
+    });
     if removed > 0 {
         debug!("cleanup_processing_log: purged {removed} stale entries");
     }
@@ -536,28 +674,34 @@ pub fn migrate_domain_classes(
         return;
     }
 
-    let conn = match Connection::open(db_path) {
+    let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("migrate_domain_classes: cannot open DB: {e}");
             return;
         }
     };
-    conn.execute_batch("PRAGMA busy_timeout=5000;").ok();
 
     let mut updated: usize = 0;
     for (sci_name, class) in class_map {
         if class == old_domain {
             continue; // nothing to change
         }
-        let n = conn
-            .execute(
+        let n = rt().block_on(async {
+            conn.execute(
                 "UPDATE detections SET Domain = ?1 \
                  WHERE Sci_Name = ?2 AND Domain = ?3 AND Model_Slug = ?4",
-                params![class, sci_name, old_domain, model_slug],
+                params![
+                    class.clone(),
+                    sci_name.clone(),
+                    old_domain.to_string(),
+                    model_slug.to_string()
+                ],
             )
-            .unwrap_or(0);
-        updated += n;
+            .await
+            .unwrap_or(0)
+        });
+        updated += n as usize;
     }
     if updated > 0 {
         info!(

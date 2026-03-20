@@ -1,4 +1,4 @@
-//! SQLite read-only queries for the web dashboard.
+//! SQLite queries for the web dashboard (libsql / Turso edition).
 //!
 //! Uses the same `detections` table written by the processing server.
 //!
@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration, Utc};
-use rusqlite::{params, Connection};
+use libsql::params;
 
 use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, TopRecording, UrbanNoiseSummary, WebDetection,
                     HourlyCount, SpeciesHourlyCounts};
@@ -18,15 +18,15 @@ use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, Sp
 
 /// Read the `tz_offset` value (hours) from the settings table.
 /// Returns 0 (UTC) if unset or on any error.
-fn read_tz_offset(conn: &Connection) -> i32 {
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'tz_offset'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|v| v.parse::<i32>().ok())
-    .unwrap_or(0)
+async fn read_tz_offset(conn: &libsql::Connection) -> i32 {
+    let mut rows = match conn.query("SELECT value FROM settings WHERE key = 'tz_offset'", ()).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    match rows.next().await {
+        Ok(Some(row)) => row.get::<String>(0).ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// Apply a timezone offset (hours) to UTC `date` (YYYY-MM-DD) and `time`
@@ -78,20 +78,25 @@ fn today_for_tz(offset: i32) -> String {
 
 /// Public version — reads the TZ offset from the database and returns today's
 /// date string.  Used by server functions that don't already hold a connection.
-pub fn today_for_tz_pub(db_path: &Path) -> Result<String, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+pub async fn today_for_tz_pub(db_path: &Path) -> Result<String, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
     Ok(today_for_tz(tz))
 }
 
 /// Open a read-only connection with a busy timeout.
 ///
-/// WAL journal mode is set once by [`ensure_gaia_schema`] at startup (which
-/// opens the database read-write).  The mode persists in the file, so
-/// read-only connections inherit it automatically without needing a write.
-fn open(db_path: &Path) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+/// WAL mode is also set once at schema creation, but re-asserting it here
+/// is cheap (no-op when already active) and ensures every connection is
+/// consistent even if the database was reset externally.
+async fn open(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
+    let db = libsql::Builder::new_local(
+        db_path.to_str().ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))?,
+    )
+    .build()
+    .await?;
+    let conn = db.connect()?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;").await?;
     Ok(conn)
 }
 
@@ -100,20 +105,20 @@ fn open(db_path: &Path) -> Result<Connection, rusqlite::Error> {
 /// Return the most recent `limit` detections.  
 /// If `after_rowid` is provided only rows with `rowid > after_rowid` are returned
 /// (used for incremental polling).
-pub fn recent_detections(
+pub async fn recent_detections(
     db_path: &Path,
     limit: u32,
     after_rowid: Option<i64>,
-) -> Result<Vec<WebDetection>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
+) -> Result<Vec<WebDetection>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let (sql, row_params): (String, Vec<libsql::Value>) = match after_rowid {
         Some(rid) => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
              COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
              COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
              FROM detections WHERE rowid > ?1 ORDER BY rowid DESC LIMIT ?2"
                 .into(),
-            vec![Box::new(rid), Box::new(limit)],
+            vec![libsql::Value::from(rid), libsql::Value::from(limit as i64)],
         ),
         None => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
@@ -121,33 +126,33 @@ pub fn recent_detections(
              COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
              FROM detections ORDER BY rowid DESC LIMIT ?1"
                 .into(),
-            vec![Box::new(limit)],
+            vec![libsql::Value::from(limit as i64)],
         ),
     };
 
-    let tz = read_tz_offset(&conn);
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
-        Ok(WebDetection {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            scientific_name: row.get(2)?,
-            common_name: row.get(3)?,
-            confidence: row.get(4)?,
-            date: row.get(5)?,
-            time: row.get(6)?,
-            file_name: row.get(7)?,
-            source_node: row.get(8)?,
-            excluded: row.get::<_, i32>(9)? != 0,
+    let tz = read_tz_offset(&conn).await;
+    let mut rows = conn.query(&sql, row_params).await?;
+    let mut dets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
             image_url: None,
-            model_slug: row.get(10)?,
-            model_name: row.get(11)?,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
             display_date: String::new(),
             display_time: String::new(),
-        })
-    })?;
+        });
+    }
 
-    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
     for d in &mut dets { stamp(d, tz); }
     Ok(dets)
 }
@@ -155,12 +160,12 @@ pub fn recent_detections(
 // ─── Calendar data ───────────────────────────────────────────────────────────
 
 /// For a given year-month, return per-day aggregates.
-pub fn calendar_data(
+pub async fn calendar_data(
     db_path: &Path,
     year: i32,
     month: u32,
-) -> Result<Vec<CalendarDay>, rusqlite::Error> {
-    let conn = open(db_path)?;
+) -> Result<Vec<CalendarDay>, libsql::Error> {
+    let conn = open(db_path).await?;
     let start = format!("{year:04}-{month:02}-01");
     let end = if month == 12 {
         format!("{:04}-01-01", year + 1)
@@ -168,68 +173,69 @@ pub fn calendar_data(
         format!("{year:04}-{:02}-01", month + 1)
     };
 
-    let mut stmt = conn.prepare(
+    let mut rows = conn.query(
         "SELECT Date, COUNT(*) AS cnt, COUNT(DISTINCT Sci_Name) AS spp \
          FROM detections \
          WHERE Date >= ?1 AND Date < ?2 \
            AND (COALESCE(Excluded, 0) = 0 \
                 OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY Date ORDER BY Date",
-    )?;
+        params![start, end],
+    ).await?;
 
-    let rows = stmt.query_map(params![start, end], |row| {
-        Ok(CalendarDay {
-            date: row.get(0)?,
-            total_detections: row.get(1)?,
-            unique_species: row.get(2)?,
-        })
-    })?;
-
-    rows.collect()
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(CalendarDay {
+            date: row.get::<String>(0)?,
+            total_detections: row.get::<u32>(1)?,
+            unique_species: row.get::<u32>(2)?,
+        });
+    }
+    Ok(results)
 }
 
 // ─── Day detail ──────────────────────────────────────────────────────────────
 
 /// Return all detections for a specific date, grouped by species.
-pub fn day_detections(
+pub async fn day_detections(
     db_path: &Path,
     date: &str,
-) -> Result<Vec<DayDetectionGroup>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
-    let mut stmt = conn.prepare(
+) -> Result<Vec<DayDetectionGroup>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
+    let mut rows = conn.query(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
          COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
          FROM detections WHERE Date = ?1 ORDER BY Sci_Name, Time DESC",
-    )?;
+        params![date.to_string()],
+    ).await?;
 
-    let rows: Vec<WebDetection> = stmt
-        .query_map(params![date], |row| {
-            Ok(WebDetection {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-                scientific_name: row.get(2)?,
-                common_name: row.get(3)?,
-                confidence: row.get(4)?,
-                date: row.get(5)?,
-                time: row.get(6)?,
-                file_name: row.get(7)?,
-                source_node: row.get(8)?,
-                excluded: row.get::<_, i32>(9)? != 0,
-                image_url: None,
-                model_slug: row.get(10)?,
-                model_name: row.get(11)?,
-                display_date: String::new(),
-                display_time: String::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let rows: Vec<WebDetection> = rows.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
+    let mut all_dets: Vec<WebDetection> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        all_dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
+            image_url: None,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
+        });
+    }
+    let all_dets: Vec<WebDetection> = all_dets.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
 
     // Group by (scientific_name, domain)
     let mut groups: Vec<DayDetectionGroup> = Vec::new();
-    for det in rows {
+    for det in all_dets {
         if let Some(group) = groups
             .iter_mut()
             .find(|g| g.scientific_name == det.scientific_name && g.domain == det.domain)
@@ -257,12 +263,12 @@ pub fn day_detections(
 /// Aggregate species statistics.
 ///
 /// Includes excluded detections only if the species has been overridden.
-pub fn species_info(
+pub async fn species_info(
     db_path: &Path,
     scientific_name: &str,
-) -> Result<Option<SpeciesInfo>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let mut stmt = conn.prepare(
+) -> Result<Option<SpeciesInfo>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let mut rows = conn.query(
         "SELECT Domain, Com_Name, COUNT(*) AS cnt, \
          MIN(Date) AS first_seen, MAX(Date) AS last_seen \
          FROM detections \
@@ -270,84 +276,85 @@ pub fn species_info(
            AND (COALESCE(Excluded, 0) = 0 \
                 OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY Domain, Com_Name LIMIT 1",
-    )?;
+        params![scientific_name.to_string()],
+    ).await?;
 
-    let mut rows = stmt.query_map(params![scientific_name], |row| {
-        Ok(SpeciesInfo {
+    match rows.next().await? {
+        Some(row) => Ok(Some(SpeciesInfo {
             scientific_name: scientific_name.to_string(),
-            domain: row.get(0)?,
-            common_name: row.get(1)?,
-            total_detections: row.get(2)?,
-            first_seen: row.get(3)?,
-            last_seen: row.get(4)?,
+            domain: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            total_detections: row.get::<i64>(2)? as u64,
+            first_seen: row.get::<String>(3).ok(),
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             wikipedia_url: None,
             male_image_url: None,
             female_image_url: None,
             verification: None,
-        })
-    })?;
-
-    match rows.next() {
-        Some(Ok(info)) => Ok(Some(info)),
-        Some(Err(e)) => Err(e),
+        })),
         None => Ok(None),
     }
 }
 
 /// Dates on which a species was detected (for calendar highlighting).
-pub fn species_active_dates(
+pub async fn species_active_dates(
     db_path: &Path,
     scientific_name: &str,
     year: i32,
-) -> Result<Vec<String>, rusqlite::Error> {
-    let conn = open(db_path)?;
+) -> Result<Vec<String>, libsql::Error> {
+    let conn = open(db_path).await?;
     let start = format!("{year:04}-01-01");
     let end = format!("{:04}-01-01", year + 1);
 
-    let mut stmt = conn.prepare(
+    let mut rows = conn.query(
         "SELECT DISTINCT Date FROM detections \
          WHERE Sci_Name = ?1 AND Date >= ?2 AND Date < ?3 ORDER BY Date",
-    )?;
+        params![scientific_name.to_string(), start, end],
+    ).await?;
 
-    let rows = stmt.query_map(params![scientific_name, start, end], |row| row.get(0))?;
-    rows.collect()
+    let mut dates = Vec::new();
+    while let Some(row) = rows.next().await? {
+        dates.push(row.get::<String>(0)?);
+    }
+    Ok(dates)
 }
 
 /// Hourly detection histogram for a single species (all-time).
 ///
 /// Hours are shifted by the user's `tz_offset` so the histogram
 /// reflects local time, not UTC.
-pub fn species_hourly_histogram(
+pub async fn species_hourly_histogram(
     db_path: &Path,
     scientific_name: &str,
-) -> Result<Vec<HourlyCount>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
-    let mut stmt = conn.prepare(
+) -> Result<Vec<HourlyCount>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
+    let mut rows = conn.query(
         "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
          FROM detections \
          WHERE Sci_Name = ?1 \
            AND (COALESCE(Excluded, 0) = 0 \
                 OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY hour ORDER BY hour",
-    )?;
+        params![scientific_name.to_string()],
+    ).await?;
 
-    let rows = stmt.query_map(params![scientific_name], |row| {
-        Ok(HourlyCount {
-            hour: row.get(0)?,
-            count: row.get(1)?,
-        })
-    })?;
+    let mut raw: Vec<HourlyCount> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        raw.push(HourlyCount {
+            hour: row.get::<u32>(0)?,
+            count: row.get::<u32>(1)?,
+        });
+    }
 
     if tz == 0 {
-        return rows.collect();
+        return Ok(raw);
     }
 
     // Re-bucket hours into local time.
     let mut buckets = [0u32; 24];
-    for row in rows {
-        let hc = row?;
+    for hc in &raw {
         let local_hour = ((hc.hour as i32 + tz).rem_euclid(24)) as u32;
         buckets[local_hour as usize] += hc.count;
     }
@@ -360,46 +367,51 @@ pub fn species_hourly_histogram(
 /// Per-species hourly breakdown for a specific date (for the day view chart).
 ///
 /// Hours are shifted by the user's `tz_offset`.
-pub fn daily_species_hourly(
+pub async fn daily_species_hourly(
     db_path: &Path,
     date: &str,
-) -> Result<Vec<SpeciesHourlyCounts>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+) -> Result<Vec<SpeciesHourlyCounts>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
+
     // First get distinct species for the day, ordered by total count.
-    let mut sp_stmt = conn.prepare(
+    let mut sp_rows = conn.query(
         "SELECT Sci_Name, Com_Name, COUNT(*) AS cnt \
          FROM detections \
          WHERE Date = ?1 \
            AND (COALESCE(Excluded, 0) = 0 \
                 OR Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY Sci_Name ORDER BY cnt DESC",
-    )?;
+        params![date.to_string()],
+    ).await?;
 
-    let species: Vec<(String, String, u32)> = sp_stmt
-        .query_map(params![date], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut species: Vec<(String, String, u32)> = Vec::new();
+    while let Some(row) = sp_rows.next().await? {
+        species.push((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<u32>(2)?,
+        ));
+    }
 
     // Then get hourly breakdown for each species.
-    let mut hour_stmt = conn.prepare(
-        "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
-         FROM detections \
-         WHERE Date = ?1 AND Sci_Name = ?2 \
-         GROUP BY hour ORDER BY hour",
-    )?;
-
     let mut result = Vec::new();
     for (sci, com, total) in species {
-        let raw_hours: Vec<HourlyCount> = hour_stmt
-            .query_map(params![date, &sci], |row| {
-                Ok(HourlyCount {
-                    hour: row.get(0)?,
-                    count: row.get(1)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut hour_rows = conn.query(
+            "SELECT CAST(SUBSTR(Time, 1, 2) AS INTEGER) AS hour, COUNT(*) AS cnt \
+             FROM detections \
+             WHERE Date = ?1 AND Sci_Name = ?2 \
+             GROUP BY hour ORDER BY hour",
+            params![date.to_string(), sci.clone()],
+        ).await?;
+
+        let mut raw_hours: Vec<HourlyCount> = Vec::new();
+        while let Some(row) = hour_rows.next().await? {
+            raw_hours.push(HourlyCount {
+                hour: row.get::<u32>(0)?,
+                count: row.get::<u32>(1)?,
+            });
+        }
 
         let hours = if tz == 0 {
             raw_hours
@@ -427,13 +439,13 @@ pub fn daily_species_hourly(
 }
 
 /// Top species for a specific date (for daily top species on home page).
-pub fn top_species_for_date(
+pub async fn top_species_for_date(
     db_path: &Path,
     date: &str,
     limit: u32,
-) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let mut stmt = conn.prepare(
+) -> Result<Vec<SpeciesSummary>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
@@ -441,122 +453,134 @@ pub fn top_species_for_date(
            AND (COALESCE(d.Excluded, 0) = 0 \
                 OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?2",
-    )?;
+        params![date.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![date, limit], |row| {
-        let count: u32 = row.get(3)?;
-        Ok(SpeciesSummary {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count: u32 = row.get::<u32>(3)?;
+        results.push(SpeciesSummary {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
             detection_count: count,
             display_count: round_count(count),
-            last_seen: row.get(4)?,
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
-        })
-    })?;
-
-    rows.collect()
+        });
+    }
+    Ok(results)
 }
 
 /// Top species (for species list on home page).
 ///
 /// Reads from the `species_stats` cache table for fast loading.
 /// Falls back to a live COUNT(*) query if the cache is empty.
-pub fn top_species(
+pub async fn top_species(
     db_path: &Path,
     limit: u32,
-) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
-    let conn = open(db_path)?;
+) -> Result<Vec<SpeciesSummary>, libsql::Error> {
+    let conn = open(db_path).await?;
 
     // Check if the cache table exists and has data.
-    let cache_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type='table' AND name='species_stats'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let cache_count: i64 = match conn.query(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type='table' AND name='species_stats'",
+        (),
+    ).await {
+        Ok(mut r) => match r.next().await {
+            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+            _ => 0,
+        },
+        Err(_) => 0,
+    };
 
     if cache_count > 0 {
-        let has_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM species_stats", [], |r| r.get(0))
-            .unwrap_or(0);
+        let has_rows: i64 = match conn.query(
+            "SELECT COUNT(*) FROM species_stats", (),
+        ).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
 
         if has_rows > 0 {
-            return top_species_from_cache(&conn, limit);
+            return top_species_from_cache(&conn, limit).await;
         }
     }
 
     // Fallback: live query (slow on large databases).
-    top_species_live(&conn, limit)
+    top_species_live(&conn, limit).await
 }
 
 /// Read species from the cached `species_stats` table.
-fn top_species_from_cache(
-    conn: &Connection,
+async fn top_species_from_cache(
+    conn: &libsql::Connection,
     limit: u32,
-) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+) -> Result<Vec<SpeciesSummary>, libsql::Error> {
+    let mut rows = conn.query(
         "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
          FROM species_stats \
          ORDER BY detection_count DESC LIMIT ?1",
-    )?;
+        params![limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![limit], |row| {
-        let count: u32 = row.get(3)?;
-        Ok(SpeciesSummary {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count: u32 = row.get::<u32>(3)?;
+        results.push(SpeciesSummary {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
             detection_count: count,
             display_count: round_count(count),
-            last_seen: row.get(4)?,
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
-        })
-    })?;
-
-    rows.collect()
+        });
+    }
+    Ok(results)
 }
 
 /// Live COUNT(*) query — used as fallback when the cache is empty.
-fn top_species_live(
-    conn: &Connection,
+async fn top_species_live(
+    conn: &libsql::Connection,
     limit: u32,
-) -> Result<Vec<SpeciesSummary>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+) -> Result<Vec<SpeciesSummary>, libsql::Error> {
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE (COALESCE(d.Excluded, 0) = 0 \
                 OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
          GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?1",
-    )?;
+        params![limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![limit], |row| {
-        let count: u32 = row.get(3)?;
-        Ok(SpeciesSummary {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count: u32 = row.get::<u32>(3)?;
+        results.push(SpeciesSummary {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
             detection_count: count,
             display_count: round_count(count),
-            last_seen: row.get(4)?,
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
-        })
-    })?;
-
-    rows.collect()
+        });
+    }
+    Ok(results)
 }
 
 /// Round a detection count for display:
@@ -594,9 +618,8 @@ fn format_with_commas(n: u32) -> String {
 ///
 /// This does a full recount from the `detections` table.  Designed to be
 /// called once at startup and then nightly.
-pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+pub async fn refresh_species_stats(db_path: &Path) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
 
     // Ensure the table exists (in case this runs before ensure_gaia_schema).
     conn.execute_batch(
@@ -609,7 +632,7 @@ pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
             updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (Sci_Name, Domain)
         );",
-    )?;
+    ).await?;
 
     conn.execute_batch(
         "DELETE FROM species_stats;
@@ -619,7 +642,7 @@ pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
          WHERE COALESCE(d.Excluded, 0) = 0
             OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)
          GROUP BY d.Sci_Name, d.Domain;",
-    )?;
+    ).await?;
 
     // ── Refresh top recordings per species ───────────────────────────
     conn.execute_batch(
@@ -635,10 +658,10 @@ pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
             rank           INTEGER      NOT NULL DEFAULT 0,
             PRIMARY KEY (Sci_Name, rank)
         );",
-    )?;
+    ).await?;
 
     // Keep the 10 highest-confidence recordings per species.
-    conn.execute_batch("DELETE FROM species_top_recordings;")?;
+    conn.execute_batch("DELETE FROM species_top_recordings;").await?;
     conn.execute_batch(
         "INSERT INTO species_top_recordings
             (Sci_Name, Com_Name, Date, Time, Confidence, File_Name, Source_Node, Model_Name, rank)
@@ -657,7 +680,7 @@ pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
                AND d.Confidence >= 0.5
          ) ranked
          WHERE rn <= 10;",
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -666,86 +689,92 @@ pub fn refresh_species_stats(db_path: &Path) -> Result<(), rusqlite::Error> {
 ///
 /// Returns up to `limit` recordings sorted by confidence descending.
 /// Falls back to a live query if the cache table is empty or missing.
-pub fn get_top_recordings(
+pub async fn get_top_recordings(
     db_path: &Path,
     scientific_name: &str,
     limit: u32,
-) -> Result<Vec<TopRecording>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+) -> Result<Vec<TopRecording>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
 
     // Try the cached table first.
-    let has_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='species_top_recordings'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
+    let has_table: bool = match conn.query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='species_top_recordings'",
+        (),
+    ).await {
+        Ok(mut r) => match r.next().await {
+            Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+            _ => false,
+        },
+        Err(_) => false,
+    };
 
     if has_table {
-        let has_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM species_top_recordings WHERE Sci_Name = ?1",
-                params![scientific_name],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        let has_rows: i64 = match conn.query(
+            "SELECT COUNT(*) FROM species_top_recordings WHERE Sci_Name = ?1",
+            params![scientific_name.to_string()],
+        ).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
 
         if has_rows > 0 {
-            let mut recs = get_top_recordings_cached(&conn, scientific_name, limit)?;
+            let mut recs = get_top_recordings_cached(&conn, scientific_name, limit).await?;
             for r in &mut recs { stamp_recording(r, tz); }
             return Ok(recs);
         }
     }
 
     // Fallback: live query.
-    let mut recs = get_top_recordings_live(&conn, scientific_name, limit)?;
+    let mut recs = get_top_recordings_live(&conn, scientific_name, limit).await?;
     for r in &mut recs { stamp_recording(r, tz); }
     Ok(recs)
 }
 
-fn get_top_recordings_cached(
-    conn: &Connection,
+async fn get_top_recordings_cached(
+    conn: &libsql::Connection,
     scientific_name: &str,
     limit: u32,
-) -> Result<Vec<TopRecording>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+) -> Result<Vec<TopRecording>, libsql::Error> {
+    let mut rows = conn.query(
         "SELECT Sci_Name, Com_Name, Date, Time, Confidence, File_Name, \
          Source_Node, Model_Name \
          FROM species_top_recordings \
          WHERE Sci_Name = ?1 \
          ORDER BY Confidence DESC, Date DESC, Time DESC \
          LIMIT ?2",
-    )?;
+        params![scientific_name.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![scientific_name, limit], |row| {
-        let date: String = row.get(2)?;
-        let time: String = row.get(3)?;
-        Ok(TopRecording {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let date: String = row.get::<String>(2)?;
+        let time: String = row.get::<String>(3)?;
+        results.push(TopRecording {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
             display_date: date.clone(),
             display_time: time.clone(),
             date,
             time,
-            confidence: row.get(4)?,
-            file_name: row.get(5)?,
-            source_node: row.get(6)?,
-            model_name: row.get(7)?,
-        })
-    })?;
-
-    rows.collect()
+            confidence: row.get::<f64>(4)?,
+            file_name: row.get::<String>(5)?,
+            source_node: row.get::<String>(6)?,
+            model_name: row.get::<String>(7)?,
+        });
+    }
+    Ok(results)
 }
 
-fn get_top_recordings_live(
-    conn: &Connection,
+async fn get_top_recordings_live(
+    conn: &libsql::Connection,
     scientific_name: &str,
     limit: u32,
-) -> Result<Vec<TopRecording>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+) -> Result<Vec<TopRecording>, libsql::Error> {
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Date, d.Time, d.Confidence, d.File_Name, \
          COALESCE(d.Source_Node, ''), COALESCE(d.Model_Name, '') \
          FROM detections d \
@@ -755,26 +784,27 @@ fn get_top_recordings_live(
            AND d.Confidence >= 0.5 \
          ORDER BY d.Confidence DESC, d.Date DESC, d.Time DESC \
          LIMIT ?2",
-    )?;
+        params![scientific_name.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![scientific_name, limit], |row| {
-        let date: String = row.get(2)?;
-        let time: String = row.get(3)?;
-        Ok(TopRecording {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let date: String = row.get::<String>(2)?;
+        let time: String = row.get::<String>(3)?;
+        results.push(TopRecording {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
             display_date: date.clone(),
             display_time: time.clone(),
             date,
             time,
-            confidence: row.get(4)?,
-            file_name: row.get(5)?,
-            source_node: row.get(6)?,
-            model_name: row.get(7)?,
-        })
-    })?;
-
-    rows.collect()
+            confidence: row.get::<f64>(4)?,
+            file_name: row.get::<String>(5)?,
+            source_node: row.get::<String>(6)?,
+            model_name: row.get::<String>(7)?,
+        });
+    }
+    Ok(results)
 }
 
 // ─── Model filter helpers ────────────────────────────────────────────────────
@@ -789,43 +819,44 @@ pub struct AvailableModel {
 /// Return distinct `(Model_Slug, Model_Name)` pairs recorded in the DB.
 ///
 /// Only non-empty slugs are returned, ordered by the most recent use.
-pub fn available_models(db_path: &Path) -> Result<Vec<AvailableModel>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let mut stmt = conn.prepare(
+pub async fn available_models(db_path: &Path) -> Result<Vec<AvailableModel>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let mut rows = conn.query(
         "SELECT COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), MAX(rowid) AS last \
          FROM detections \
          WHERE COALESCE(Model_Slug, '') != '' \
          GROUP BY Model_Slug \
          ORDER BY last DESC",
-    )?;
+        (),
+    ).await?;
 
-    let rows = stmt.query_map([], |row| {
-        Ok(AvailableModel {
-            slug: row.get(0)?,
-            name: row.get(1)?,
-        })
-    })?;
-
-    rows.collect()
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(AvailableModel {
+            slug: row.get::<String>(0)?,
+            name: row.get::<String>(1)?,
+        });
+    }
+    Ok(results)
 }
 
 /// Recent detections optionally filtered by model slug.
-pub fn recent_detections_filtered(
+pub async fn recent_detections_filtered(
     db_path: &Path,
     limit: u32,
     after_rowid: Option<i64>,
     model_slug: Option<&str>,
-) -> Result<Vec<WebDetection>, rusqlite::Error> {
+) -> Result<Vec<WebDetection>, libsql::Error> {
     // No filter → delegate to existing function.
     if model_slug.is_none() || model_slug == Some("") {
-        return recent_detections(db_path, limit, after_rowid);
+        return recent_detections(db_path, limit, after_rowid).await;
     }
     let slug = model_slug.unwrap();
 
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
 
-    let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match after_rowid {
+    let (sql, row_params): (String, Vec<libsql::Value>) = match after_rowid {
         Some(rid) => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
              COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
@@ -834,7 +865,11 @@ pub fn recent_detections_filtered(
              WHERE rowid > ?1 AND COALESCE(Model_Slug, '') = ?2 \
              ORDER BY rowid DESC LIMIT ?3"
                 .into(),
-            vec![Box::new(rid), Box::new(slug.to_string()), Box::new(limit)],
+            vec![
+                libsql::Value::from(rid),
+                libsql::Value::from(slug.to_string()),
+                libsql::Value::from(limit as i64),
+            ],
         ),
         None => (
             "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
@@ -844,48 +879,51 @@ pub fn recent_detections_filtered(
              WHERE COALESCE(Model_Slug, '') = ?1 \
              ORDER BY rowid DESC LIMIT ?2"
                 .into(),
-            vec![Box::new(slug.to_string()), Box::new(limit)],
+            vec![
+                libsql::Value::from(slug.to_string()),
+                libsql::Value::from(limit as i64),
+            ],
         ),
     };
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
-        Ok(WebDetection {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            scientific_name: row.get(2)?,
-            common_name: row.get(3)?,
-            confidence: row.get(4)?,
-            date: row.get(5)?,
-            time: row.get(6)?,
-            file_name: row.get(7)?,
-            source_node: row.get(8)?,
-            excluded: row.get::<_, i32>(9)? != 0,
+    let mut rows = conn.query(&sql, row_params).await?;
+    let mut dets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
             image_url: None,
-            model_slug: row.get(10)?,
-            model_name: row.get(11)?,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
             display_date: String::new(),
             display_time: String::new(),
-        })
-    })?;
+        });
+    }
 
-    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
     for d in &mut dets { stamp(d, tz); }
     Ok(dets)
 }
 
 /// Top species (all-time) optionally filtered by model slug.
-pub fn top_species_filtered(
+pub async fn top_species_filtered(
     db_path: &Path,
     limit: u32,
     model_slug: Option<&str>,
-) -> Result<Vec<crate::model::SpeciesSummary>, rusqlite::Error> {
+) -> Result<Vec<crate::model::SpeciesSummary>, libsql::Error> {
     if model_slug.is_none() || model_slug == Some("") {
-        return top_species(db_path, limit);
+        return top_species(db_path, limit).await;
     }
     let slug = model_slug.unwrap();
-    let conn = open(db_path)?;
-    let mut stmt = conn.prepare(
+    let conn = open(db_path).await?;
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
@@ -893,40 +931,41 @@ pub fn top_species_filtered(
                 OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
            AND COALESCE(d.Model_Slug, '') = ?1 \
          GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?2",
-    )?;
+        params![slug.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![slug, limit], |row| {
-        let count: u32 = row.get(3)?;
-        Ok(crate::model::SpeciesSummary {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count: u32 = row.get::<u32>(3)?;
+        results.push(crate::model::SpeciesSummary {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
             detection_count: count,
             display_count: round_count(count),
-            last_seen: row.get(4)?,
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
-        })
-    })?;
-
-    rows.collect()
+        });
+    }
+    Ok(results)
 }
 
 /// Top species for a specific date, optionally filtered by model slug.
-pub fn top_species_for_date_filtered(
+pub async fn top_species_for_date_filtered(
     db_path: &Path,
     date: &str,
     limit: u32,
     model_slug: Option<&str>,
-) -> Result<Vec<crate::model::SpeciesSummary>, rusqlite::Error> {
+) -> Result<Vec<crate::model::SpeciesSummary>, libsql::Error> {
     if model_slug.is_none() || model_slug == Some("") {
-        return top_species_for_date(db_path, date, limit);
+        return top_species_for_date(db_path, date, limit).await;
     }
     let slug = model_slug.unwrap();
-    let conn = open(db_path)?;
-    let mut stmt = conn.prepare(
+    let conn = open(db_path).await?;
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
@@ -935,73 +974,74 @@ pub fn top_species_for_date_filtered(
                 OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)) \
            AND COALESCE(d.Model_Slug, '') = ?2 \
          GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT ?3",
-    )?;
+        params![date.to_string(), slug.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![date, slug, limit], |row| {
-        let count: u32 = row.get(3)?;
-        Ok(crate::model::SpeciesSummary {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count: u32 = row.get::<u32>(3)?;
+        results.push(crate::model::SpeciesSummary {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
             detection_count: count,
             display_count: round_count(count),
-            last_seen: row.get(4)?,
+            last_seen: row.get::<String>(4).ok(),
             image_url: None,
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
-        })
-    })?;
-
-    rows.collect()
+        });
+    }
+    Ok(results)
 }
 
 /// Day detections optionally filtered by model slug.
-pub fn day_detections_filtered(
+pub async fn day_detections_filtered(
     db_path: &Path,
     date: &str,
     model_slug: Option<&str>,
-) -> Result<Vec<DayDetectionGroup>, rusqlite::Error> {
+) -> Result<Vec<DayDetectionGroup>, libsql::Error> {
     if model_slug.is_none() || model_slug == Some("") {
-        return day_detections(db_path, date);
+        return day_detections(db_path, date).await;
     }
     let slug = model_slug.unwrap();
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
-    let mut stmt = conn.prepare(
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
+    let mut rows = conn.query(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
          COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
          FROM detections \
          WHERE Date = ?1 AND COALESCE(Model_Slug, '') = ?2 \
          ORDER BY Sci_Name, Time DESC",
-    )?;
+        params![date.to_string(), slug.to_string()],
+    ).await?;
 
-    let rows: Vec<WebDetection> = stmt
-        .query_map(params![date, slug], |row| {
-            Ok(WebDetection {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-                scientific_name: row.get(2)?,
-                common_name: row.get(3)?,
-                confidence: row.get(4)?,
-                date: row.get(5)?,
-                time: row.get(6)?,
-                file_name: row.get(7)?,
-                source_node: row.get(8)?,
-                excluded: row.get::<_, i32>(9)? != 0,
-                image_url: None,
-                model_slug: row.get(10)?,
-                model_name: row.get(11)?,
-                display_date: String::new(),
-                display_time: String::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let rows: Vec<WebDetection> = rows.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
+    let mut all_dets: Vec<WebDetection> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        all_dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
+            image_url: None,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
+            display_date: String::new(),
+            display_time: String::new(),
+        });
+    }
+    let all_dets: Vec<WebDetection> = all_dets.into_iter().map(|mut d| { stamp(&mut d, tz); d }).collect();
 
     let mut groups: Vec<DayDetectionGroup> = Vec::new();
-    for det in rows {
+    for det in all_dets {
         if let Some(group) = groups
             .iter_mut()
             .find(|g| g.scientific_name == det.scientific_name && g.domain == det.domain)
@@ -1025,16 +1065,16 @@ pub fn day_detections_filtered(
 }
 
 /// Species info optionally filtered by model slug.
-pub fn species_detections_by_model(
+pub async fn species_detections_by_model(
     db_path: &Path,
     scientific_name: &str,
     limit: u32,
     model_slug: Option<&str>,
-) -> Result<Vec<WebDetection>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+) -> Result<Vec<WebDetection>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
 
-    let (sql, row_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+    let (sql, row_params): (String, Vec<libsql::Value>) =
         if let Some(slug) = model_slug.filter(|s| !s.is_empty()) {
             (
                 "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
@@ -1045,9 +1085,9 @@ pub fn species_detections_by_model(
                  ORDER BY Date DESC, Time DESC LIMIT ?3"
                     .into(),
                 vec![
-                    Box::new(scientific_name.to_string()),
-                    Box::new(slug.to_string()),
-                    Box::new(limit),
+                    libsql::Value::from(scientific_name.to_string()),
+                    libsql::Value::from(slug.to_string()),
+                    libsql::Value::from(limit as i64),
                 ],
             )
         } else {
@@ -1060,34 +1100,34 @@ pub fn species_detections_by_model(
                  ORDER BY Date DESC, Time DESC LIMIT ?2"
                     .into(),
                 vec![
-                    Box::new(scientific_name.to_string()),
-                    Box::new(limit),
+                    libsql::Value::from(scientific_name.to_string()),
+                    libsql::Value::from(limit as i64),
                 ],
             )
         };
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(row_params.iter()), |row| {
-        Ok(WebDetection {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            scientific_name: row.get(2)?,
-            common_name: row.get(3)?,
-            confidence: row.get(4)?,
-            date: row.get(5)?,
-            time: row.get(6)?,
-            file_name: row.get(7)?,
-            source_node: row.get(8)?,
-            excluded: row.get::<_, i32>(9)? != 0,
+    let mut rows = conn.query(&sql, row_params).await?;
+    let mut dets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
             image_url: None,
-            model_slug: row.get(10)?,
-            model_name: row.get(11)?,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
             display_date: String::new(),
             display_time: String::new(),
-        })
-    })?;
+        });
+    }
 
-    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
     for d in &mut dets { stamp(d, tz); }
     Ok(dets)
 }
@@ -1097,62 +1137,63 @@ pub fn species_detections_by_model(
 use std::collections::HashMap;
 
 /// Read all rows from the `settings` table as a key-value map.
-pub fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>, rusqlite::Error> {
-    let conn = open(db_path)?;
+pub async fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>, libsql::Error> {
+    let conn = open(db_path).await?;
     // The table may not exist in older databases.
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-    );
-    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    ).await;
+    let mut rows = conn.query("SELECT key, value FROM settings", ()).await?;
     let mut map = HashMap::new();
-    for r in rows {
-        let (k, v) = r?;
+    while let Some(row) = rows.next().await? {
+        let k: String = row.get::<String>(0)?;
+        let v: String = row.get::<String>(1)?;
         map.insert(k, v);
     }
     Ok(map)
 }
 
-/// Open a read-write connection with a busy timeout.
-fn open_rw(db_path: &Path) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+/// Open a read-write connection with WAL and a busy timeout.
+async fn open_rw(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
+    let db = libsql::Builder::new_local(
+        db_path.to_str().ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))?,
+    )
+    .build()
+    .await?;
+    let conn = db.connect()?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;").await?;
     Ok(conn)
 }
 
 /// Save multiple settings in one transaction.
-pub fn save_settings(db_path: &Path, entries: &[(&str, &str)]) -> Result<(), rusqlite::Error> {
-    let conn = open_rw(db_path)?;
+pub async fn save_settings(db_path: &Path, entries: &[(&str, &str)]) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-    );
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare(
+    ).await;
+    conn.execute_batch("BEGIN").await?;
+    for (k, v) in entries {
+        conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-        )?;
-        for (k, v) in entries {
-            stmt.execute(params![k, v])?;
-        }
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![k.to_string(), v.to_string()],
+        ).await?;
     }
-    tx.commit()?;
+    conn.execute_batch("COMMIT").await?;
     Ok(())
 }
 
 // ─── Urban noise ─────────────────────────────────────────────────────────────
 
 /// Aggregated urban-noise counts per category (today, last 7 days, all time).
-pub fn urban_noise_summary(
+pub async fn urban_noise_summary(
     db_path: &Path,
-) -> Result<Vec<UrbanNoiseSummary>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+) -> Result<Vec<UrbanNoiseSummary>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
     let today = today_for_tz(tz);
 
-    let mut stmt = conn.prepare(
+    let mut rows = conn.query(
         "SELECT Category,
                 COALESCE(SUM(Count), 0) AS total,
                 COALESCE(SUM(CASE WHEN Date = ?1 THEN Count ELSE 0 END), 0) AS today,
@@ -1160,27 +1201,28 @@ pub fn urban_noise_summary(
          FROM urban_noise
          GROUP BY Category
          ORDER BY total DESC",
-    )?;
+        params![today],
+    ).await?;
 
-    let rows = stmt.query_map(params![today], |row| {
-        Ok(UrbanNoiseSummary {
-            category: row.get(0)?,
-            total_count: row.get(1)?,
-            today_count: row.get(2)?,
-            week_count: row.get(3)?,
-        })
-    })?;
-
-    rows.collect()
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(UrbanNoiseSummary {
+            category: row.get::<String>(0)?,
+            total_count: row.get::<u32>(1)?,
+            today_count: row.get::<u32>(2)?,
+            week_count: row.get::<u32>(3)?,
+        });
+    }
+    Ok(results)
 }
 
 // ─── Excluded species ────────────────────────────────────────────────────────
 
 /// List species that have at least one excluded detection.
-pub fn excluded_species(db_path: &Path) -> Result<Vec<ExcludedSpecies>, rusqlite::Error> {
-    let conn = open(db_path)?;
+pub async fn excluded_species(db_path: &Path) -> Result<Vec<ExcludedSpecies>, libsql::Error> {
+    let conn = open(db_path).await?;
 
-    let mut stmt = conn.prepare(
+    let mut rows = conn.query(
         "SELECT d.Sci_Name, d.Com_Name, d.Domain, \
                 COUNT(*) AS cnt, \
                 MAX(d.Date || ' ' || d.Time) AS last, \
@@ -1191,95 +1233,97 @@ pub fn excluded_species(db_path: &Path) -> Result<Vec<ExcludedSpecies>, rusqlite
          WHERE COALESCE(d.Excluded, 0) = 1 \
          GROUP BY d.Sci_Name, d.Domain \
          ORDER BY overridden ASC, cnt DESC",
-    )?;
+        (),
+    ).await?;
 
-    let rows = stmt.query_map([], |row| {
-        Ok(ExcludedSpecies {
-            scientific_name: row.get(0)?,
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
-            detection_count: row.get(3)?,
-            last_seen: row.get(4)?,
-            max_confidence: row.get(5)?,
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(ExcludedSpecies {
+            scientific_name: row.get::<String>(0)?,
+            common_name: row.get::<String>(1)?,
+            domain: row.get::<String>(2)?,
+            detection_count: row.get::<u32>(3)?,
+            last_seen: row.get::<String>(4).ok(),
+            max_confidence: row.get::<f64>(5)?,
             image_url: None,
-            overridden: row.get::<_, i32>(6)? != 0,
-        })
-    })?;
-
-    rows.collect()
+            overridden: row.get::<i32>(6)? != 0,
+        });
+    }
+    Ok(results)
 }
 
 /// Return individual excluded detections for a given species, newest first.
 ///
 /// Used by the Excluded page so the user can listen to / inspect the
 /// recordings before confirming an override.
-pub fn excluded_detections_for_species(
+pub async fn excluded_detections_for_species(
     db_path: &Path,
     scientific_name: &str,
     limit: u32,
-) -> Result<Vec<WebDetection>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
-    let mut stmt = conn.prepare(
+) -> Result<Vec<WebDetection>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
+    let mut rows = conn.query(
         "SELECT rowid, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
          COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
          FROM detections \
          WHERE Sci_Name = ?1 AND COALESCE(Excluded, 0) = 1 \
          ORDER BY Date DESC, Time DESC LIMIT ?2",
-    )?;
+        params![scientific_name.to_string(), limit],
+    ).await?;
 
-    let rows = stmt.query_map(params![scientific_name, limit], |row| {
-        Ok(WebDetection {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            scientific_name: row.get(2)?,
-            common_name: row.get(3)?,
-            confidence: row.get(4)?,
-            date: row.get(5)?,
-            time: row.get(6)?,
-            file_name: row.get(7)?,
-            source_node: row.get(8)?,
-            excluded: row.get::<_, i32>(9)? != 0,
+    let mut dets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        dets.push(WebDetection {
+            id: row.get::<i64>(0)?,
+            domain: row.get::<String>(1)?,
+            scientific_name: row.get::<String>(2)?,
+            common_name: row.get::<String>(3)?,
+            confidence: row.get::<f64>(4)?,
+            date: row.get::<String>(5)?,
+            time: row.get::<String>(6)?,
+            file_name: row.get::<String>(7)?,
+            source_node: row.get::<String>(8)?,
+            excluded: row.get::<i32>(9)? != 0,
             image_url: None,
-            model_slug: row.get(10)?,
-            model_name: row.get(11)?,
+            model_slug: row.get::<String>(10)?,
+            model_name: row.get::<String>(11)?,
             display_date: String::new(),
             display_time: String::new(),
-        })
-    })?;
+        });
+    }
 
-    let mut dets: Vec<WebDetection> = rows.collect::<Result<Vec<_>, _>>()?;
     for d in &mut dets { stamp(d, tz); }
     Ok(dets)
 }
 
 /// Add an exclusion override (ornithologist confirms the species is real).
-pub fn add_exclusion_override(
+pub async fn add_exclusion_override(
     db_path: &Path,
     scientific_name: &str,
     notes: &str,
-) -> Result<(), rusqlite::Error> {
-    let conn = open_rw(db_path)?;
+) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
     conn.execute(
         "INSERT INTO exclusion_overrides (Sci_Name, overridden_at, notes) \
          VALUES (?1, datetime('now'), ?2) \
          ON CONFLICT(Sci_Name) DO UPDATE SET overridden_at = datetime('now'), notes = excluded.notes",
-        params![scientific_name, notes],
-    )?;
+        params![scientific_name.to_string(), notes.to_string()],
+    ).await?;
     Ok(())
 }
 
 /// Remove an exclusion override (undo confirmation).
-pub fn remove_exclusion_override(
+pub async fn remove_exclusion_override(
     db_path: &Path,
     scientific_name: &str,
-) -> Result<(), rusqlite::Error> {
-    let conn = open_rw(db_path)?;
+) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
     conn.execute(
         "DELETE FROM exclusion_overrides WHERE Sci_Name = ?1",
-        params![scientific_name],
-    )?;
+        params![scientific_name.to_string()],
+    ).await?;
     Ok(())
 }
 
@@ -1288,46 +1332,44 @@ pub fn remove_exclusion_override(
 use crate::model::SpeciesVerification;
 
 /// Get verification record for a species (if any).
-pub fn get_species_verification(
+pub async fn get_species_verification(
     db_path: &Path,
     scientific_name: &str,
-) -> Result<Option<SpeciesVerification>, rusqlite::Error> {
-    let conn = open(db_path)?;
+) -> Result<Option<SpeciesVerification>, libsql::Error> {
+    let conn = open(db_path).await?;
     // Table may not exist in older DBs.
-    let result = conn.query_row(
+    let mut rows = match conn.query(
         "SELECT method, COALESCE(inaturalist_obs, ''), verified_at \
          FROM species_verifications WHERE Sci_Name = ?1",
-        params![scientific_name],
-        |row| {
-            Ok(SpeciesVerification {
-                method: row.get(0)?,
-                inaturalist_obs: row.get(1)?,
-                verified_at: row.get(2)?,
-            })
-        },
-    );
-    match result {
-        Ok(v) => Ok(Some(v)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        params![scientific_name.to_string()],
+    ).await {
+        Ok(r) => r,
         Err(e) => {
             // Table doesn't exist yet – treat as no verification.
             if e.to_string().contains("no such table") {
-                Ok(None)
-            } else {
-                Err(e)
+                return Ok(None);
             }
+            return Err(e);
         }
+    };
+    match rows.next().await? {
+        Some(row) => Ok(Some(SpeciesVerification {
+            method: row.get::<String>(0)?,
+            inaturalist_obs: row.get::<String>(1)?,
+            verified_at: row.get::<String>(2)?,
+        })),
+        None => Ok(None),
     }
 }
 
 /// Save a verification record for a species.
-pub fn set_species_verification(
+pub async fn set_species_verification(
     db_path: &Path,
     scientific_name: &str,
     method: &str,
     inaturalist_obs: &str,
-) -> Result<(), rusqlite::Error> {
-    let conn = open_rw(db_path)?;
+) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS species_verifications (
             Sci_Name         VARCHAR(100) PRIMARY KEY,
@@ -1335,27 +1377,27 @@ pub fn set_species_verification(
             inaturalist_obs  TEXT NOT NULL DEFAULT '',
             verified_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );"
-    );
+    ).await;
     conn.execute(
         "INSERT INTO species_verifications (Sci_Name, method, inaturalist_obs, verified_at) \
          VALUES (?1, ?2, ?3, datetime('now')) \
          ON CONFLICT(Sci_Name) DO UPDATE SET method = excluded.method, \
          inaturalist_obs = excluded.inaturalist_obs, verified_at = datetime('now')",
-        params![scientific_name, method, inaturalist_obs],
-    )?;
+        params![scientific_name.to_string(), method.to_string(), inaturalist_obs.to_string()],
+    ).await?;
     Ok(())
 }
 
 /// Remove verification for a species.
-pub fn remove_species_verification(
+pub async fn remove_species_verification(
     db_path: &Path,
     scientific_name: &str,
-) -> Result<(), rusqlite::Error> {
-    let conn = open_rw(db_path)?;
+) -> Result<(), libsql::Error> {
+    let conn = open_rw(db_path).await?;
     let _ = conn.execute(
         "DELETE FROM species_verifications WHERE Sci_Name = ?1",
-        params![scientific_name],
-    );
+        params![scientific_name.to_string()],
+    ).await;
     Ok(())
 }
 
@@ -1371,12 +1413,12 @@ pub fn remove_species_verification(
 ///     (i.e. the clip contains only one species)
 ///
 /// When `today_only` is `true` only detections from today (TZ-aware) are returned.
-pub fn quiz_candidates(
+pub async fn quiz_candidates(
     db_path: &Path,
     today_only: bool,
-) -> Result<Vec<QuizItem>, rusqlite::Error> {
-    let conn = open(db_path)?;
-    let tz = read_tz_offset(&conn);
+) -> Result<Vec<QuizItem>, libsql::Error> {
+    let conn = open(db_path).await?;
+    let tz = read_tz_offset(&conn).await;
     let today_str = today_for_tz(tz);
 
     // Use separate date filters: the CTE has no table alias while the
@@ -1413,29 +1455,23 @@ pub fn quiz_candidates(
          ORDER BY RANDOM()"
     );
 
-    let mut stmt = conn.prepare(&sql)?;
-
     // When today_only we bind the TZ-aware date; otherwise no params.
-    let mapper = |row: &rusqlite::Row| {
-        let sci_name: String = row.get(0)?;
-        let com_name: String = row.get(1)?;
-        let date: String = row.get(2)?;
-        let file_name: String = row.get(3)?;
-        Ok((sci_name, com_name, date, file_name))
-    };
-
-    let collected: Vec<Result<(String, String, String, String), rusqlite::Error>> = if today_only {
-        stmt.query_map(params![today_str], mapper)?.collect()
+    let mut rows = if today_only {
+        conn.query(&sql, params![today_str.clone()]).await?
     } else {
-        stmt.query_map([], mapper)?.collect()
+        conn.query(&sql, ()).await?
     };
 
     // Pick one clip per species, up to 4 distinct species.
     let mut seen_species = std::collections::HashSet::new();
     let mut items = Vec::new();
 
-    for row in collected {
-        let (sci_name, com_name, date, file_name) = row?;
+    while let Some(row) = rows.next().await? {
+        let sci_name: String = row.get::<String>(0)?;
+        let com_name: String = row.get::<String>(1)?;
+        let date: String = row.get::<String>(2)?;
+        let file_name: String = row.get::<String>(3)?;
+
         if seen_species.contains(&sci_name) {
             continue;
         }

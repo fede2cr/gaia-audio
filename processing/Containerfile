@@ -194,7 +194,6 @@ RUN gaia-processing validate-model \
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 \
     ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*

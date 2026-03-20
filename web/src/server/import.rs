@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use libsql::params;
 
 /// Pre-import report – shows what the backup contains before committing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,8 +68,41 @@ pub struct ImportResult {
 // ─── Discovered BirdNET-Pi node (reuse the shared model type) ────────────
 pub use crate::model::BirdnetNode;
 
+/// Open a libsql local connection (helper for import functions).
+async fn open_local(path: &Path) -> Result<libsql::Connection, String> {
+    let db = libsql::Builder::new_local(
+        path.to_str().ok_or_else(|| "Non-UTF-8 database path".to_string())?,
+    )
+    .build()
+    .await
+    .map_err(|e| format!("Cannot open database {}: {e}", path.display()))?;
+    db.connect().map_err(|e| format!("Cannot connect to {}: {e}", path.display()))
+}
+
+/// Helper: query a single i64 scalar value from a connection.
+async fn query_scalar_i64(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: impl libsql::params::IntoParams,
+) -> Option<i64> {
+    let mut rows = conn.query(sql, params).await.ok()?;
+    let row = rows.next().await.ok()??;
+    row.get::<i64>(0).ok()
+}
+
+/// Helper: query a single String scalar value from a connection.
+async fn query_scalar_string(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: impl libsql::params::IntoParams,
+) -> Option<String> {
+    let mut rows = conn.query(sql, params).await.ok()?;
+    let row = rows.next().await.ok()??;
+    row.get::<String>(0).ok()
+}
+
 /// Analyse a BirdNET-Pi backup tar and produce a report *without* importing.
-pub fn analyse_backup(tar_path: &Path) -> Result<ImportReport, String> {
+pub async fn analyse_backup(tar_path: &Path) -> Result<ImportReport, String> {
     let meta = std::fs::metadata(tar_path)
         .map_err(|e| format!("Cannot stat {}: {e}", tar_path.display()))?;
 
@@ -126,60 +159,62 @@ pub fn analyse_backup(tar_path: &Path) -> Result<ImportReport, String> {
 
     // Analyse the embedded DB
     let db_path = tmp_dir.join("birds.db");
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Cannot open extracted birds.db: {e}"))?;
+    let conn = open_local(&db_path).await?;
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-    let total_detections: u64 = conn
-        .query_row("SELECT COUNT(*) FROM detections", [], |r| r.get(0))
-        .unwrap_or(0);
+    let total_detections: u64 = query_scalar_i64(&conn, "SELECT COUNT(*) FROM detections", ())
+        .await
+        .unwrap_or(0) as u64;
 
-    let today_detections: u64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM detections WHERE Date = ?1",
-            params![today],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let today_detections: u64 = query_scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM detections WHERE Date = ?1",
+        params![today.clone()],
+    )
+    .await
+    .unwrap_or(0) as u64;
 
-    let total_species: u32 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT Com_Name) FROM detections",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let total_species: u32 = query_scalar_i64(
+        &conn,
+        "SELECT COUNT(DISTINCT Com_Name) FROM detections",
+        (),
+    )
+    .await
+    .unwrap_or(0) as u32;
 
-    let today_species: u32 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT Com_Name) FROM detections WHERE Date = ?1",
-            params![today],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let today_species: u32 = query_scalar_i64(
+        &conn,
+        "SELECT COUNT(DISTINCT Com_Name) FROM detections WHERE Date = ?1",
+        params![today],
+    )
+    .await
+    .unwrap_or(0) as u32;
 
-    let date_min: Option<String> = conn
-        .query_row("SELECT MIN(Date) FROM detections", [], |r| r.get(0))
-        .ok();
+    let date_min: Option<String> =
+        query_scalar_string(&conn, "SELECT MIN(Date) FROM detections", ()).await;
 
-    let date_max: Option<String> = conn
-        .query_row("SELECT MAX(Date) FROM detections", [], |r| r.get(0))
-        .ok();
+    let date_max: Option<String> =
+        query_scalar_string(&conn, "SELECT MAX(Date) FROM detections", ()).await;
 
     // Top 10 species
-    let mut top_stmt = conn
-        .prepare(
-            "SELECT Com_Name, COUNT(*) AS cnt FROM detections \
-             GROUP BY Com_Name ORDER BY cnt DESC LIMIT 10",
-        )
-        .map_err(|e| format!("Query error: {e}"))?;
-
-    let top_species: Vec<(String, u64)> = top_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| format!("Query error: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let top_species: Vec<(String, u64)> = {
+        let mut rows = conn
+            .query(
+                "SELECT Com_Name, COUNT(*) AS cnt FROM detections \
+                 GROUP BY Com_Name ORDER BY cnt DESC LIMIT 10",
+                (),
+            )
+            .await
+            .map_err(|e| format!("Query error: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| format!("Row error: {e}"))? {
+            if let (Ok(name), Ok(cnt)) = (row.get::<String>(0), row.get::<i64>(1)) {
+                out.push((name, cnt as u64));
+            }
+        }
+        out
+    };
 
     // Read lat/lon from config if available
     let (latitude, longitude) = if conf_extracted {
@@ -262,7 +297,13 @@ pub fn import_backup(
     }
 
     // Ensure Gaia DB exists with schema
-    ensure_gaia_schema(gaia_db_path)?;
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Cannot create runtime: {e}"))?;
+        rt.block_on(ensure_gaia_schema(gaia_db_path))?;
+    }
 
     // Read existing file names to avoid duplicates (opus-aware)
     let existing_files = get_existing_filenames(gaia_db_path)?;
@@ -328,7 +369,13 @@ pub fn stream_import(
     tracing::info!("Starting streaming import from {url}");
 
     // Ensure Gaia DB and directories exist
-    ensure_gaia_schema(gaia_db_path)?;
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Cannot create runtime: {e}"))?;
+        rt.block_on(ensure_gaia_schema(gaia_db_path))?;
+    }
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| format!("Cannot create extracted dir: {e}"))?;
 
@@ -610,50 +657,55 @@ fn import_detections_from_db(
     existing: &HashSet<String>,
     result: &mut ImportResult,
 ) -> Result<(), String> {
-    let src_conn = Connection::open(source_db)
-        .map_err(|e| format!("Cannot open source DB: {e}"))?;
+    // Use a dedicated tokio runtime for this sync function since it
+    // may be called from within a tokio context via spawn_blocking.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Cannot create runtime: {e}"))?;
 
-    let dst_conn = Connection::open(gaia_db_path)
-        .map_err(|e| format!("Cannot open Gaia DB: {e}"))?;
-    dst_conn
-        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-        .map_err(|e| format!("Pragma error: {e}"))?;
+    rt.block_on(async {
+        let src_conn = open_local(source_db).await?;
+        let dst_conn = open_local(gaia_db_path).await?;
+        dst_conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .await
+            .map_err(|e| format!("Pragma error: {e}"))?;
 
-    let mut src_stmt = src_conn
-        .prepare(
-            "SELECT Date, Time, Sci_Name, Com_Name, Confidence, \
-             Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name \
-             FROM detections ORDER BY Date, Time",
-        )
-        .map_err(|e| format!("Source query error: {e}"))?;
+        // Read all source rows
+        let mut src_rows = src_conn
+            .query(
+                "SELECT Date, Time, Sci_Name, Com_Name, Confidence, \
+                 Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name \
+                 FROM detections ORDER BY Date, Time",
+                (),
+            )
+            .await
+            .map_err(|e| format!("Source query error: {e}"))?;
 
-    let mut batch_count = 0u64;
-    dst_conn
-        .execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| format!("Transaction error: {e}"))?;
+        let mut batch_count = 0u64;
+        dst_conn
+            .execute_batch("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| format!("Transaction error: {e}"))?;
 
-    let rows = src_stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,  // Date
-                row.get::<_, String>(1)?,  // Time
-                row.get::<_, String>(2)?,  // Sci_Name
-                row.get::<_, String>(3)?,  // Com_Name
-                row.get::<_, f64>(4)?,     // Confidence
-                row.get::<_, f64>(5)?,     // Lat
-                row.get::<_, f64>(6)?,     // Lon
-                row.get::<_, f64>(7)?,     // Cutoff
-                row.get::<_, i32>(8)?,     // Week
-                row.get::<_, f64>(9)?,     // Sens
-                row.get::<_, f64>(10)?,    // Overlap
-                row.get::<_, String>(11)?, // File_Name
-            ))
-        })
-        .map_err(|e| format!("Query error: {e}"))?;
-
-    for row_result in rows {
-        let (date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname) =
-            match row_result {
+        while let Some(row) = src_rows.next().await.map_err(|e| format!("Row error: {e}"))? {
+            let (date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname) = match (|| -> Result<_, libsql::Error> {
+                Ok((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<f64>(4)?,
+                    row.get::<f64>(5)?,
+                    row.get::<f64>(6)?,
+                    row.get::<f64>(7)?,
+                    row.get::<i64>(8)?,
+                    row.get::<f64>(9)?,
+                    row.get::<f64>(10)?,
+                    row.get::<String>(11)?,
+                ))
+            })() {
                 Ok(r) => r,
                 Err(e) => {
                     result.errors.push(format!("Row read error: {e}"));
@@ -661,41 +713,44 @@ fn import_detections_from_db(
                 }
             };
 
-        // Skip if this file was already imported (even if now .opus)
-        if existing.contains(&fname) {
-            result.skipped_existing += 1;
-            continue;
+            // Skip if this file was already imported (even if now .opus)
+            if existing.contains(&fname) {
+                result.skipped_existing += 1;
+                continue;
+            }
+
+            if let Err(e) = dst_conn.execute(
+                "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, \
+                 Confidence, Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name) \
+                 VALUES (?1, ?2, 'birds', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname.clone()],
+            ).await {
+                result.errors.push(format!("Insert error for {fname}: {e}"));
+                continue;
+            }
+
+            result.detections_imported += 1;
+            batch_count += 1;
+
+            if batch_count % 5000 == 0 {
+                dst_conn
+                    .execute_batch("COMMIT; BEGIN TRANSACTION")
+                    .await
+                    .map_err(|e| format!("Commit error: {e}"))?;
+                tracing::info!(
+                    "Imported {} detections so far…",
+                    result.detections_imported
+                );
+            }
         }
 
-        if let Err(e) = dst_conn.execute(
-            "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, \
-             Confidence, Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name) \
-             VALUES (?1, ?2, 'birds', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname],
-        ) {
-            result.errors.push(format!("Insert error for {fname}: {e}"));
-            continue;
-        }
+        dst_conn
+            .execute_batch("COMMIT")
+            .await
+            .map_err(|e| format!("Final commit error: {e}"))?;
 
-        result.detections_imported += 1;
-        batch_count += 1;
-
-        if batch_count % 5000 == 0 {
-            dst_conn
-                .execute_batch("COMMIT; BEGIN TRANSACTION")
-                .map_err(|e| format!("Commit error: {e}"))?;
-            tracing::info!(
-                "Imported {} detections so far…",
-                result.detections_imported
-            );
-        }
-    }
-
-    dst_conn
-        .execute_batch("COMMIT")
-        .map_err(|e| format!("Final commit error: {e}"))?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Extract audio and spectrogram files from a tar on disk into `extracted_dir`,
@@ -810,17 +865,17 @@ fn file_already_imported(dest: &Path) -> bool {
 }
 
 /// Ensure the Gaia detections table exists.
-pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
+pub async fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create DB dir: {e}"))?;
     }
 
-    let conn =
-        Connection::open(db_path).map_err(|e| format!("Cannot open Gaia DB: {e}"))?;
+    let conn = open_local(db_path).await?;
 
     // Enable WAL once via a read-write connection so that later read-only
     // connections inherit it without needing write access.
     conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .await
         .map_err(|e| format!("WAL pragma error: {e}"))?;
 
     conn.execute_batch(
@@ -873,23 +928,24 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             verified_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )
+    .await
     .map_err(|e| format!("Schema error: {e}"))?;
 
     // Migration: add Source_Node to existing databases that lack it.
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Source_Node VARCHAR(200) NOT NULL DEFAULT '';",
-    );
+    ).await;
     // Migration: add Excluded column to existing databases.
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Excluded INTEGER NOT NULL DEFAULT 0;",
-    );
+    ).await;
     // Migration: add model tracking columns.
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Model_Slug VARCHAR(100) NOT NULL DEFAULT '';",
-    );
+    ).await;
     let _ = conn.execute_batch(
         "ALTER TABLE detections ADD COLUMN Model_Name VARCHAR(200) NOT NULL DEFAULT '';",
-    );
+    ).await;
 
     // ── Species stats cache table ────────────────────────────────────
     conn.execute_batch(
@@ -903,11 +959,12 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             PRIMARY KEY (Sci_Name, Domain)
         );",
     )
+    .await
     .map_err(|e| format!("species_stats table error: {e}"))?;
 
     // Populate the cache if it's empty (first run or after table creation).
-    let stats_empty: bool = conn
-        .query_row("SELECT COUNT(*) FROM species_stats", [], |r| r.get::<_, i64>(0))
+    let stats_empty: bool = query_scalar_i64(&conn, "SELECT COUNT(*) FROM species_stats", ())
+        .await
         .unwrap_or(0)
         == 0;
     if stats_empty {
@@ -918,7 +975,7 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
              WHERE COALESCE(d.Excluded, 0) = 0
                 OR d.Sci_Name IN (SELECT Sci_Name FROM exclusion_overrides)
              GROUP BY d.Sci_Name, d.Domain;",
-        );
+        ).await;
     }
 
     // ── Top recordings per species ───────────────────────────────────
@@ -936,6 +993,7 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
             PRIMARY KEY (Sci_Name, rank)
         );",
     )
+    .await
     .map_err(|e| format!("species_top_recordings table error: {e}"))?;
 
     Ok(())
@@ -947,33 +1005,40 @@ pub fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
 /// `.mp3`/`.wav` to `.opus`.  We expand the set with the pre-compression
 /// variants so that re-importing a BirdNET-Pi backup still deduplicates.
 fn get_existing_filenames(db_path: &Path) -> Result<HashSet<String>, String> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| format!("Cannot open Gaia DB: {e}"))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Cannot create runtime: {e}"))?;
 
-    let mut stmt = conn
-        .prepare("SELECT File_Name FROM detections")
-        .map_err(|e| format!("Query error: {e}"))?;
+    rt.block_on(async {
+        let conn = open_local(db_path).await?;
+        let mut rows = conn
+            .query("SELECT File_Name FROM detections", ())
+            .await
+            .map_err(|e| format!("Query error: {e}"))?;
 
-    let mut names: HashSet<String> = stmt
-        .query_map([], |row| row.get(0))
-        .map_err(|e| format!("Query error: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
+        let mut names: HashSet<String> = HashSet::new();
+        while let Some(row) = rows.next().await.map_err(|e| format!("Row error: {e}"))? {
+            if let Ok(name) = row.get::<String>(0) {
+                names.insert(name);
+            }
+        }
 
-    // For every .opus filename, also add .mp3 and .wav so the source
-    // BirdNET-Pi filenames (which are always .mp3) still match.
-    let opus_variants: Vec<String> = names
-        .iter()
-        .filter(|n| n.ends_with(".opus"))
-        .flat_map(|n| {
-            let stem = &n[..n.len() - 5]; // strip ".opus"
-            [format!("{stem}.mp3"), format!("{stem}.wav")]
-        })
-        .collect();
+        // For every .opus filename, also add .mp3 and .wav so the source
+        // BirdNET-Pi filenames (which are always .mp3) still match.
+        let opus_variants: Vec<String> = names
+            .iter()
+            .filter(|n| n.ends_with(".opus"))
+            .flat_map(|n| {
+                let stem = &n[..n.len() - 5]; // strip ".opus"
+                [format!("{stem}.mp3"), format!("{stem}.wav")]
+            })
+            .collect();
 
-    names.extend(opus_variants);
+        names.extend(opus_variants);
 
-    Ok(names)
+        Ok(names)
+    })
 }
 
 /// Parse LATITUDE and LONGITUDE from a birdnet.conf file.
@@ -1065,14 +1130,20 @@ mod tests {
         let db_path = dir.join("test.db");
 
         // Create a DB with an .opus filename (post-compression)
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE detections (File_Name TEXT NOT NULL);
-             INSERT INTO detections VALUES ('birds-Robin-42.opus');
-             INSERT INTO detections VALUES ('birds-Wren-10.mp3');",
-        )
-        .unwrap();
-        drop(conn);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn = open_local(&db_path).await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE detections (File_Name TEXT NOT NULL);
+                 INSERT INTO detections VALUES ('birds-Robin-42.opus');
+                 INSERT INTO detections VALUES ('birds-Wren-10.mp3');",
+            )
+            .await
+            .unwrap();
+        });
 
         let names = get_existing_filenames(&db_path).unwrap();
 

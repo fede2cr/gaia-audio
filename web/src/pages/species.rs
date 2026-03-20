@@ -24,6 +24,7 @@ pub async fn get_species_info(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let mut info = db::species_info(&state.db_path, &scientific_name)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     if let Some(ref mut sp) = info {
@@ -35,6 +36,7 @@ pub async fn get_species_info(
         }
         // Load verification state.
         sp.verification = db::get_species_verification(&state.db_path, &scientific_name)
+            .await
             .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     }
     Ok(info)
@@ -53,12 +55,14 @@ pub async fn get_species_calendar(
     let mut all_days = Vec::new();
     for m in 1..=12 {
         let mut month_days = db::calendar_data(&state.db_path, year, m)
+            .await
             .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
         all_days.append(&mut month_days);
     }
 
     // Dates this species was active
     let active = db::species_active_dates(&state.db_path, &scientific_name, year)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     Ok((all_days, active))
@@ -75,6 +79,7 @@ pub async fn set_species_verification(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::set_species_verification(&state.db_path, &scientific_name, &method, &inaturalist_obs)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(())
 }
@@ -88,6 +93,7 @@ pub async fn remove_species_verification(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::remove_species_verification(&state.db_path, &scientific_name)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(())
 }
@@ -101,6 +107,7 @@ pub async fn get_species_hourly(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::species_hourly_histogram(&state.db_path, &scientific_name)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
@@ -113,6 +120,7 @@ pub async fn get_species_top_recordings(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::get_top_recordings(&state.db_path, &scientific_name, 10)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
@@ -128,6 +136,7 @@ pub async fn get_species_detections(
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut dets = db::species_detections_by_model(&state.db_path, &scientific_name, limit, slug_opt)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     for det in dets.iter_mut() {
         if let Some(photo) = inaturalist::lookup(&state.photo_cache, &det.scientific_name).await {
@@ -146,31 +155,35 @@ pub async fn get_species_models(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     // Re-use the general available_models query and filter to this species.
-    let conn = rusqlite::Connection::open_with_flags(
-        &state.db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    let db = libsql::Builder::new_local(
+        state.db_path.to_str().ok_or_else(|| ServerFnError::new("Non-UTF-8 DB path"))?,
     )
+    .build()
+    .await
     .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    conn.execute_batch("PRAGMA busy_timeout=3000;")
+    let conn = db.connect()
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    let mut stmt = conn
-        .prepare(
+    conn.execute_batch("PRAGMA busy_timeout=5000;")
+        .await
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    let mut rows = conn
+        .query(
             "SELECT COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), COUNT(*) AS cnt \
              FROM detections \
              WHERE Sci_Name = ?1 AND COALESCE(Model_Slug, '') != '' \
              GROUP BY Model_Slug ORDER BY cnt DESC",
+            libsql::params![scientific_name],
         )
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    let rows = stmt
-        .query_map(rusqlite::params![scientific_name], |row| {
-            Ok(ModelInfo {
-                slug: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| ServerFnError::new(format!("DB error: {e}")))? {
+        out.push(ModelInfo {
+            slug: row.get::<String>(0).map_err(|e| ServerFnError::new(format!("DB error: {e}")))?,
+            name: row.get::<String>(1).map_err(|e| ServerFnError::new(format!("DB error: {e}")))?,
+        });
+    }
+    Ok(out)
 }
 
 // ─── Page component ──────────────────────────────────────────────────────────

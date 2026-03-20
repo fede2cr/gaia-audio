@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use libsql::params;
 use tracing::{debug, error, info, warn};
 
 /// Opus encoding bitrate.  96 kbps is transparent quality for bird /
@@ -52,10 +52,8 @@ pub fn compress_sweep(
         by_date.display()
     );
 
-    let conn = Connection::open(db_path)
+    let conn = crate::db::open_conn_pub(db_path)
         .context("Cannot open database for compression")?;
-    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
-        .ok();
 
     let mut converted = 0u64;
 
@@ -224,7 +222,7 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Convert a single `.wav` or `.mp3` file to `.opus`, rename its
 /// spectrogram, and update the DB `File_Name`.
-fn convert_one(conn: &Connection, src_path: &Path) -> Result<()> {
+fn convert_one(conn: &libsql::Connection, src_path: &Path) -> Result<()> {
     let src_name = src_path
         .file_name()
         .context("No filename")?
@@ -302,11 +300,11 @@ fn convert_one(conn: &Connection, src_path: &Path) -> Result<()> {
 /// This is best-effort: imported BirdNET-Pi clips may have the same
 /// basename stored in the DB, while Gaia clips use a different naming
 /// convention.  We update all matching rows.
-fn update_db_filename(conn: &Connection, old_name: &str, new_name: &str) {
-    match conn.execute(
+fn update_db_filename(conn: &libsql::Connection, old_name: &str, new_name: &str) {
+    match crate::db::block_on(conn.execute(
         "UPDATE detections SET File_Name = ?1 WHERE File_Name = ?2",
-        params![new_name, old_name],
-    ) {
+        params![new_name.to_string(), old_name.to_string()],
+    )) {
         Ok(n) if n > 0 => debug!("Updated {n} DB row(s): {old_name} → {new_name}"),
         Ok(_) => {
             // No matching rows — file may have been extracted without a
@@ -382,33 +380,33 @@ mod tests {
         let dir = std::env::temp_dir().join("gaia_compress_test_db");
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
+        let conn = crate::db::open_conn_pub(&db).unwrap();
+        crate::db::block_on(conn.execute_batch(
             "CREATE TABLE detections (File_Name TEXT NOT NULL);
              INSERT INTO detections (File_Name) VALUES ('clip.wav');
              INSERT INTO detections (File_Name) VALUES ('clip.wav');
              INSERT INTO detections (File_Name) VALUES ('other.mp3');",
-        )
+        ))
         .unwrap();
 
         update_db_filename(&conn, "clip.wav", "clip.opus");
-        let count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM detections WHERE File_Name = 'clip.opus'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let count: u32 = crate::db::block_on(async {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM detections WHERE File_Name = 'clip.opus'", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<u32>(0).unwrap()
+        });
         assert_eq!(count, 2);
 
         // mp3 row untouched
-        let mp3: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM detections WHERE File_Name = 'other.mp3'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let mp3: u32 = crate::db::block_on(async {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM detections WHERE File_Name = 'other.mp3'", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get::<u32>(0).unwrap()
+        });
         assert_eq!(mp3, 1);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -27,8 +27,8 @@ pub async fn discover_nodes() -> Result<Vec<BirdnetNode>, ServerFnError> {
 pub async fn import_from_node(
     address: String,
     port: u16,
-    username: String,
-    password: String,
+    username: Option<String>,
+    password: Option<String>,
 ) -> Result<ImportResult, ServerFnError> {
     use crate::server::import;
 
@@ -37,9 +37,11 @@ pub async fn import_from_node(
 
     let db_path = state.db_path.clone();
     let extracted_dir = state.extracted_dir.clone();
+    let user = username.unwrap_or_else(|| "birdnet".to_string());
+    let pass = password.unwrap_or_default();
 
     let result = tokio::task::spawn_blocking(move || {
-        import::stream_import(&address, port, &db_path, &extracted_dir, &username, &password)
+        import::stream_import(&address, port, &db_path, &extracted_dir, &user, &pass)
     })
     .await
     .map_err(|e| ServerFnError::new(format!("Task error: {e}")))?
@@ -92,7 +94,7 @@ pub async fn analyse_backup(tar_path: String) -> Result<ImportReport, ServerFnEr
     use std::path::Path;
 
     let path = Path::new(&tar_path);
-    let report = import::analyse_backup(path).map_err(|e| ServerFnError::new(e))?;
+    let report = import::analyse_backup(path).await.map_err(|e| ServerFnError::new(e))?;
 
     Ok(ImportReport {
         tar_path: report.tar_path,
@@ -190,7 +192,7 @@ pub fn ImportPage() -> impl IntoView {
         let user = auth_user.get();
         let pass = auth_pass.get();
         leptos::task::spawn_local(async move {
-            match import_from_node(addr, port, user, pass).await {
+            match import_from_node(addr, port, Some(user), Some(pass)).await {
                 Ok(r) => set_import_result.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Import failed: {e}"))),
             }

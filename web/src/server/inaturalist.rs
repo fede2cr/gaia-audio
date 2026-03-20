@@ -55,8 +55,11 @@ pub async fn lookup(
     // Fetch from iNaturalist
     let result = fetch_from_inaturalist(scientific_name).await;
 
-    // Store in cache
-    {
+    // Only cache successful results.  Transient failures (API rate-
+    // limiting, network blips) return None — leaving them uncached
+    // allows the next request to retry instead of permanently showing
+    // placeholder.svg.
+    if result.is_some() {
         let mut guard = cache.lock().unwrap();
         guard.insert(scientific_name.to_string(), CacheEntry {
             version: CACHE_VERSION,

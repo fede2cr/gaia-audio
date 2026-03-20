@@ -22,6 +22,7 @@ pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnErro
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let mut species = db::excluded_species(&state.db_path)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images
@@ -41,6 +42,7 @@ pub async fn override_exclusion(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     crate::server::db::add_exclusion_override(&state.db_path, &scientific_name, &notes)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(())
 }
@@ -50,6 +52,7 @@ pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnErro
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     crate::server::db::remove_exclusion_override(&state.db_path, &scientific_name)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(())
 }
@@ -62,6 +65,7 @@ pub async fn get_excluded_detections(
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let mut detections = db::excluded_detections_for_species(&state.db_path, &scientific_name, 20)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images

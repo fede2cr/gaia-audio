@@ -27,6 +27,7 @@ pub async fn get_recent_detections(
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut detections = db::recent_detections_filtered(&state.db_path, limit, after_rowid, slug_opt)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist species photos
@@ -50,9 +51,11 @@ pub async fn get_top_species(
     // Show today's top species instead of all-time.
     // Use the user's TZ offset so "today" matches their local midnight.
     let today = db::today_for_tz_pub(&state.db_path)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut species = db::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images

@@ -16,6 +16,7 @@ pub async fn get_urban_noise() -> Result<Vec<UrbanNoiseSummary>, ServerFnError> 
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     db::urban_noise_summary(&state.db_path)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 

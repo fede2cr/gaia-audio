@@ -153,6 +153,79 @@ but demonstrates the system's ability to load arbitrary classifiers.
 
 ---
 
+### FrogNET v1.0.2 (Chirpity Custom Classifier)
+
+| Field | Value |
+|-------|-------|
+| **Species** | European amphibians (frogs/toads) + confusable bird species appended to BirdNET V2.4's ~6,500 classes |
+| **Format** | TensorFlow.js (TFJS) — Chirpity custom classifier format |
+| **Sample rate** | 48 kHz (inherits BirdNET V2.4 pipeline) |
+| **Chunk duration** | 3.0 s (inherits BirdNET V2.4 pipeline) |
+| **Source** | [Chirpity download](https://chirpity.net/downloads/FrogNET%20v1.0.2.zip) — also see [chirpity.net](https://chirpity.net) |
+| **Author** | Matthew Kirkland ([Mattk70/Chirpity-Electron](https://github.com/Mattk70/Chirpity-Electron)) |
+| **License** | Unclear — distributed via chirpity.net; BirdNET's base model is CC BY-NC-SA 4.0 |
+| **Status** | **Not compatible** — requires TFJS→ONNX conversion and label extraction |
+
+FrogNET v1.0.2 is a custom classifier built on top of BirdNET V2.4 using
+Chirpity's built-in training feature.  It extends BirdNET to include a number
+of European amphibian species (primarily frogs and toads sourced from
+Xeno-Canto recordings from France/Europe) and adds bird species classes that
+are commonly confused with amphibians.  The training data was assembled by
+analysing Xeno-Canto frog recordings through BirdNET, manually reviewing the
+misidentified segments, and using those verified clips (~6,100 examples) as
+supervised training samples.
+
+The model is a **fine-tuned BirdNET V2.4** — it uses BirdNET's 48 kHz
+two-channel mel spectrogram (256×384 input) as a feature extractor and appends
+new output classes for the amphibian species.  The appended labels use a
+trailing `-` to distinguish them from existing BirdNET labels (e.g.
+`"Natterjack Toad-"` vs a hypothetical BirdNET bird entry).  A dedicated
+`Background_Background` class is included to reduce false positives.
+
+**Why it's not directly usable in gaia-audio:**
+
+1. **Format mismatch:** FrogNET is distributed as a TFJS model (the format
+   Chirpity uses internally via TensorFlow.js in Electron).  gaia-audio
+   requires ONNX.  A TFJS→SavedModel→ONNX conversion pipeline would be
+   needed, and the model's architecture (BirdNET V2.4 backbone + appended
+   classification head) may complicate straightforward conversion.
+
+2. **Labels not standalone:** The label list is embedded in Chirpity's model
+   import format (ZIP with model JSON + labels).  The labels would need to
+   be extracted and reformatted as a `labels.csv` one-per-line file.
+
+3. **Spectrogram preprocessing:** Like BirdNET V2.4, FrogNET expects
+   BirdNET's specific two-channel mel spectrogram (low-freq + high-freq
+   channels, 48 kHz, 256×384).  This matches our existing BirdNET V2.4
+   pipeline (`onnx_is_classifier = true`), so if the ONNX conversion
+   preserves the extracted classifier architecture, it could potentially
+   reuse the same mel parameters.
+
+4. **European focus:** The amphibian species are primarily European, limiting
+   utility outside that region.
+
+**Related projects:**
+
+- [lawrieb/FrogNET-Analyzer](https://github.com/lawrieb/FrogNET-Analyzer) —
+  fork of BirdNET-Analyzer adapted for scientific frog audio processing
+  (Python, MIT license).  143 commits behind upstream.
+- [dan-schlangen/FrogNET-Pi](https://github.com/dan-schlangen/FrogNET-Pi) —
+  fork of BirdNET-Pi for real-time frog classification on Raspberry Pi
+  (non-commercial license).
+
+**Integration path (if pursued):**
+
+1. Download and extract the ZIP from chirpity.net
+2. Convert TFJS model → TF SavedModel → ONNX (using `tensorflowjs_converter`
+   and `tf2onnx`)
+3. Extract the label list from the model metadata
+4. Write a `manifest.toml` with `sample_rate = 48000`,
+   `chunk_duration = 3.0`, `apply_softmax = false`, `onnx_is_classifier = true`
+5. Validate that the converted ONNX model produces correct output shapes
+   with our existing BirdNET mel spectrogram pipeline
+
+---
+
 ---
 
 ## Requires Training

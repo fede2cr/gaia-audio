@@ -59,6 +59,7 @@ pub async fn get_all_species(
 
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut species = db::top_species_filtered(&state.db_path, limit, slug_opt)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with iNaturalist images, conservation status, and sex photos
