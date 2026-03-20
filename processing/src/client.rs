@@ -77,7 +77,7 @@ pub fn poll_and_dispatch(
         }
     }
     // Prune processing instances that haven't heartbeated in a while.
-    let pruned = crate::db::prune_stale_instances(&config.db_path, 10);
+    let pruned = crate::kv::prune_stale_instances(10);
     if pruned > 0 {
         info!("Pruned {pruned} stale processing instance(s) from previous runs");
     }
@@ -89,7 +89,7 @@ pub fn poll_and_dispatch(
         }
 
         // ── refresh settings from DB ─────────────────────────────
-        crate::db::apply_settings_overrides(config);
+        crate::kv::apply_settings_overrides(config);
 
         // ── heartbeat so other instances know we're alive ────────
         let instance_id = if config.processing_instance.is_empty() {
@@ -97,7 +97,7 @@ pub fn poll_and_dispatch(
         } else {
             &config.processing_instance
         };
-        crate::db::update_heartbeat(&config.db_path, instance_id);
+        crate::kv::update_heartbeat(instance_id);
 
         // ── periodic mDNS re-discovery ───────────────────────────────
         if last_discovery.elapsed() >= REDISCOVERY_INTERVAL {
@@ -153,7 +153,7 @@ pub fn poll_and_dispatch(
                 } else {
                     &config.processing_instance
                 };
-                if crate::db::is_file_processed(&config.db_path, &rec.filename, instance_id) {
+                if crate::kv::is_file_processed(&rec.filename, instance_id) {
                     debug!(
                         "[{}] Skipping {} — already processed by this instance",
                         base_url, rec.filename
@@ -203,8 +203,8 @@ pub fn poll_and_dispatch(
         // Prevent unbounded growth of the dispatched set
         if dispatched.len() > 10_000 {
             dispatched.clear();
-            crate::db::cleanup_processing_log(&config.db_path);
-            crate::db::prune_stale_instances(&config.db_path, 10);
+            crate::kv::cleanup_processing_log();
+            crate::kv::prune_stale_instances(10);
         }
 
         // Only skip the sleep when we actually dispatched new work

@@ -109,10 +109,10 @@ fn run_analysis(
     let mut whitelist =
         model::load_species_list(Path::new(&base).join("whitelist_species_list.txt").as_path());
 
-    // Merge in DB-based exclusion overrides (species confirmed via the
+    // Merge in Redis-based exclusion overrides (species confirmed via the
     // web UI by an ornithologist).  These bypass the occurrence threshold
     // just like the file-based whitelist.
-    let db_overrides = crate::db::load_exclusion_overrides(&config.db_path);
+    let db_overrides = crate::kv::load_exclusion_overrides();
     for sp in db_overrides {
         if !whitelist.contains(&sp) {
             whitelist.push(sp);

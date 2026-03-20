@@ -35,9 +35,9 @@ pub async fn get_species_info(
             sp.female_image_url = photo.female_image_url;
         }
         // Load verification state.
-        sp.verification = crate::server::db::get_species_verification(&state.db_path, &scientific_name)
+        sp.verification = crate::server::kv::get_species_verification(&scientific_name)
             .await
-            .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+            .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     }
     Ok(info)
 }
@@ -75,12 +75,10 @@ pub async fn set_species_verification(
     method: String,
     inaturalist_obs: String,
 ) -> Result<(), ServerFnError> {
-    use crate::server::db;
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::set_species_verification(&state.db_path, &scientific_name, &method, &inaturalist_obs)
+    use crate::server::kv;
+    kv::set_species_verification(&scientific_name, &method, &inaturalist_obs)
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     Ok(())
 }
 
@@ -89,12 +87,10 @@ pub async fn set_species_verification(
 pub async fn remove_species_verification(
     scientific_name: String,
 ) -> Result<(), ServerFnError> {
-    use crate::server::db;
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::remove_species_verification(&state.db_path, &scientific_name)
+    use crate::server::kv;
+    kv::remove_species_verification(&scientific_name)
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     Ok(())
 }
 

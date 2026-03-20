@@ -1,12 +1,12 @@
 //! Gaia Processing Server – loads models, polls the capture server,
-//! runs TFLite inference, writes detections to SQLite.
+//! runs inference, writes detections to Parquet, coordinates via Redis.
 
 mod accel;
 mod analysis;
 mod client;
 mod compress;
-mod db;
 mod download;
+mod kv;
 mod live_status;
 mod manifest;
 mod mel;
@@ -124,8 +124,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── initialize database ──────────────────────────────────────────
-    db::initialize(&config.db_path)?;
+    // ── initialize Valkey / Redis coordination layer ──────────────────
+    kv::initialize()?;
 
     // ── initialize Parquet detection store ────────────────────────────
     {
@@ -146,7 +146,7 @@ fn main() -> Result<()> {
         } else {
             &config.processing_instance
         };
-        db::register_instance(&config.db_path, instance_id)?;
+        kv::register_instance(instance_id)?;
         info!("Registered processing instance: {instance_id:?}");
     }
 
@@ -236,19 +236,10 @@ fn main() -> Result<()> {
 
     // ── backfill per-species taxonomic class ─────────────────────────
     // Models whose labels CSV contains a `class` column (e.g. BirdNET+
-    // V3.0) now set Domain per-species.  Migrate existing detections
-    // that still carry the old model-wide domain.
-    for m in &models {
-        let class_map = m.csv_classes();
-        if !class_map.is_empty() {
-            db::migrate_domain_classes(
-                &config.db_path,
-                &m.manifest.slug(),
-                m.domain(),
-                class_map,
-            );
-        }
-    }
+    // V3.0) now set Domain per-species.  The old SQLite migration is
+    // skipped because detections are stored in Parquet files and the
+    // Domain column is written correctly by the parquet_store.
+    // (Legacy `db::migrate_domain_classes` is no longer called.)
 
     let num_workers = config.processing_threads;
     info!(
@@ -333,7 +324,6 @@ fn main() -> Result<()> {
     for worker_id in 0..num_workers {
         let report_tx = report_tx.clone();
         let work_rx = work_rx.clone();
-        let db_path = config.db_path.clone();
         let instance_id_owned = if config.processing_instance.is_empty() {
             "default".to_string()
         } else {
@@ -408,8 +398,7 @@ fn main() -> Result<()> {
                     }
 
                     // ── coordinate multi-instance deletion ───────────
-                    if let Err(e) = crate::db::mark_file_processed(
-                        &db_path,
+                    if let Err(e) = crate::kv::mark_file_processed(
                         &item.filename,
                         &instance_id_owned,
                     ) {
@@ -419,7 +408,7 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    if crate::db::all_instances_done(&db_path, &item.filename) {
+                    if crate::kv::all_instances_done(&item.filename) {
                         tracing::debug!(
                             "Worker {worker_id}: all instances done with {} — deleting",
                             item.filename

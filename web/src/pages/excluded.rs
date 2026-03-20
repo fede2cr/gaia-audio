@@ -39,21 +39,17 @@ pub async fn override_exclusion(
     scientific_name: String,
     notes: String,
 ) -> Result<(), ServerFnError> {
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    crate::server::db::add_exclusion_override(&state.db_path, &scientific_name, &notes)
+    crate::server::kv::add_exclusion_override(&scientific_name, &notes)
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     Ok(())
 }
 
 #[server(prefix = "/api")]
 pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnError> {
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    crate::server::db::remove_exclusion_override(&state.db_path, &scientific_name)
+    crate::server::kv::remove_exclusion_override(&scientific_name)
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     Ok(())
 }
 

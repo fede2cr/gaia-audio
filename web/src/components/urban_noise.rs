@@ -12,12 +12,10 @@ use crate::model::UrbanNoiseSummary;
 
 #[server(prefix = "/api")]
 pub async fn get_urban_noise() -> Result<Vec<UrbanNoiseSummary>, ServerFnError> {
-    use crate::server::db;
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::urban_noise_summary(&state.db_path)
+    use crate::server::kv;
+    kv::urban_noise_summary()
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────

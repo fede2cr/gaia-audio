@@ -13,7 +13,7 @@ use gaia_common::audio;
 use gaia_common::config::Config;
 use gaia_common::detection::{Detection, ParsedFileName};
 
-use crate::db;
+use crate::kv;
 use crate::parquet_store;
 use crate::spectrogram::{self, Colormap, SpectrogramParams};
 use crate::ReportPayload;
@@ -22,9 +22,9 @@ use crate::ReportPayload;
 pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path) {
     let mut config = config.clone();
     while let Ok(payload) = rx.recv() {
-        // Refresh settings (colormap, thresholds) from the DB so web UI
+        // Refresh settings (colormap, thresholds) from Redis so web UI
         // changes are picked up without restarting the container.
-        db::apply_settings_overrides(&mut config);
+        kv::apply_settings_overrides(&mut config);
 
         if let Err(e) = process_report(&payload, &config, db_path) {
             error!("Reporting error: {e:#}");
@@ -67,7 +67,7 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
     info!("Reporting thread finished");
 }
 
-fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> Result<()> {
+fn process_report(payload: &ReportPayload, config: &Config, _db_path: &Path) -> Result<()> {
     let file = &payload.file;
 
     // Separate urban-noise detections (Engine, Dog, Human, …) from real
@@ -76,7 +76,7 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
     let (species_dets, noise_dets): (Vec<&Detection>, Vec<&Detection>) = payload
         .detections
         .iter()
-        .partition(|d| !db::is_urban_noise(&d.scientific_name));
+        .partition(|d| !kv::is_urban_noise(&d.scientific_name));
 
     debug!(
         "Report for {}: {} total detection(s) ({} species, {} noise)",
@@ -201,8 +201,8 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
             .and_then(|h| h.parse().ok())
             .unwrap_or(0);
 
-        if let Err(e) = db::increment_urban_noise(db_path, &detection.date, hour, category) {
-            error!("Urban noise DB update failed: {e}");
+        if let Err(e) = kv::increment_urban_noise(&detection.date, hour, category) {
+            error!("Urban noise update failed: {e}");
         }
 
         info!(

@@ -53,6 +53,21 @@ const BUSY_TIMEOUT_MS: u32 = 30_000;
 /// Maximum application-level retries for SQLITE_BUSY / locked errors.
 const MAX_BUSY_RETRIES: u32 = 5;
 
+/// Compute a retry delay with exponential backoff and random jitter.
+/// Base delay doubles each attempt (100, 200, 400, 800, 1600 ms) and
+/// ±25% jitter is added to prevent thundering-herd synchronisation
+/// across containers.
+fn retry_delay(attempt: u32) -> Duration {
+    let base_ms = 100u64 * 2u64.pow(attempt);
+    // Cheap jitter: use nanosecond timestamp modulo to add 0-50% of base
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % (base_ms / 2 + 1);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
 /// Check whether a libsql error is a transient "database is locked" /
 /// SQLITE_BUSY error that is worth retrying.
 fn is_busy_error(e: &libsql::Error) -> bool {
@@ -408,32 +423,17 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
     let conn = conn(db_path)?;
     for attempt in 0..=MAX_BUSY_RETRIES {
         let res: Result<(), libsql::Error> = rt().block_on(async {
-            let result = conn.execute(
+            conn.execute(
                 "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
                  ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
                 params![date.to_string(), hour as i64, category.to_string()],
-            ).await;
-
-            if result.is_err() {
-                // Fallback for older schemas without the UNIQUE constraint.
-                let updated = conn.execute(
-                    "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
-                    params![date.to_string(), hour as i64, category.to_string()],
-                ).await?;
-                if updated == 0 {
-                    conn.execute(
-                        "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
-                        params![date.to_string(), hour as i64, category.to_string()],
-                    ).await?;
-                }
-            }
-
+            ).await?;
             Ok(())
         });
         match res {
             Ok(()) => return Ok(()),
             Err(e) if is_busy_error(&e) && attempt < MAX_BUSY_RETRIES => {
-                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                let delay = retry_delay(attempt);
                 warn!("increment_urban_noise: busy (attempt {}/{}), retrying in {delay:?}",
                       attempt + 1, MAX_BUSY_RETRIES);
                 std::thread::sleep(delay);
@@ -629,38 +629,15 @@ pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Re
                 params![filename.to_string(), instance.to_string()],
             )
             .await?;
-
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
-                    params![filename.to_string()],
-                )
-                .await?;
-            let done: u32 = rows
-                .next()
-                .await?
-                .and_then(|r| r.get::<u32>(0).ok())
-                .unwrap_or(0);
-
-            let mut rows2 = conn
-                .query("SELECT COUNT(*) FROM processing_instances", ())
-                .await?;
-            let total: u32 = rows2
-                .next()
-                .await?
-                .and_then(|r| r.get::<u32>(0).ok())
-                .unwrap_or(0);
-
-            debug!(
-                "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
-                instance
-            );
             Ok(())
         });
         match res {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                debug!("mark_file_processed: {filename} by {instance:?}");
+                return Ok(());
+            }
             Err(e) if is_busy_error(&e) && attempt < MAX_BUSY_RETRIES => {
-                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                let delay = retry_delay(attempt);
                 warn!("mark_file_processed: busy (attempt {}/{}), retrying in {delay:?}",
                       attempt + 1, MAX_BUSY_RETRIES);
                 std::thread::sleep(delay);

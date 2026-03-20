@@ -44,15 +44,14 @@ pub async fn get_top_species(
     limit: u32,
     model_slug: String,
 ) -> Result<Vec<SpeciesSummary>, ServerFnError> {
-    use crate::server::{db, detections_duckdb as ddb, inaturalist};
+    use crate::server::{kv, detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     // Show today's top species instead of all-time.
     // Use the user's TZ offset so "today" matches their local midnight.
-    let today = db::today_for_tz_pub(&state.db_path)
-        .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    let today = kv::today_for_tz()
+        .await;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
     let mut species = ddb::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
         .await

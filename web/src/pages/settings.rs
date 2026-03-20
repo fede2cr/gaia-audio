@@ -21,12 +21,9 @@ const DEFAULT_TZ_OFFSET: i32 = 0;
 
 #[server(prefix = "/api")]
 pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-
-    let map = crate::server::db::get_all_settings(&state.db_path)
+    let map = crate::server::kv::get_all_settings()
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
 
     let f = |key: &str, default: f64| -> f64 {
         map.get(key)
@@ -46,9 +43,6 @@ pub async fn get_settings() -> Result<DetectionSettings, ServerFnError> {
 
 #[server(prefix = "/api")]
 pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnError> {
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-
     let sens = settings.sensitivity.to_string();
     let conf = settings.confidence.to_string();
     let sf = settings.sf_thresh.to_string();
@@ -56,8 +50,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
     let cmap = settings.colormap.clone();
     let tz = settings.tz_offset.to_string();
 
-    crate::server::db::save_settings(
-        &state.db_path,
+    crate::server::kv::save_settings(
         &[
             ("sensitivity", &sens),
             ("confidence", &conf),
@@ -68,7 +61,7 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
         ],
     )
     .await
-    .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+    .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
 
     Ok(())
 }

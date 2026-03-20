@@ -55,11 +55,25 @@ async fn main() {
         tracing::info!("DuckDB detection layer ready (dir={})", det_dir.display());
     }
 
+    // ── Initialise Valkey / Redis coordination layer ─────────────────
+    if let Err(e) = gaia_web::server::kv::initialize().await {
+        tracing::error!("Cannot initialise Redis: {e}");
+        std::process::exit(1);
+    }
+
     // ── Migrate existing SQLite detections → Parquet (one-time) ──────
     {
         let db = db_path.clone();
         if let Err(e) = gaia_web::server::detections_duckdb::migrate_sqlite_to_parquet(&db).await {
             tracing::warn!("SQLite→Parquet migration failed (non-fatal): {e}");
+        }
+    }
+
+    // ── Migrate SQLite OLTP data → Redis (one-time) ──────────────────
+    {
+        let db = db_path.clone();
+        if let Err(e) = gaia_web::server::kv::migrate_from_sqlite(&db).await {
+            tracing::warn!("SQLite→Redis migration failed (non-fatal): {e}");
         }
     }
 

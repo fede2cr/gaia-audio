@@ -14,7 +14,7 @@
 //! magnitude faster than row-oriented SQLite at scale.
 //!
 //! The small OLTP tables (`settings`, `exclusion_overrides`,
-//! `urban_noise`, `species_verifications`, etc.) stay in SQLite.
+//! `urban_noise`, `species_verifications`, etc.) live in Redis / Valkey.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -143,51 +143,14 @@ fn exclusion_clause(overrides: &[String]) -> String {
     }
 }
 
-/// Read the exclusion-override species list from SQLite.
-pub async fn read_overrides(db_path: &Path) -> Vec<String> {
-    match super::db::open_conn(db_path).await {
-        Ok(conn) => {
-            let mut rows = match conn
-                .query("SELECT Sci_Name FROM exclusion_overrides", ())
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
-            let mut names = Vec::new();
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(name) = row.get::<String>(0) {
-                    names.push(name);
-                }
-            }
-            names
-        }
-        Err(_) => Vec::new(),
-    }
+/// Read the exclusion-override species list from Redis.
+pub async fn read_overrides(_db_path: &Path) -> Vec<String> {
+    super::kv::read_overrides().await
 }
 
-/// Read tz_offset from SQLite settings.
-pub async fn read_tz_offset(db_path: &Path) -> i32 {
-    match super::db::open_conn(db_path).await {
-        Ok(conn) => {
-            let mut rows = match conn
-                .query("SELECT value FROM settings WHERE key = 'tz_offset'", ())
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return 0,
-            };
-            match rows.next().await {
-                Ok(Some(row)) => row
-                    .get::<String>(0)
-                    .ok()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(0),
-                _ => 0,
-            }
-        }
-        Err(_) => 0,
-    }
+/// Read tz_offset from Redis settings.
+pub async fn read_tz_offset(_db_path: &Path) -> i32 {
+    super::kv::read_tz_offset().await
 }
 
 /// Apply TZ offset to date/time strings.
@@ -491,7 +454,7 @@ pub async fn daily_species_hourly(
     let list_sql = format!(
         "SELECT Sci_Name, Com_Name, COUNT(*) AS cnt \
          FROM detections WHERE Date = '{safe_date}' AND {excl} \
-         GROUP BY Sci_Name ORDER BY cnt DESC"
+         GROUP BY Sci_Name, Com_Name ORDER BY cnt DESC"
     );
     let mut list_stmt = duck.prepare(&list_sql)?;
     let species: Vec<(String, String, u32)> = list_stmt
@@ -549,7 +512,7 @@ pub async fn top_species_for_date_filtered(
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE d.Date = '{safe_date}' AND {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
+         GROUP BY d.Sci_Name, d.Com_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
     );
     let mut stmt = duck.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -597,7 +560,7 @@ pub async fn top_species_filtered(
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
+         GROUP BY d.Sci_Name, d.Com_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
     );
     let mut stmt = duck.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -722,7 +685,7 @@ pub async fn excluded_species(db_path: &Path) -> Res<Vec<ExcludedSpecies>> {
                MAX(Confidence) AS max_conf \
                FROM detections \
                WHERE COALESCE(Excluded, 0) = 1 \
-               GROUP BY Sci_Name, Domain \
+               GROUP BY Sci_Name, Com_Name, Domain \
                ORDER BY cnt DESC";
     let mut stmt = duck.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
@@ -813,9 +776,8 @@ pub async fn quiz_candidates(
     db_path: &Path,
     today_only: bool,
 ) -> Res<Vec<QuizItem>> {
-    let today = super::db::today_for_tz_pub(db_path)
-        .await
-        .unwrap_or_default();
+    let today = super::kv::today_for_tz()
+        .await;
     let duck = conn()?;
 
     let date_filter = if today_only {

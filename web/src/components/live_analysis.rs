@@ -133,11 +133,9 @@ pub async fn get_live_status() -> Result<Option<LiveStatus>, ServerFnError> {
 
 #[server(prefix = "/api")]
 pub async fn get_tz_offset() -> Result<i32, ServerFnError> {
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let map = crate::server::db::get_all_settings(&state.db_path)
+    let map = crate::server::kv::get_all_settings()
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
     Ok(map.get("tz_offset").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0))
 }
 

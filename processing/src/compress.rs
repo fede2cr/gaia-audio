@@ -13,7 +13,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use libsql::params;
 use tracing::{debug, error, info, warn};
 
 /// Opus encoding bitrate.  96 kbps is transparent quality for bird /
@@ -25,7 +24,7 @@ const OPUS_BITRATE: &str = "96k";
 /// Returns the number of files successfully compressed.
 pub fn compress_sweep(
     extracted_dir: &Path,
-    db_path: &Path,
+    _db_path: &Path,
     shutdown: &AtomicBool,
 ) -> Result<u64> {
     let by_date = extracted_dir.join("By_Date");
@@ -52,9 +51,6 @@ pub fn compress_sweep(
         by_date.display()
     );
 
-    let conn = crate::db::open_conn_pub(db_path)
-        .context("Cannot open database for compression")?;
-
     let mut converted = 0u64;
 
     for src_path in &candidates {
@@ -63,7 +59,7 @@ pub fn compress_sweep(
             break;
         }
 
-        match convert_one(&conn, src_path) {
+        match convert_one(src_path) {
             Ok(()) => converted += 1,
             Err(e) => {
                 warn!("Failed to compress {}: {e:#}", src_path.display());
@@ -221,8 +217,9 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Convert a single `.wav` or `.mp3` file to `.opus`, rename its
-/// spectrogram, and update the DB `File_Name`.
-fn convert_one(conn: &libsql::Connection, src_path: &Path) -> Result<()> {
+/// spectrogram.  (File_Name updates in the old SQLite detections table
+/// are no longer needed — detections are stored in Parquet.)
+fn convert_one(src_path: &Path) -> Result<()> {
     let src_name = src_path
         .file_name()
         .context("No filename")?
@@ -243,8 +240,6 @@ fn convert_one(conn: &libsql::Connection, src_path: &Path) -> Result<()> {
     if dest_path.exists() {
         debug!("Opus already exists, removing source: {}", src_path.display());
         std::fs::remove_file(src_path).ok();
-        // Still try to update DB in case a previous run crashed mid-way
-        update_db_filename(conn, &src_name, &new_name);
         return Ok(());
     }
 
@@ -283,9 +278,6 @@ fn convert_one(conn: &libsql::Connection, src_path: &Path) -> Result<()> {
         }
     }
 
-    // Update database
-    update_db_filename(conn, &src_name, &new_name);
-
     // Remove original source file
     if let Err(e) = std::fs::remove_file(src_path) {
         warn!("Cannot remove original {}: {e}", src_path.display());
@@ -297,23 +289,11 @@ fn convert_one(conn: &libsql::Connection, src_path: &Path) -> Result<()> {
 
 /// Update `File_Name` in the detections table.
 ///
-/// This is best-effort: imported BirdNET-Pi clips may have the same
-/// basename stored in the DB, while Gaia clips use a different naming
-/// convention.  We update all matching rows.
-fn update_db_filename(conn: &libsql::Connection, old_name: &str, new_name: &str) {
-    match crate::db::block_on(conn.execute(
-        "UPDATE detections SET File_Name = ?1 WHERE File_Name = ?2",
-        params![new_name.to_string(), old_name.to_string()],
-    )) {
-        Ok(n) if n > 0 => debug!("Updated {n} DB row(s): {old_name} → {new_name}"),
-        Ok(_) => {
-            // No matching rows — file may have been extracted without a
-            // detection (e.g. urban noise), or the naming doesn't match.
-            // This is normal and not an error.
-        }
-        Err(e) => warn!("DB update failed for {old_name}: {e}"),
-    }
-}
+/// Detections are now stored in Parquet files — this function is a
+/// no-op.  Kept for reference; the background compression no longer
+/// needs to touch the database.
+#[allow(dead_code)]
+fn update_db_filename(_old_name: &str, _new_name: &str) {}
 
 /// Check that ffmpeg is reachable.
 fn ffmpeg_available() -> bool {
@@ -376,39 +356,9 @@ mod tests {
     }
 
     #[test]
-    fn test_update_db_filename() {
-        let dir = std::env::temp_dir().join("gaia_compress_test_db");
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("test.db");
-        let conn = crate::db::open_conn_pub(&db).unwrap();
-        crate::db::block_on(conn.execute_batch(
-            "CREATE TABLE detections (File_Name TEXT NOT NULL);
-             INSERT INTO detections (File_Name) VALUES ('clip.wav');
-             INSERT INTO detections (File_Name) VALUES ('clip.wav');
-             INSERT INTO detections (File_Name) VALUES ('other.mp3');",
-        ))
-        .unwrap();
-
-        update_db_filename(&conn, "clip.wav", "clip.opus");
-        let count: u32 = crate::db::block_on(async {
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM detections WHERE File_Name = 'clip.opus'", ())
-                .await
-                .unwrap();
-            rows.next().await.unwrap().unwrap().get::<u32>(0).unwrap()
-        });
-        assert_eq!(count, 2);
-
-        // mp3 row untouched
-        let mp3: u32 = crate::db::block_on(async {
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM detections WHERE File_Name = 'other.mp3'", ())
-                .await
-                .unwrap();
-            rows.next().await.unwrap().unwrap().get::<u32>(0).unwrap()
-        });
-        assert_eq!(mp3, 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn test_update_db_filename_noop() {
+        // update_db_filename is now a no-op (detections are in Parquet).
+        // Just verify it doesn't panic.
+        update_db_filename("clip.wav", "clip.opus");
     }
 }
