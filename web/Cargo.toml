@@ -31,6 +31,7 @@ tower-http          = { version = "0.6", features = ["fs", "cors"], optional = t
 tracing             = { version = "0.1", optional = true }
 tracing-subscriber  = { version = "0.3", features = ["env-filter"], optional = true }
 libsql              = { version = "0.9", default-features = false, features = ["core"], optional = true }
+duckdb              = { version = "1", features = ["bundled"], optional = true }
 reqwest             = { version = "0.12", features = ["json"], optional = true }
 chrono              = { version = "0.4", optional = true }
 http                = { version = "1", optional = true }
@@ -60,6 +61,7 @@ ssr = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:libsql",
+    "dep:duckdb",
     "dep:reqwest",
     "dep:chrono",
     "dep:http",

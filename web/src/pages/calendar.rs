@@ -17,10 +17,10 @@ pub async fn get_calendar_data(
     year: i32,
     month: u32,
 ) -> Result<Vec<CalendarDay>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::calendar_data(&state.db_path, year, month)
+    ddb::calendar_data(&state.db_path, year, month)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }

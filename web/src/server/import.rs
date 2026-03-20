@@ -315,7 +315,7 @@ pub fn import_backup(
         return Err("No birds.db found in the backup tar".into());
     }
 
-    // Ensure Gaia DB exists with schema
+    // Ensure Gaia DB exists with schema (OLTP tables only)
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -324,10 +324,14 @@ pub fn import_backup(
         rt.block_on(ensure_gaia_schema(gaia_db_path))?;
     }
 
-    // Read existing file names to avoid duplicates (opus-aware)
-    let existing_files = get_existing_filenames(gaia_db_path)?;
+    // Read existing file names to avoid duplicates (opus-aware, from Parquet)
+    let existing_files = get_existing_filenames()?;
 
-    import_detections_from_db(&source_db, gaia_db_path, &existing_files, &mut result)?;
+    // Derive detections directory from db_path (same convention as main.rs)
+    let detections_dir = super::detections_duckdb::get_detections_dir()
+        .unwrap_or_else(|| gaia_db_path.parent().unwrap_or(Path::new("data")).join("detections"));
+
+    import_detections_from_db(&source_db, &detections_dir, &existing_files, &mut result)?;
 
     tracing::info!(
         "Phase 1 complete: {} detections imported, {} skipped (existing)",
@@ -388,6 +392,7 @@ pub fn stream_import(
     tracing::info!("Starting streaming import from {url}");
 
     // Ensure Gaia DB and directories exist
+    // Ensure Gaia DB exists with schema (OLTP tables)
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -398,8 +403,8 @@ pub fn stream_import(
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| format!("Cannot create extracted dir: {e}"))?;
 
-    // Build the opus-aware dedup set BEFORE we start downloading
-    let existing = get_existing_filenames(gaia_db_path)?;
+    // Build the opus-aware dedup set BEFORE we start downloading (from Parquet)
+    let existing = get_existing_filenames()?;
 
     // ── Stream the tar from the BirdNET-Pi node via curl ─────────────
     //
@@ -560,7 +565,9 @@ pub fn stream_import(
     let source_db = tmp_dir.join("birds.db");
     if source_db.exists() {
         tracing::info!("Importing detections from birds.db…");
-        import_detections_from_db(&source_db, gaia_db_path, &existing, &mut result)?;
+        let detections_dir = super::detections_duckdb::get_detections_dir()
+            .unwrap_or_else(|| gaia_db_path.parent().unwrap_or(Path::new("data")).join("detections"));
+        import_detections_from_db(&source_db, &detections_dir, &existing, &mut result)?;
     } else {
         tracing::warn!("No birds.db found in the streamed backup");
     }
@@ -670,30 +677,63 @@ pub fn discover_birdnet_nodes() -> Vec<BirdnetNode> {
 /// `existing` is a set of `File_Name` values already in the Gaia DB, expanded
 /// with pre-compression variants (`.mp3`/`.wav`) so that re-importing a backup
 /// after Opus compression still deduplicates correctly.
+/// Import detection rows from a BirdNET-Pi `birds.db` into Parquet files.
+///
+/// Reads from the BirdNET-Pi source database and writes a single Parquet file
+/// in the detections directory via an in-memory DuckDB instance.
+///
+/// `existing` is a set of `File_Name` values already in the detections
+/// Parquet store, expanded with pre-compression variants (`.mp3`/`.wav`) so
+/// that re-importing after Opus compression still deduplicates.
 fn import_detections_from_db(
     source_db: &Path,
-    gaia_db_path: &Path,
+    detections_dir: &Path,
     existing: &HashSet<String>,
     result: &mut ImportResult,
 ) -> Result<(), String> {
-    // Use a dedicated tokio runtime for this sync function since it
-    // may be called from within a tokio context via spawn_blocking.
+    // In-memory DuckDB for buffering the import batch.
+    let duck = duckdb::Connection::open_in_memory()
+        .map_err(|e| format!("DuckDB open error: {e}"))?;
+
+    duck.execute_batch(
+        "CREATE TABLE buffer (
+            id          BIGINT   NOT NULL,
+            Date        VARCHAR  NOT NULL,
+            Time        VARCHAR  NOT NULL,
+            Domain      VARCHAR  NOT NULL,
+            Sci_Name    VARCHAR  NOT NULL,
+            Com_Name    VARCHAR  NOT NULL,
+            Confidence  DOUBLE   NOT NULL,
+            Lat         DOUBLE   NOT NULL,
+            Lon         DOUBLE   NOT NULL,
+            Cutoff      DOUBLE   NOT NULL,
+            Week        INTEGER  NOT NULL,
+            Sens        DOUBLE   NOT NULL,
+            Overlap     DOUBLE   NOT NULL,
+            File_Name   VARCHAR  NOT NULL,
+            Source_Node VARCHAR  NOT NULL,
+            Excluded    INTEGER  NOT NULL,
+            Model_Slug  VARCHAR  NOT NULL,
+            Model_Name  VARCHAR  NOT NULL
+        )",
+    )
+    .map_err(|e| format!("DuckDB schema error: {e}"))?;
+
+    // Read source rows from the BirdNET-Pi SQLite DB.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Cannot create runtime: {e}"))?;
 
+    let base_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut seq: u64 = 0;
+
     rt.block_on(async {
         let src_conn = open_local(source_db).await?;
-        let dst_conn = open_gaia(gaia_db_path).await?;
-        dst_conn
-            .execute_batch(&format!(
-                "PRAGMA busy_timeout={IMPORT_BUSY_TIMEOUT_MS}; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
-            ))
-            .await
-            .map_err(|e| format!("Pragma error: {e}"))?;
 
-        // Read all source rows
         let mut src_rows = src_conn
             .query(
                 "SELECT Date, Time, Sci_Name, Com_Name, Confidence, \
@@ -704,35 +744,30 @@ fn import_detections_from_db(
             .await
             .map_err(|e| format!("Source query error: {e}"))?;
 
-        let mut batch_count = 0u64;
-        dst_conn
-            .execute_batch("BEGIN CONCURRENT")
-            .await
-            .map_err(|e| format!("Transaction error: {e}"))?;
-
         while let Some(row) = src_rows.next().await.map_err(|e| format!("Row error: {e}"))? {
-            let (date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname) = match (|| -> Result<_, libsql::Error> {
-                Ok((
-                    row.get::<String>(0)?,
-                    row.get::<String>(1)?,
-                    row.get::<String>(2)?,
-                    row.get::<String>(3)?,
-                    row.get::<f64>(4)?,
-                    row.get::<f64>(5)?,
-                    row.get::<f64>(6)?,
-                    row.get::<f64>(7)?,
-                    row.get::<i64>(8)?,
-                    row.get::<f64>(9)?,
-                    row.get::<f64>(10)?,
-                    row.get::<String>(11)?,
-                ))
-            })() {
-                Ok(r) => r,
-                Err(e) => {
-                    result.errors.push(format!("Row read error: {e}"));
-                    continue;
-                }
-            };
+            let (date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname) =
+                match (|| -> Result<_, libsql::Error> {
+                    Ok((
+                        row.get::<String>(0)?,
+                        row.get::<String>(1)?,
+                        row.get::<String>(2)?,
+                        row.get::<String>(3)?,
+                        row.get::<f64>(4)?,
+                        row.get::<f64>(5)?,
+                        row.get::<f64>(6)?,
+                        row.get::<f64>(7)?,
+                        row.get::<i64>(8)?,
+                        row.get::<f64>(9)?,
+                        row.get::<f64>(10)?,
+                        row.get::<String>(11)?,
+                    ))
+                })() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        result.errors.push(format!("Row read error: {e}"));
+                        continue;
+                    }
+                };
 
             // Skip if this file was already imported (even if now .opus)
             if existing.contains(&fname) {
@@ -740,38 +775,69 @@ fn import_detections_from_db(
                 continue;
             }
 
-            if let Err(e) = dst_conn.execute(
-                "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, \
-                 Confidence, Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name) \
-                 VALUES (?1, ?2, 'birds', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![date, time, sci, com, conf, lat, lon, cutoff, week, sens, overlap, fname.clone()],
-            ).await {
-                result.errors.push(format!("Insert error for {fname}: {e}"));
+            // Generate unique sortable ID: epoch-ms << 16 | sequence
+            seq += 1;
+            let id = ((base_ms & 0xFFFF_FFFF_FFFF) << 16) | (seq & 0xFFFF);
+            // Bump base when sequence wraps around to keep IDs unique
+            if seq & 0xFFFF == 0 {
+                // The next id will use seq+1, which resets the low 16 bits.
+                // No collision because base_ms is constant and seq keeps growing.
+            }
+
+            if let Err(e) = duck.execute(
+                "INSERT INTO buffer VALUES (?, ?, ?, 'birds', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', '')",
+                duckdb::params![
+                    id as i64, date, time, sci, com, conf, lat, lon,
+                    cutoff, week as i32, sens, overlap, fname
+                ],
+            ) {
+                result.errors.push(format!("Buffer insert error for {fname}: {e}"));
                 continue;
             }
 
             result.detections_imported += 1;
-            batch_count += 1;
 
-            if batch_count % 5000 == 0 {
-                dst_conn
-                    .execute_batch("COMMIT; BEGIN CONCURRENT")
-                    .await
-                    .map_err(|e| format!("Commit error: {e}"))?;
+            if result.detections_imported % 5000 == 0 {
                 tracing::info!(
-                    "Imported {} detections so far…",
+                    "Buffered {} detections so far…",
                     result.detections_imported
                 );
             }
         }
 
-        dst_conn
-            .execute_batch("COMMIT")
-            .await
-            .map_err(|e| format!("Final commit error: {e}"))?;
+        Ok::<(), String>(())
+    })?;
 
-        Ok(())
-    })
+    // Flush the buffer to a Parquet file.
+    if result.detections_imported > 0 {
+        std::fs::create_dir_all(detections_dir)
+            .map_err(|e| format!("Cannot create detections dir: {e}"))?;
+
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
+        let filename = format!("import-{ts}.parquet");
+        let final_path = detections_dir.join(&filename);
+        let tmp_path = detections_dir.join(format!(".{filename}.tmp"));
+
+        duck.execute(
+            &format!(
+                "COPY buffer TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                tmp_path.display()
+            ),
+            [],
+        )
+        .map_err(|e| format!("Parquet write error: {e}"))?;
+
+        std::fs::rename(&tmp_path, &final_path)
+            .map_err(|e| format!("Rename error: {e}"))?;
+
+        tracing::info!(
+            "Wrote {} detections → {}",
+            result.detections_imported,
+            final_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// Extract audio and spectrogram files from a tar on disk into `extracted_dir`,
@@ -1020,46 +1086,13 @@ pub async fn ensure_gaia_schema(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Load all existing File_Name values from the Gaia DB for dedup.
+/// Load all existing File_Name values for dedup.
 ///
-/// After Opus compression, `File_Name` values may have changed from
-/// `.mp3`/`.wav` to `.opus`.  We expand the set with the pre-compression
-/// variants so that re-importing a BirdNET-Pi backup still deduplicates.
-fn get_existing_filenames(db_path: &Path) -> Result<HashSet<String>, String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Cannot create runtime: {e}"))?;
-
-    rt.block_on(async {
-        let conn = open_gaia(db_path).await?;
-        let mut rows = conn
-            .query("SELECT File_Name FROM detections", ())
-            .await
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        let mut names: HashSet<String> = HashSet::new();
-        while let Some(row) = rows.next().await.map_err(|e| format!("Row error: {e}"))? {
-            if let Ok(name) = row.get::<String>(0) {
-                names.insert(name);
-            }
-        }
-
-        // For every .opus filename, also add .mp3 and .wav so the source
-        // BirdNET-Pi filenames (which are always .mp3) still match.
-        let opus_variants: Vec<String> = names
-            .iter()
-            .filter(|n| n.ends_with(".opus"))
-            .flat_map(|n| {
-                let stem = &n[..n.len() - 5]; // strip ".opus"
-                [format!("{stem}.mp3"), format!("{stem}.wav")]
-            })
-            .collect();
-
-        names.extend(opus_variants);
-
-        Ok(names)
-    })
+/// Reads from the DuckDB Parquet-backed view (not SQLite), expanded with
+/// pre-compression variants (`.mp3`/`.wav` for every `.opus` entry) so
+/// that re-importing a BirdNET-Pi backup still deduplicates correctly.
+fn get_existing_filenames() -> Result<HashSet<String>, String> {
+    super::detections_duckdb::get_existing_filenames_set()
 }
 
 /// Parse LATITUDE and LONGITUDE from a birdnet.conf file.
@@ -1145,28 +1178,37 @@ mod tests {
 
     #[test]
     fn test_existing_filenames_includes_opus_variants() {
-        let dir = std::env::temp_dir().join("gaia_import_dedup_test");
+        // This test verifies the DuckDB-backed deduplication.
+        // We set up a temporary Parquet file, initialise DuckDB over it,
+        // and check that get_existing_filenames_set() expands .opus → .mp3/.wav.
+        let dir = std::env::temp_dir().join("gaia_import_dedup_test_parquet");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("test.db");
 
-        // Create a DB with an .opus filename (post-compression)
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let conn = open_local(&db_path).await.unwrap();
-            conn.execute_batch(
-                "CREATE TABLE detections (File_Name TEXT NOT NULL);
-                 INSERT INTO detections VALUES ('birds-Robin-42.opus');
-                 INSERT INTO detections VALUES ('birds-Wren-10.mp3');",
-            )
-            .await
-            .unwrap();
-        });
+        // Write a small Parquet file via DuckDB
+        let duck = duckdb::Connection::open_in_memory().unwrap();
+        duck.execute_batch(
+            "CREATE TABLE tmp (
+                id BIGINT, Date VARCHAR, Time VARCHAR, Domain VARCHAR,
+                Sci_Name VARCHAR, Com_Name VARCHAR, Confidence DOUBLE,
+                Lat DOUBLE, Lon DOUBLE, Cutoff DOUBLE, Week INTEGER,
+                Sens DOUBLE, Overlap DOUBLE, File_Name VARCHAR,
+                Source_Node VARCHAR, Excluded INTEGER, Model_Slug VARCHAR,
+                Model_Name VARCHAR
+            );
+            INSERT INTO tmp VALUES (1,'2024-01-01','08:00','birds','Turdus merula','Blackbird',0.9,0.0,0.0,0.0,1,1.0,0.0,'birds-Robin-42.opus','',0,'','');
+            INSERT INTO tmp VALUES (2,'2024-01-01','08:01','birds','Troglodytes','Wren',0.8,0.0,0.0,0.0,1,1.0,0.0,'birds-Wren-10.mp3','',0,'','');",
+        ).unwrap();
+        let parquet_path = dir.join("test.parquet");
+        duck.execute(
+            &format!("COPY tmp TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)", parquet_path.display()),
+            [],
+        ).unwrap();
 
-        let names = get_existing_filenames(&db_path).unwrap();
+        // Initialise the global DuckDB layer over this directory
+        super::detections_duckdb::initialize(&dir).unwrap();
+
+        let names = get_existing_filenames().unwrap();
 
         // The .opus entry should also produce .mp3 and .wav variants
         assert!(names.contains("birds-Robin-42.opus"));

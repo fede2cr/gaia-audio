@@ -18,10 +18,10 @@ use crate::model::{ExcludedSpecies, WebDetection};
 
 #[server(prefix = "/api")]
 pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut species = db::excluded_species(&state.db_path)
+    let mut species = ddb::excluded_species(&state.db_path)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
@@ -61,10 +61,10 @@ pub async fn remove_override(scientific_name: String) -> Result<(), ServerFnErro
 pub async fn get_excluded_detections(
     scientific_name: String,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut detections = db::excluded_detections_for_species(&state.db_path, &scientific_name, 20)
+    let mut detections = ddb::excluded_detections_for_species(&state.db_path, &scientific_name, 20)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 

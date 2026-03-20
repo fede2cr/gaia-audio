@@ -19,11 +19,11 @@ pub async fn get_day_detections(
     date: String,
     model_slug: String,
 ) -> Result<Vec<DayDetectionGroup>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut groups = db::day_detections_filtered(&state.db_path, &date, slug_opt)
+    let mut groups = ddb::day_detections_filtered(&state.db_path, &date, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
@@ -43,10 +43,10 @@ pub async fn get_day_detections(
 pub async fn get_day_hourly(
     date: String,
 ) -> Result<Vec<SpeciesHourlyCounts>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::daily_species_hourly(&state.db_path, &date)
+    ddb::daily_species_hourly(&state.db_path, &date)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }

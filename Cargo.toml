@@ -34,6 +34,7 @@ tract-onnx = "0.21"
 
 # Storage
 libsql = { version = "0.9", default-features = false, features = ["core"] }
+duckdb = { version = "1", features = ["bundled"] }
 
 # Image / FFT
 rustfft = "6.2"

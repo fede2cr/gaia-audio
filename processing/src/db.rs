@@ -16,15 +16,17 @@
 //! Write-heavy paths use plain **autocommit** — each individual
 //! `INSERT`/`UPDATE` is its own implicit transaction.  Cross-process
 //! contention (multiple containers accessing the same WAL file) is
-//! handled by `PRAGMA busy_timeout` which retries internally for up
-//! to 30 seconds.
+//! handled by `PRAGMA busy_timeout` (30 s) **plus** application-level
+//! retry with exponential backoff (up to 5 attempts) for the hot
+//! write paths.
 
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use libsql::params;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use gaia_common::detection::Detection;
 
@@ -47,6 +49,16 @@ fn rt() -> &'static tokio::runtime::Runtime {
 
 /// Busy-timeout in milliseconds.  Applied once at connection creation.
 const BUSY_TIMEOUT_MS: u32 = 30_000;
+
+/// Maximum application-level retries for SQLITE_BUSY / locked errors.
+const MAX_BUSY_RETRIES: u32 = 5;
+
+/// Check whether a libsql error is a transient "database is locked" /
+/// SQLITE_BUSY error that is worth retrying.
+fn is_busy_error(e: &libsql::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("database is locked") || msg.contains("database table is locked")
+}
 
 /// Cached `Database` handle — opened once, kept alive for the whole process.
 static DB: OnceLock<libsql::Database> = OnceLock::new();
@@ -280,7 +292,8 @@ async fn migrate_add_column(conn: &libsql::Connection, table: &str, column: &str
 ///
 /// Runs as a single autocommit statement — SQLite handles the
 /// implicit transaction.  Cross-process contention is absorbed by
-/// `PRAGMA busy_timeout` (30 s).
+/// `PRAGMA busy_timeout` (30 s) **plus** application-level retry
+/// with exponential backoff.
 pub fn insert_detection(
     db_path: &Path,
     d: &Detection,
@@ -293,36 +306,48 @@ pub fn insert_detection(
     source_node: &str,
 ) -> Result<()> {
     let conn = conn(db_path)?;
-    rt().block_on(async {
-        conn.execute(
-            "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
-             Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
-             Model_Slug, Model_Name) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                d.date.clone(),
-                d.time.clone(),
-                d.domain.clone(),
-                d.scientific_name.clone(),
-                d.common_name.clone(),
-                d.confidence,
-                lat,
-                lon,
-                cutoff,
-                d.week as i64,
-                sensitivity,
-                overlap,
-                file_name.to_string(),
-                source_node.to_string(),
-                d.excluded as i64,
-                d.model_slug.clone(),
-                d.model_name.clone(),
-            ],
-        )
-        .await
-        .context("Failed to insert detection")?;
-        Ok::<(), anyhow::Error>(())
-    })
+    for attempt in 0..=MAX_BUSY_RETRIES {
+        let res: Result<(), libsql::Error> = rt().block_on(async {
+            conn.execute(
+                "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
+                 Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
+                 Model_Slug, Model_Name) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    d.date.clone(),
+                    d.time.clone(),
+                    d.domain.clone(),
+                    d.scientific_name.clone(),
+                    d.common_name.clone(),
+                    d.confidence,
+                    lat,
+                    lon,
+                    cutoff,
+                    d.week as i64,
+                    sensitivity,
+                    overlap,
+                    file_name.to_string(),
+                    source_node.to_string(),
+                    d.excluded as i64,
+                    d.model_slug.clone(),
+                    d.model_name.clone(),
+                ],
+            )
+            .await?;
+            Ok(())
+        });
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_error(&e) && attempt < MAX_BUSY_RETRIES => {
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                warn!("insert_detection: busy (attempt {}/{}), retrying in {delay:?}",
+                      attempt + 1, MAX_BUSY_RETRIES);
+                std::thread::sleep(delay);
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("Failed to insert detection")),
+        }
+    }
+    unreachable!()
 }
 
 /// Count today's detections of a species in a given domain.
@@ -378,34 +403,45 @@ fn _count(db_path: &Path, sql: &str, p: Vec<libsql::Value>) -> u32 {
 ///
 /// Uses `INSERT … ON CONFLICT` (UPSERT) so a single row is stored
 /// per (Date, Hour, Category) tuple.  Each statement runs in
-/// autocommit — no explicit transaction needed.
+/// autocommit — no explicit transaction needed.  Retries on busy.
 pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &str) -> Result<()> {
     let conn = conn(db_path)?;
-    rt().block_on(async {
-        let result = conn.execute(
-            "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
-             ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
-            params![date.to_string(), hour as i64, category.to_string()],
-        ).await;
-
-        if result.is_err() {
-            // Fallback for older schemas without the UNIQUE constraint.
-            let updated = conn.execute(
-                "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
+    for attempt in 0..=MAX_BUSY_RETRIES {
+        let res: Result<(), libsql::Error> = rt().block_on(async {
+            let result = conn.execute(
+                "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
+                 ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
                 params![date.to_string(), hour as i64, category.to_string()],
-            ).await?;
-            if updated == 0 {
-                conn.execute(
-                    "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
+            ).await;
+
+            if result.is_err() {
+                // Fallback for older schemas without the UNIQUE constraint.
+                let updated = conn.execute(
+                    "UPDATE urban_noise SET Count = Count + 1 WHERE Date = ?1 AND Hour = ?2 AND Category = ?3",
                     params![date.to_string(), hour as i64, category.to_string()],
                 ).await?;
+                if updated == 0 {
+                    conn.execute(
+                        "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1)",
+                        params![date.to_string(), hour as i64, category.to_string()],
+                    ).await?;
+                }
             }
+
+            Ok(())
+        });
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_error(&e) && attempt < MAX_BUSY_RETRIES => {
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                warn!("increment_urban_noise: busy (attempt {}/{}), retrying in {delay:?}",
+                      attempt + 1, MAX_BUSY_RETRIES);
+                std::thread::sleep(delay);
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("increment_urban_noise failed")),
         }
-
-        Ok::<(), libsql::Error>(())
-    })?;
-
-    Ok(())
+    }
+    unreachable!()
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -581,45 +617,58 @@ pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool
 /// Record that this instance has finished processing a file.
 ///
 /// Runs as a single autocommit `INSERT OR IGNORE`.  Cross-process
-/// contention is absorbed by `PRAGMA busy_timeout` (30 s).
+/// contention is absorbed by `PRAGMA busy_timeout` (30 s) **plus**
+/// application-level retry with exponential backoff.
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
     let conn = conn(db_path)?;
 
-    rt().block_on(async {
-        conn.execute(
-            "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
-            params![filename.to_string(), instance.to_string()],
-        )
-        .await?;
-
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
-                params![filename.to_string()],
+    for attempt in 0..=MAX_BUSY_RETRIES {
+        let res: Result<(), libsql::Error> = rt().block_on(async {
+            conn.execute(
+                "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
+                params![filename.to_string(), instance.to_string()],
             )
             .await?;
-        let done: u32 = rows
-            .next()
-            .await?
-            .and_then(|r| r.get::<u32>(0).ok())
-            .unwrap_or(0);
 
-        let mut rows2 = conn
-            .query("SELECT COUNT(*) FROM processing_instances", ())
-            .await?;
-        let total: u32 = rows2
-            .next()
-            .await?
-            .and_then(|r| r.get::<u32>(0).ok())
-            .unwrap_or(0);
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
+                    params![filename.to_string()],
+                )
+                .await?;
+            let done: u32 = rows
+                .next()
+                .await?
+                .and_then(|r| r.get::<u32>(0).ok())
+                .unwrap_or(0);
 
-        debug!(
-            "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
-            instance
-        );
-        Ok::<(), libsql::Error>(())
-    })?;
-    Ok(())
+            let mut rows2 = conn
+                .query("SELECT COUNT(*) FROM processing_instances", ())
+                .await?;
+            let total: u32 = rows2
+                .next()
+                .await?
+                .and_then(|r| r.get::<u32>(0).ok())
+                .unwrap_or(0);
+
+            debug!(
+                "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
+                instance
+            );
+            Ok(())
+        });
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_error(&e) && attempt < MAX_BUSY_RETRIES => {
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                warn!("mark_file_processed: busy (attempt {}/{}), retrying in {delay:?}",
+                      attempt + 1, MAX_BUSY_RETRIES);
+                std::thread::sleep(delay);
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("mark_file_processed failed")),
+        }
+    }
+    unreachable!()
 }
 
 /// Check whether every **active** processing instance has processed this file.

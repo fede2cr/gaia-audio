@@ -16,10 +16,10 @@ use crate::model::ModelInfo;
 /// Fetch the list of models that have recorded detections.
 #[server(prefix = "/api")]
 pub async fn get_available_models() -> Result<Vec<ModelInfo>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let models = db::available_models(&state.db_path)
+    let models = ddb::available_models(&state.db_path)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     Ok(models

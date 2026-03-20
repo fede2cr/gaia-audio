@@ -27,6 +27,7 @@ tract-onnx.workspace = true
 
 # Storage
 libsql.workspace = true
+duckdb.workspace = true
 
 # Async runtime (for libsql block_on in sync context)
 tokio.workspace = true

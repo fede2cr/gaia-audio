@@ -45,11 +45,21 @@ async fn main() {
     }
     tracing::info!("Database ready at {}", db_path.display());
 
+    // ── Initialise DuckDB detection layer ────────────────────────────
+    {
+        let det_dir = db_path.parent().unwrap_or(std::path::Path::new("data")).join("detections");
+        if let Err(e) = gaia_web::server::detections_duckdb::initialize(&det_dir) {
+            tracing::error!("Cannot initialise DuckDB detection layer: {e}");
+            std::process::exit(1);
+        }
+        tracing::info!("DuckDB detection layer ready (dir={})", det_dir.display());
+    }
+
     // Refresh the species stats cache at startup so the species list loads
     // instantly from the cache table.
     {
         let db = db_path.clone();
-        if let Err(e) = gaia_web::server::db::refresh_species_stats(&db).await {
+        if let Err(e) = gaia_web::server::detections_duckdb::refresh_species_stats(&db).await {
             tracing::warn!("Initial species-stats refresh failed: {e}");
         } else {
             tracing::info!("Species stats cache populated");
@@ -67,7 +77,7 @@ async fn main() {
                 tracing::info!("Nightly species-stats refresh starting…");
                 let res = {
                     let db2 = db.clone();
-                    gaia_web::server::db::refresh_species_stats(&db2).await
+                    gaia_web::server::detections_duckdb::refresh_species_stats(&db2).await
                 };
                 match res {
                     Ok(()) => tracing::info!("Nightly species-stats refresh complete"),

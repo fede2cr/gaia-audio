@@ -153,6 +153,13 @@ pub async fn open_conn(db_path: &Path) -> Result<libsql::Connection, libsql::Err
     open(db_path).await
 }
 
+// ─── Detection queries (DEPRECATED – now served by detections_duckdb.rs) ─────
+//
+// All detection analytical queries below have been migrated to the DuckDB
+// Parquet-backed module (`detections_duckdb.rs`).  These SQLite versions are
+// kept temporarily for reference but are no longer called from any page.
+// TODO: remove once the DuckDB migration is fully validated.
+
 // ─── Recent detections (live feed) ───────────────────────────────────────────
 
 /// Return the most recent `limit` detections.  

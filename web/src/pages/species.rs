@@ -20,10 +20,10 @@ use crate::model::{CalendarDay, HourlyCount, ModelInfo, SpeciesInfo, TopRecordin
 pub async fn get_species_info(
     scientific_name: String,
 ) -> Result<Option<SpeciesInfo>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut info = db::species_info(&state.db_path, &scientific_name)
+    let mut info = ddb::species_info(&state.db_path, &scientific_name)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
@@ -35,7 +35,7 @@ pub async fn get_species_info(
             sp.female_image_url = photo.female_image_url;
         }
         // Load verification state.
-        sp.verification = db::get_species_verification(&state.db_path, &scientific_name)
+        sp.verification = crate::server::db::get_species_verification(&state.db_path, &scientific_name)
             .await
             .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     }
@@ -47,21 +47,21 @@ pub async fn get_species_calendar(
     scientific_name: String,
     year: i32,
 ) -> Result<(Vec<CalendarDay>, Vec<String>), ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     // Full-year calendar data
     let mut all_days = Vec::new();
     for m in 1..=12 {
-        let mut month_days = db::calendar_data(&state.db_path, year, m)
+        let mut month_days = ddb::calendar_data(&state.db_path, year, m)
             .await
             .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
         all_days.append(&mut month_days);
     }
 
     // Dates this species was active
-    let active = db::species_active_dates(&state.db_path, &scientific_name, year)
+    let active = ddb::species_active_dates(&state.db_path, &scientific_name, year)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
@@ -103,10 +103,10 @@ pub async fn remove_species_verification(
 pub async fn get_species_hourly(
     scientific_name: String,
 ) -> Result<Vec<HourlyCount>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::species_hourly_histogram(&state.db_path, &scientific_name)
+    ddb::species_hourly_histogram(&state.db_path, &scientific_name)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
@@ -116,10 +116,10 @@ pub async fn get_species_hourly(
 pub async fn get_species_top_recordings(
     scientific_name: String,
 ) -> Result<Vec<TopRecording>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::get_top_recordings(&state.db_path, &scientific_name, 10)
+    ddb::get_top_recordings(&state.db_path, &scientific_name, 10)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
@@ -131,11 +131,11 @@ pub async fn get_species_detections(
     model_slug: String,
     limit: u32,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut dets = db::species_detections_by_model(&state.db_path, &scientific_name, limit, slug_opt)
+    let mut dets = ddb::species_detections_by_model(&state.db_path, &scientific_name, limit, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     for det in dets.iter_mut() {
@@ -151,31 +151,12 @@ pub async fn get_species_detections(
 pub async fn get_species_models(
     scientific_name: String,
 ) -> Result<Vec<ModelInfo>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    // Re-use the general available_models query and filter to this species.
-    let conn = db::open_conn(&state.db_path)
+    ddb::get_species_models(&state.db_path, &scientific_name)
         .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    let mut rows = conn
-        .query(
-            "SELECT COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), COUNT(*) AS cnt \
-             FROM detections \
-             WHERE Sci_Name = ?1 AND COALESCE(Model_Slug, '') != '' \
-             GROUP BY Model_Slug ORDER BY cnt DESC",
-            libsql::params![scientific_name],
-        )
-        .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|e| ServerFnError::new(format!("DB error: {e}")))? {
-        out.push(ModelInfo {
-            slug: row.get::<String>(0).map_err(|e| ServerFnError::new(format!("DB error: {e}")))?,
-            name: row.get::<String>(1).map_err(|e| ServerFnError::new(format!("DB error: {e}")))?,
-        });
-    }
-    Ok(out)
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
 // ─── Page component ──────────────────────────────────────────────────────────

@@ -11,10 +11,11 @@ mod live_status;
 mod manifest;
 mod mel;
 mod model;
+mod parquet_store;
 mod reporting;
 mod spectrogram;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
@@ -125,6 +126,17 @@ fn main() -> Result<()> {
 
     // ── initialize database ──────────────────────────────────────────
     db::initialize(&config.db_path)?;
+
+    // ── initialize Parquet detection store ────────────────────────────
+    {
+        let det_dir = config.db_path.parent().unwrap_or(Path::new("/data")).join("detections");
+        let instance = if config.processing_instance.is_empty() {
+            "default"
+        } else {
+            &config.processing_instance
+        };
+        parquet_store::initialize(&det_dir, instance)?;
+    };
 
     // Register this processing instance so multi-instance deletion
     // coordination knows how many instances exist.

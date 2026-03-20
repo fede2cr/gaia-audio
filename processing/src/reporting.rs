@@ -14,6 +14,7 @@ use gaia_common::config::Config;
 use gaia_common::detection::{Detection, ParsedFileName};
 
 use crate::db;
+use crate::parquet_store;
 use crate::spectrogram::{self, Colormap, SpectrogramParams};
 use crate::ReportPayload;
 
@@ -27,6 +28,12 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
 
         if let Err(e) = process_report(&payload, &config, db_path) {
             error!("Reporting error: {e:#}");
+        }
+
+        // Flush buffered detections to Parquet so the web UI sees them
+        // promptly (instead of waiting for FLUSH_THRESHOLD accumulation).
+        if let Err(e) = parquet_store::flush() {
+            error!("Parquet flush failed: {e}");
         }
 
         // Notify capture server to delete the source file (if local)
@@ -52,6 +59,10 @@ pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path
                 );
             }
         }
+    }
+    // Flush any remaining buffered detections before the thread exits.
+    if let Err(e) = parquet_store::flush() {
+        error!("Final Parquet flush failed: {e}");
     }
     info!("Reporting thread finished");
 }
@@ -143,8 +154,7 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
 
         write_to_log(&summary, &config.recs_dir);
 
-        if let Err(e) = db::insert_detection(
-            db_path,
+        if let Err(e) = parquet_store::write_detection(
             detection,
             config.latitude,
             config.longitude,
@@ -154,7 +164,7 @@ fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> R
             &basename,
             &payload.source_node,
         ) {
-            error!("DB insert failed: {e}");
+            error!("Parquet insert failed: {e}");
         }
     }
 

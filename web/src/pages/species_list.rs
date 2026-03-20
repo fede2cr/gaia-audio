@@ -53,12 +53,12 @@ pub async fn get_all_species(
     limit: u32,
     model_slug: String,
 ) -> Result<Vec<SpeciesSummary>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut species = db::top_species_filtered(&state.db_path, limit, slug_opt)
+    let mut species = ddb::top_species_filtered(&state.db_path, limit, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 

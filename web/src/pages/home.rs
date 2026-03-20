@@ -22,11 +22,11 @@ pub async fn get_recent_detections(
     after_rowid: Option<i64>,
     model_slug: String,
 ) -> Result<Vec<WebDetection>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut detections = db::recent_detections_filtered(&state.db_path, limit, after_rowid, slug_opt)
+    let mut detections = ddb::recent_detections_filtered(&state.db_path, limit, after_rowid, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
@@ -44,7 +44,7 @@ pub async fn get_top_species(
     limit: u32,
     model_slug: String,
 ) -> Result<Vec<SpeciesSummary>, ServerFnError> {
-    use crate::server::{db, inaturalist};
+    use crate::server::{db, detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
@@ -54,7 +54,7 @@ pub async fn get_top_species(
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut species = db::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
+    let mut species = ddb::top_species_for_date_filtered(&state.db_path, &today, limit, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
