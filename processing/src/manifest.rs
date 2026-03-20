@@ -84,6 +84,18 @@ pub struct ModelSection {
     /// this; most ONNX models (e.g. Perch) accept raw audio directly.
     #[serde(default)]
     pub onnx_is_classifier: bool,
+    /// Which ONNX output tensor contains the class predictions.
+    ///
+    /// Multi-output models place predictions at different indices:
+    ///   - BirdNET V2.4:  1 output  → predictions at index **0** (default)
+    ///   - BirdNET V3.0:  2 outputs → predictions at index **1**
+    ///                    (output 0 = 1280-dim embeddings)
+    ///   - Perch V2:      4 outputs → predictions at index **3**
+    ///                    (0 = embedding, 1 = spatial_emb, 2 = spectrogram)
+    ///
+    /// Defaults to `0` for backward compatibility with single-output models.
+    #[serde(default)]
+    pub prediction_output_index: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

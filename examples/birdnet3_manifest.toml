@@ -14,7 +14,7 @@ name = "BirdNET+ V3.0"
 slug = "birdnet3"
 domain = "birds"
 sample_rate = 32000
-chunk_duration = 3.0
+chunk_duration = 5.0
 # BirdNET+ V3.0 is ONNX-only — no TFLite file needed for inference.
 # Set to a placeholder; the ONNX path takes priority when present.
 tflite_file = "model.tflite"
@@ -30,6 +30,8 @@ apply_softmax = false
 # BirdNET+ V3.0 accepts raw audio [1, N], NOT mel spectrograms.
 # Only BirdNET V2.4's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false
+# BirdNET V3.0 has 2 ONNX outputs: [0] = 1280-dim embeddings, [1] = predictions.
+prediction_output_index = 1
 
 # ── Species-range filter (reusing BirdNET V2.4 metadata model) ───────
 #

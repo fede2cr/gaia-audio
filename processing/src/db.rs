@@ -1,9 +1,21 @@
-//! SQLite database layer (via libsql / Turso).
+//! Database layer (libsql / Turso).
 //!
-//! All database access goes through the libsql crate, which uses a
-//! fork of SQLite with enhanced features.  The async API is driven by
-//! a module-level single-threaded tokio runtime so that the rest of
-//! the processing server can remain synchronous.
+//! All database access goes through the libsql crate.  A single
+//! `Database` and a single `Connection` are cached for the lifetime
+//! of the process.  Because libsql connections are `Send + Sync`,
+//! the connection can be shared across threads without a Mutex —
+//! libsql serialises writes internally and, with WAL mode, supports
+//! concurrent readers.
+//!
+//! WAL mode and `synchronous = NORMAL` are set **once** during
+//! [`initialize()`].  Regular connection access (`conn()`) never
+//! touches write-lock-requiring PRAGMAs, eliminating the
+//! "database is locked" errors that occurred when every operation
+//! tried to re-set `journal_mode=WAL`.
+//!
+//! For write-heavy paths (`insert_detection`, `mark_file_processed`)
+//! we use `BEGIN CONCURRENT` so libsql can run multiple write
+//! transactions in parallel and only serialise at commit time.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -29,26 +41,22 @@ fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-// ── Connection helper ────────────────────────────────────────────────────
+// ── Cached connection ────────────────────────────────────────────────────
 
-/// Busy-timeout in milliseconds.  30 s gives enough headroom for the
-/// web server, backup scripts, and other processing containers that
-/// may hold the write lock momentarily.
+/// Busy-timeout in milliseconds.  Applied once at connection creation.
 const BUSY_TIMEOUT_MS: u32 = 30_000;
 
-/// Cached database handle — opened once, reused for every connection.
-///
-/// Re-opening `libsql::Database` for every query is expensive (it
-/// re-opens the file descriptor, replays the WAL, etc.) and creates
-/// transient connections that may miss the `busy_timeout` PRAGMA if
-/// another process holds the write lock at open time.
+/// Cached `Database` handle — opened once, kept alive for the whole process.
 static DB: OnceLock<libsql::Database> = OnceLock::new();
 
-/// Resolve the effective database path.
+/// Cached `Connection` — created once from the cached `Database`.
+/// libsql connections are `Send + Sync`; concurrent operations are
+/// serialised internally by libsql (with `BEGIN CONCURRENT` support).
+static CONN: OnceLock<libsql::Connection> = OnceLock::new();
+
+/// Resolve the effective database URL.
 ///
-/// `TURSO_DATABASE_URL` takes precedence over the `db_path` argument
-/// (which itself comes from `DB_PATH` or the config file default).
-/// In local-only mode the URL is simply a file path.
+/// `TURSO_DATABASE_URL` takes precedence over the `db_path` argument.
 fn effective_db_path(db_path: &Path) -> String {
     std::env::var("TURSO_DATABASE_URL")
         .ok()
@@ -61,7 +69,7 @@ fn effective_db_path(db_path: &Path) -> String {
         })
 }
 
-/// Return (or lazily create) the cached `Database` for `db_path`.
+/// Return the cached `Database`, opening it on first call.
 async fn get_or_open_db(db_path: &Path) -> Result<&'static libsql::Database> {
     if let Some(db) = DB.get() {
         return Ok(db);
@@ -72,54 +80,54 @@ async fn get_or_open_db(db_path: &Path) -> Result<&'static libsql::Database> {
         .build()
         .await
         .with_context(|| format!("Cannot open database: {url}"))?;
-    // If another thread raced us, their Database wins — ours is dropped.
     let _ = DB.set(new_db);
     Ok(DB.get().expect("DB was just set"))
 }
 
-/// Open a database connection with WAL journal mode and a busy timeout.
+/// Return the cached `Connection`, creating it on first call.
 ///
-/// WAL mode allows concurrent readers alongside a single writer — the
-/// single most important setting for avoiding "database is locked" errors
-/// when the processing server, web server, and backup script all access
-/// the same database file simultaneously.
-///
-/// The busy timeout tells SQLite to retry internally (using
-/// exponential backoff) when another connection holds the write lock,
-/// instead of returning SQLITE_BUSY immediately.
-///
-/// **PRAGMA order matters:** `busy_timeout` is set *first* so that the
-/// subsequent `journal_mode=WAL` (which itself requires a write lock)
-/// can wait instead of failing immediately.
-async fn open_conn_async(db_path: &Path) -> Result<libsql::Connection> {
+/// Only sets `busy_timeout` — WAL and synchronous are configured
+/// once in [`initialize()`].
+async fn get_or_open_conn(db_path: &Path) -> Result<&'static libsql::Connection> {
+    if let Some(c) = CONN.get() {
+        return Ok(c);
+    }
     let db = get_or_open_db(db_path).await?;
-
-    let conn = db.connect().context("Cannot connect to database")?;
-
-    conn.execute_batch(&format!(
-        "PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; \
-         PRAGMA journal_mode=WAL; \
-         PRAGMA synchronous=NORMAL;"
-    ))
-    .await
-    .context("Failed to set database pragmas")?;
-
-    Ok(conn)
+    let c = db.connect().context("Cannot connect to database")?;
+    c.execute_batch(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+        .await
+        .context("Failed to set busy_timeout")?;
+    let _ = CONN.set(c);
+    Ok(CONN.get().expect("CONN was just set"))
 }
 
-/// Open a connection synchronously (blocks the calling thread).
-fn open_conn(db_path: &Path) -> Result<libsql::Connection> {
-    rt().block_on(open_conn_async(db_path))
+/// Get the cached connection (sync wrapper).  Panics if called before
+/// [`initialize()`].
+fn conn(db_path: &Path) -> Result<&'static libsql::Connection> {
+    if let Some(c) = CONN.get() {
+        return Ok(c);
+    }
+    rt().block_on(get_or_open_conn(db_path))
 }
 
-/// Like [`open_conn`] but returns `None` on failure instead of an error.
-fn open_conn_opt(db_path: &Path) -> Option<libsql::Connection> {
-    open_conn(db_path).ok()
+/// Get the cached connection, returning `None` on failure.
+fn conn_opt(db_path: &Path) -> Option<&'static libsql::Connection> {
+    conn(db_path).ok()
 }
 
-/// Public re-export for other crates in the processing workspace.
+/// Public access to the cached connection for other crates (e.g.
+/// `compress.rs`).
 pub fn open_conn_pub(db_path: &Path) -> Result<libsql::Connection> {
-    open_conn(db_path)
+    // Return a *new* connection from the same Database for callers
+    // that need their own (e.g. long-running compression loops).
+    let db = rt().block_on(get_or_open_db(db_path))?;
+    let c = db.connect().context("Cannot create connection")?;
+    rt().block_on(async {
+        c.execute_batch(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+            .await
+            .context("Failed to set busy_timeout")
+    })?;
+    Ok(c)
 }
 
 /// Execute an async operation using the module-level runtime.
@@ -154,14 +162,26 @@ pub fn is_urban_noise(sci_name: &str) -> bool {
 }
 
 /// Create the `detections` table (and indices) if it doesn't exist.
+///
+/// **Must** be called once at startup. Sets WAL mode and
+/// `synchronous=NORMAL` — no other code path needs to touch those
+/// PRAGMAs.
 pub fn initialize(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let conn = open_conn(db_path)?;
+    let conn = rt().block_on(get_or_open_conn(db_path))?;
 
     rt().block_on(async {
+        // Set WAL + synchronous once for the whole process lifetime.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL;"
+        )
+        .await
+        .context("Failed to set WAL mode")?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS detections (
@@ -255,32 +275,10 @@ async fn migrate_add_column(conn: &libsql::Connection, table: &str, column: &str
 }
 
 /// Insert a single detection row.
+///
+/// Uses `BEGIN CONCURRENT` so multiple worker threads can insert in
+/// parallel — libsql serialises only at commit time.
 pub fn insert_detection(
-    db_path: &Path,
-    detection: &Detection,
-    lat: f64,
-    lon: f64,
-    cutoff: f64,
-    sensitivity: f64,
-    overlap: f64,
-    file_name: &str,
-    source_node: &str,
-) -> Result<()> {
-    for attempt in 0..3 {
-        match try_insert(
-            db_path, detection, lat, lon, cutoff, sensitivity, overlap, file_name, source_node,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!("Database busy (attempt {attempt}): {e}");
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-        }
-    }
-    anyhow::bail!("Failed to insert detection after 3 attempts")
-}
-
-fn try_insert(
     db_path: &Path,
     d: &Detection,
     lat: f64,
@@ -291,9 +289,10 @@ fn try_insert(
     file_name: &str,
     source_node: &str,
 ) -> Result<()> {
-    let conn = open_conn(db_path)?;
+    let conn = conn(db_path)?;
     rt().block_on(async {
-        conn.execute(
+        conn.execute_batch("BEGIN CONCURRENT").await.ok();
+        let res = conn.execute(
             "INSERT INTO detections (Date, Time, Domain, Sci_Name, Com_Name, Confidence, \
              Lat, Lon, Cutoff, Week, Sens, Overlap, File_Name, Source_Node, Excluded, \
              Model_Slug, Model_Name) \
@@ -318,8 +317,13 @@ fn try_insert(
                 d.model_name.clone(),
             ],
         )
-        .await
-        .context("Failed to insert detection")?;
+        .await;
+        if res.is_ok() {
+            conn.execute_batch("COMMIT").await.ok();
+        } else {
+            conn.execute_batch("ROLLBACK").await.ok();
+        }
+        res.context("Failed to insert detection")?;
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -357,7 +361,7 @@ pub fn weeks_count_for(db_path: &Path, domain: &str, sci_name: &str) -> u32 {
 }
 
 fn _count(db_path: &Path, sql: &str, p: Vec<libsql::Value>) -> u32 {
-    let conn = match open_conn_opt(db_path) {
+    let conn = match conn_opt(db_path) {
         Some(c) => c,
         None => return 0,
     };
@@ -378,8 +382,9 @@ fn _count(db_path: &Path, sql: &str, p: Vec<libsql::Value>) -> u32 {
 /// Uses `INSERT OR REPLACE` with an UPSERT pattern so a single row is
 /// stored per (Date, Hour, Category) tuple.
 pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &str) -> Result<()> {
-    let conn = open_conn(db_path)?;
+    let conn = conn(db_path)?;
     rt().block_on(async {
+        conn.execute_batch("BEGIN CONCURRENT").await.ok();
         let result = conn.execute(
             "INSERT INTO urban_noise (Date, Hour, Category, Count) VALUES (?1, ?2, ?3, 1) \
              ON CONFLICT(Date, Hour, Category) DO UPDATE SET Count = Count + 1",
@@ -399,6 +404,7 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
                 ).await?;
             }
         }
+        conn.execute_batch("COMMIT").await.ok();
 
         Ok::<(), libsql::Error>(())
     })?;
@@ -411,7 +417,7 @@ pub fn increment_urban_noise(db_path: &Path, date: &str, hour: u32, category: &s
 /// Read a single setting from the `settings` table.
 /// Returns `None` if the table or key doesn't exist.
 pub fn get_setting(db_path: &Path, key: &str) -> Option<String> {
-    let conn = open_conn_opt(db_path)?;
+    let conn = conn_opt(db_path)?;
     rt().block_on(async {
         let mut rows = conn
             .query("SELECT value FROM settings WHERE key = ?1", params![key.to_string()])
@@ -455,7 +461,7 @@ pub fn apply_settings_overrides(config: &mut gaia_common::config::Config) {
 /// These species have been manually confirmed by an ornithologist and
 /// should bypass the species-range occurrence-threshold filter.
 pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
@@ -479,7 +485,7 @@ pub fn load_exclusion_overrides(db_path: &Path) -> Vec<String> {
 /// Register a processing instance so other instances know about it.
 /// Called once at startup.
 pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
-    let conn = open_conn(db_path)?;
+    let conn = conn(db_path)?;
     rt().block_on(async {
         conn.execute(
             "INSERT OR REPLACE INTO processing_instances (instance, registered_at, last_heartbeat) \
@@ -508,7 +514,7 @@ pub fn register_instance(db_path: &Path, instance: &str) -> Result<()> {
 /// Should be called every poll cycle so `all_instances_done` can
 /// distinguish live instances from stale ones.
 pub fn update_heartbeat(db_path: &Path, instance: &str) {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -525,7 +531,7 @@ pub fn update_heartbeat(db_path: &Path, instance: &str) {
 /// Remove processing instances whose heartbeat is older than the given
 /// threshold (in minutes).  Returns the number of pruned rows.
 pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return 0,
     };
@@ -554,7 +560,7 @@ pub fn prune_stale_instances(db_path: &Path, stale_minutes: u32) -> usize {
 /// processed in a previous run (the in-memory `dispatched` set is
 /// lost on restart, but the DB log survives).
 pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -578,71 +584,48 @@ pub fn is_file_processed(db_path: &Path, filename: &str, instance: &str) -> bool
 
 /// Record that this instance has finished processing a file.
 ///
-/// Retries up to 3 times with exponential backoff if the database is
-/// locked, to cope with transient contention from other processes.
+/// Uses `BEGIN CONCURRENT` so multiple workers can mark files
+/// concurrently without blocking each other.
 pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Result<()> {
-    const MAX_RETRIES: u32 = 3;
-    let mut last_err: Option<anyhow::Error> = None;
+    let conn = conn(db_path)?;
 
-    for attempt in 0..=MAX_RETRIES {
-        if attempt > 0 {
-            let backoff = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
-            tracing::info!(
-                "mark_file_processed: retry {attempt}/{MAX_RETRIES} for {filename} after {backoff:?}"
-            );
-            std::thread::sleep(backoff);
-        }
+    rt().block_on(async {
+        conn.execute_batch("BEGIN CONCURRENT").await.ok();
+        conn.execute(
+            "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
+            params![filename.to_string(), instance.to_string()],
+        )
+        .await?;
+        conn.execute_batch("COMMIT").await.ok();
 
-        let conn = match open_conn(db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
-
-        match rt().block_on(async {
-            conn.execute(
-                "INSERT OR IGNORE INTO file_processing_log (filename, instance) VALUES (?1, ?2)",
-                params![filename.to_string(), instance.to_string()],
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
+                params![filename.to_string()],
             )
             .await?;
+        let done: u32 = rows
+            .next()
+            .await?
+            .and_then(|r| r.get::<u32>(0).ok())
+            .unwrap_or(0);
 
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM file_processing_log WHERE filename = ?1",
-                    params![filename.to_string()],
-                )
-                .await?;
-            let done: u32 = rows
-                .next()
-                .await?
-                .and_then(|r| r.get::<u32>(0).ok())
-                .unwrap_or(0);
+        let mut rows2 = conn
+            .query("SELECT COUNT(*) FROM processing_instances", ())
+            .await?;
+        let total: u32 = rows2
+            .next()
+            .await?
+            .and_then(|r| r.get::<u32>(0).ok())
+            .unwrap_or(0);
 
-            let mut rows2 = conn
-                .query("SELECT COUNT(*) FROM processing_instances", ())
-                .await?;
-            let total: u32 = rows2
-                .next()
-                .await?
-                .and_then(|r| r.get::<u32>(0).ok())
-                .unwrap_or(0);
-
-            debug!(
-                "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
-                instance
-            );
-            Ok::<(), libsql::Error>(())
-        }) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e.into());
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("mark_file_processed failed after retries")))
+        debug!(
+            "mark_file_processed: {filename} by {:?} ({done}/{total} instances done)",
+            instance
+        );
+        Ok::<(), libsql::Error>(())
+    })?;
+    Ok(())
 }
 
 /// Check whether every **active** processing instance has processed this file.
@@ -651,7 +634,7 @@ pub fn mark_file_processed(db_path: &Path, filename: &str, instance: &str) -> Re
 /// considered.  This prevents stale / stopped containers from blocking
 /// deletion forever.
 pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return true, // fail-open: delete if we can't check
     };
@@ -708,7 +691,7 @@ pub fn all_instances_done(db_path: &Path, filename: &str) -> bool {
 
 /// Remove old entries from the processing log (files older than 1 hour).
 pub fn cleanup_processing_log(db_path: &Path) {
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -745,7 +728,7 @@ pub fn migrate_domain_classes(
         return;
     }
 
-    let conn = match open_conn(db_path) {
+    let conn = match conn(db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("migrate_domain_classes: cannot open DB: {e}");

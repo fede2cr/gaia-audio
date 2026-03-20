@@ -7,17 +7,22 @@
 //! `display_date` / `display_time` on [`WebDetection`] for the UI.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Duration, Utc};
 use libsql::params;
+use tracing::info;
 
 use crate::model::{CalendarDay, DayDetectionGroup, ExcludedSpecies, QuizItem, SpeciesInfo, SpeciesSummary, TopRecording, UrbanNoiseSummary, WebDetection,
                     HourlyCount, SpeciesHourlyCounts};
 
 // ── Turso / libsql connection helpers ───────────────────────────────────────
 
-/// Busy-timeout in milliseconds.
+/// Busy-timeout in milliseconds.  Applied once at connection creation.
 const BUSY_TIMEOUT_MS: u32 = 30_000;
+
+/// Cached `Database` handle — opened once, kept alive for the whole process.
+static DB: OnceLock<libsql::Database> = OnceLock::new();
 
 /// Resolve the database path: `TURSO_DATABASE_URL` overrides `db_path`.
 fn effective_db_url(db_path: &Path) -> Result<String, libsql::Error> {
@@ -32,12 +37,30 @@ fn effective_db_url(db_path: &Path) -> Result<String, libsql::Error> {
         .ok_or_else(|| libsql::Error::SqliteFailure(0, "Non-UTF-8 path".into()))
 }
 
-/// Open a `libsql::Database` from the effective URL.
-async fn build_db(db_path: &Path) -> Result<libsql::Database, libsql::Error> {
+/// Return the cached `Database`, opening it on first call.
+///
+/// Every connection created from this handle shares internal state,
+/// which enables libsql to coordinate concurrent writers without
+/// file-level lock contention.
+async fn get_or_open_db(db_path: &Path) -> Result<&'static libsql::Database, libsql::Error> {
+    if let Some(db) = DB.get() {
+        return Ok(db);
+    }
     let url = effective_db_url(db_path)?;
-    libsql::Builder::new_local(&url)
+    info!("Opening database: {url}");
+    let new_db = libsql::Builder::new_local(&url)
         .build()
-        .await
+        .await?;
+    let _ = DB.set(new_db);
+    Ok(DB.get().expect("DB was just set"))
+}
+
+/// Return the cached `Database` handle.
+///
+/// Public so that `import.rs` and `species.rs` can create their own
+/// connections from the shared handle.
+pub async fn get_db(db_path: &Path) -> Result<&'static libsql::Database, libsql::Error> {
+    get_or_open_db(db_path).await
 }
 
 // ─── Timezone helpers ────────────────────────────────────────────────────────
@@ -110,16 +133,13 @@ pub async fn today_for_tz_pub(db_path: &Path) -> Result<String, libsql::Error> {
     Ok(today_for_tz(tz))
 }
 
-/// Open a read-only connection with a busy timeout.
+/// Open a connection from the cached `Database` with a busy timeout.
 ///
-/// WAL mode is also set once at schema creation, but re-asserting it here
-/// is cheap (no-op when already active) and ensures every connection is
-/// consistent even if the database was reset externally.
-///
-/// Reads `TURSO_DATABASE_URL` to resolve the database location,
-/// falling back to `db_path`.
+/// WAL mode is set once at startup (`ensure_gaia_schema`), so we never
+/// touch that PRAGMA here — avoiding the write-lock that caused
+/// "database is locked" errors across containers.
 async fn open(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
-    let db = build_db(db_path).await?;
+    let db = get_or_open_db(db_path).await?;
     let conn = db.connect()?;
     conn.execute_batch(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")).await?;
     Ok(conn)
@@ -653,6 +673,7 @@ fn format_with_commas(n: u32) -> String {
 /// called once at startup and then nightly.
 pub async fn refresh_species_stats(db_path: &Path) -> Result<(), libsql::Error> {
     let conn = open_rw(db_path).await?;
+    conn.execute_batch("BEGIN CONCURRENT").await?;
 
     // Ensure the table exists (in case this runs before ensure_gaia_schema).
     conn.execute_batch(
@@ -715,6 +736,7 @@ pub async fn refresh_species_stats(db_path: &Path) -> Result<(), libsql::Error> 
          WHERE rn <= 10;",
     ).await?;
 
+    conn.execute_batch("COMMIT").await?;
     Ok(())
 }
 
@@ -1186,13 +1208,16 @@ pub async fn get_all_settings(db_path: &Path) -> Result<HashMap<String, String>,
     Ok(map)
 }
 
-/// Open a read-write connection with WAL and a busy timeout.
+/// Open a read-write connection from the cached `Database`.
+///
+/// Only sets `busy_timeout` — WAL is configured once in
+/// `ensure_gaia_schema`.  Callers that modify data should wrap
+/// their writes in `BEGIN CONCURRENT … COMMIT` so that libsql
+/// can run multiple writers in parallel across containers.
 async fn open_rw(db_path: &Path) -> Result<libsql::Connection, libsql::Error> {
-    let db = build_db(db_path).await?;
+    let db = get_or_open_db(db_path).await?;
     let conn = db.connect()?;
-    conn.execute_batch(&format!(
-        "PRAGMA busy_timeout={BUSY_TIMEOUT_MS}; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
-    )).await?;
+    conn.execute_batch(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")).await?;
     Ok(conn)
 }
 
@@ -1202,7 +1227,7 @@ pub async fn save_settings(db_path: &Path, entries: &[(&str, &str)]) -> Result<(
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     ).await;
-    conn.execute_batch("BEGIN").await?;
+    conn.execute_batch("BEGIN CONCURRENT").await?;
     for (k, v) in entries {
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) \

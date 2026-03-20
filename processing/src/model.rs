@@ -400,12 +400,13 @@ impl LoadedModel {
     ) -> Result<Vec<Prediction>> {
         // ── ORT path (GPU-accelerated or CPU fallback) ───────────────
         if let Some(ort) = &mut self.ort_session {
+            let out_idx = self.manifest.manifest.model.prediction_output_index;
             let logits = if self.onnx_classifier {
                 let mel = crate::mel::birdnet_mel_spectrogram(chunk);
-                ort.predict(mel, vec![1, 96, 511, 2])?
+                ort.predict(mel, vec![1, 96, 511, 2], out_idx)?
             } else {
                 let n = chunk.len();
-                ort.predict(chunk.to_vec(), vec![1, n])?
+                ort.predict(chunk.to_vec(), vec![1, n], out_idx)?
             };
 
             let scores = if self.manifest.manifest.model.apply_softmax {
@@ -465,7 +466,7 @@ impl LoadedModel {
                 .context("Inference failed")?
         };
 
-        let output = result[0]
+        let output = result[self.manifest.manifest.model.prediction_output_index]
             .to_array_view::<f32>()
             .context("Cannot read output tensor")?;
 

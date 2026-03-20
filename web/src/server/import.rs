@@ -82,20 +82,16 @@ async fn open_local(path: &Path) -> Result<libsql::Connection, String> {
 
 /// Open a connection to the **Gaia** database.
 ///
-/// Reads `TURSO_DATABASE_URL` to override `db_path` when set.
+/// Uses the cached `Database` handle from `db::get_db()` so that all
+/// connections (reads from the web UI, writes from imports) share the
+/// same internal state — enabling libsql to coordinate concurrent
+/// writers across containers without file-level lock contention.
 const IMPORT_BUSY_TIMEOUT_MS: u32 = 30_000;
 async fn open_gaia(db_path: &Path) -> Result<libsql::Connection, String> {
-    let url = std::env::var("TURSO_DATABASE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            db_path.to_str().unwrap_or("/data/birds.db").to_string()
-        });
-    let db = libsql::Builder::new_local(&url)
-        .build()
+    let db = super::db::get_db(db_path)
         .await
-        .map_err(|e| format!("Cannot open gaia database {url}: {e}"))?;
-    let conn = db.connect().map_err(|e| format!("Cannot connect to {url}: {e}"))?;
+        .map_err(|e| format!("Cannot open gaia database: {e}"))?;
+    let conn = db.connect().map_err(|e| format!("Cannot connect to gaia database: {e}"))?;
     conn.execute_batch(&format!("PRAGMA busy_timeout={IMPORT_BUSY_TIMEOUT_MS};"))
         .await
         .map_err(|e| format!("Pragma error: {e}"))?;
@@ -710,7 +706,7 @@ fn import_detections_from_db(
 
         let mut batch_count = 0u64;
         dst_conn
-            .execute_batch("BEGIN TRANSACTION")
+            .execute_batch("BEGIN CONCURRENT")
             .await
             .map_err(|e| format!("Transaction error: {e}"))?;
 
@@ -759,7 +755,7 @@ fn import_detections_from_db(
 
             if batch_count % 5000 == 0 {
                 dst_conn
-                    .execute_batch("COMMIT; BEGIN TRANSACTION")
+                    .execute_batch("COMMIT; BEGIN CONCURRENT")
                     .await
                     .map_err(|e| format!("Commit error: {e}"))?;
                 tracing::info!(

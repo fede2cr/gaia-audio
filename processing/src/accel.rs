@@ -126,8 +126,15 @@ impl OrtSession {
     /// Run inference on a batch of f32 input data.
     ///
     /// `input_data` is the flattened tensor; `input_shape` is its
-    /// dimensions.  Returns the raw output logits/scores.
-    pub fn predict(&mut self, input_data: Vec<f32>, input_shape: Vec<usize>) -> Result<Vec<f32>> {
+    /// dimensions.  `output_index` selects which output tensor to read
+    /// (multi-output models place predictions at a non-zero index).
+    /// Returns the raw output logits/scores.
+    pub fn predict(
+        &mut self,
+        input_data: Vec<f32>,
+        input_shape: Vec<usize>,
+        output_index: usize,
+    ) -> Result<Vec<f32>> {
         let input_name = self.session.inputs()[0].name().to_string();
 
         let shape_i64: Vec<i64> = input_shape.iter().map(|&d| d as i64).collect();
@@ -140,7 +147,13 @@ impl OrtSession {
             .run(ort::inputs![input_name => input_tensor])
             .context("ORT inference failed")?;
 
-        let (_shape, data) = outputs[0]
+        anyhow::ensure!(
+            output_index < outputs.len(),
+            "Model has {} outputs but prediction_output_index = {output_index}",
+            outputs.len()
+        );
+
+        let (_shape, data) = outputs[output_index]
             .try_extract_tensor::<f32>()
             .context("Cannot extract f32 output tensor")?;
 
