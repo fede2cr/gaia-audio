@@ -92,8 +92,16 @@ fn main() -> Result<()> {
     let mut config =
         gaia_common::config::load(&PathBuf::from(&config_path)).context("Config load failed")?;
 
+    // Short tag identifying this container's model, shown in every log line.
+    // e.g. "[birdnet3]" or "[perch]".
+    let tag: String = if config.processing_instance.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", config.processing_instance)
+    };
+
     info!(
-        "Gaia Processing Server starting (capture_url={})",
+        "{tag}Processing server starting (capture_url={})",
         config.capture_server_url
     );
 
@@ -147,7 +155,7 @@ fn main() -> Result<()> {
             &config.processing_instance
         };
         kv::register_instance(instance_id)?;
-        info!("Registered processing instance: {instance_id:?}");
+        info!("{tag}Registered processing instance: {instance_id:?}");
     }
 
     // ── discover and load models ─────────────────────────────────────
@@ -228,7 +236,7 @@ fn main() -> Result<()> {
     } else {
         let names: Vec<&str> = models.iter().map(|m| m.manifest.manifest.model.name.as_str()).collect();
         info!(
-            "{} model(s) loaded: [{}]  – each audio file will be analysed by all models",
+            "{tag}{} model(s) loaded: [{}]",
             models.len(),
             names.join(", "),
         );
@@ -243,7 +251,7 @@ fn main() -> Result<()> {
 
     let num_workers = config.processing_threads;
     info!(
-        "Processing threads: {} (set PROCESSING_THREADS to change)",
+        "{tag}Workers: {} (set PROCESSING_THREADS to change)",
         num_workers
     );
 
@@ -359,10 +367,11 @@ fn main() -> Result<()> {
             m
         };
 
+        let tag = tag.clone();
         let handle = std::thread::Builder::new()
             .name(format!("worker-{worker_id}"))
             .spawn(move || {
-                info!("Worker {worker_id} started ({} model(s))", worker_models.len());
+                info!("{tag}Worker {worker_id} ready ({} model(s))", worker_models.len());
 
                 // Build a per-worker HTTP client for deletion requests.
                 let client = reqwest::blocking::Client::builder()
@@ -381,7 +390,7 @@ fn main() -> Result<()> {
                         Err(_) => break, // channel closed → shutdown
                     };
 
-                    tracing::debug!("Worker {worker_id}: analysing {}", item.filename);
+                    tracing::debug!("{tag}W{worker_id} analysing {}", item.filename);
 
                     // ── run analysis ──────────────────────────────────
                     if let Err(e) = analysis::process_file(
@@ -392,7 +401,7 @@ fn main() -> Result<()> {
                         &item.base_url,
                     ) {
                         tracing::error!(
-                            "Worker {worker_id}: error processing {}: {e:#}",
+                            "{tag}W{worker_id} error processing {}: {e:#}",
                             item.filename
                         );
                     }
@@ -403,14 +412,14 @@ fn main() -> Result<()> {
                         &instance_id_owned,
                     ) {
                         tracing::warn!(
-                            "Worker {worker_id}: cannot mark {} as processed: {e}",
+                            "{tag}W{worker_id} cannot mark {} as processed: {e}",
                             item.filename
                         );
                     }
 
                     if crate::kv::all_instances_done(&item.filename) {
                         tracing::debug!(
-                            "Worker {worker_id}: all instances done with {} — deleting",
+                            "{tag}W{worker_id} all instances done — deleting {}",
                             item.filename
                         );
                         let url = format!(
@@ -422,20 +431,20 @@ fn main() -> Result<()> {
                                 || resp.status() == reqwest::StatusCode::NOT_FOUND =>
                             {
                                 info!(
-                                    "Worker {worker_id}: deleted {} from capture server",
+                                    "{tag}W{worker_id} deleted {}",
                                     item.filename
                                 );
                             }
                             Ok(resp) => {
                                 tracing::warn!(
-                                    "Worker {worker_id}: DELETE {} returned {}",
+                                    "{tag}W{worker_id} DELETE {} returned {}",
                                     item.filename,
                                     resp.status()
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "Worker {worker_id}: failed to delete {}: {e}",
+                                    "{tag}W{worker_id} failed to delete {}: {e}",
                                     item.filename
                                 );
                             }
@@ -443,7 +452,7 @@ fn main() -> Result<()> {
                     }
                 }
 
-                info!("Worker {worker_id} stopped");
+                info!("{tag}Worker {worker_id} stopped");
             })
             .with_context(|| format!("Cannot spawn worker-{worker_id}"))?;
 
@@ -476,6 +485,6 @@ fn main() -> Result<()> {
         dh.shutdown();
     }
 
-    info!("Gaia Processing Server stopped");
+    info!("{tag}Processing server stopped");
     Ok(())
 }
