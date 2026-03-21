@@ -14,7 +14,7 @@ name = "BirdNET+ V3.0"
 slug = "birdnet3"
 domain = "birds"
 sample_rate = 32000
-chunk_duration = 5.0
+chunk_duration = 3.0
 # BirdNET+ V3.0 is ONNX-only — no TFLite file needed for inference.
 # Set to a placeholder; the ONNX path takes priority when present.
 tflite_file = "model.tflite"
