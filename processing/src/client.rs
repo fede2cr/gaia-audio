@@ -94,6 +94,29 @@ pub fn poll_and_dispatch(
         // ── heartbeat so coordination layer knows we're alive ────
         crate::kv::update_heartbeat("default");
 
+        // ── idle when no models are enabled ──────────────────────
+        // The container stays running but does not download or
+        // process files until at least one model is activated in
+        // Settings.  The set is checked every poll interval.
+        let enabled_models = crate::kv::get_enabled_models();
+        {
+            static IDLE_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if enabled_models.is_empty() {
+                if !IDLE_LOGGED.load(Ordering::Relaxed) {
+                    info!("No models enabled — idling (container stays running)");
+                    IDLE_LOGGED.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(poll_interval);
+                continue;
+            } else if IDLE_LOGGED.swap(false, Ordering::Relaxed) {
+                info!(
+                    "Models re-enabled ({} active) — resuming polling",
+                    enabled_models.len()
+                );
+            }
+        }
+
         // ── periodic mDNS re-discovery ───────────────────────────────
         if last_discovery.elapsed() >= REDISCOVERY_INTERVAL {
             let new_urls = resolve_capture_urls(discovery, config);

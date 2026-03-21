@@ -40,12 +40,11 @@ pub fn process_file(
     // Collect the top raw predictions across models for the live feed.
     let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
-    // Read the set of enabled models from Redis.  An empty set means
-    // "all loaded models are enabled" (backward-compat / first boot).
+    // Read the set of enabled models from Redis (managed in Settings).
     let enabled = crate::kv::get_enabled_models();
 
     for model in models.iter_mut() {
-        if !enabled.is_empty() && !enabled.contains(&model.manifest.slug()) {
+        if !enabled.contains(&model.manifest.slug()) {
             debug!("Skipping disabled model: {}", model.manifest.manifest.model.name);
             continue;
         }
@@ -161,7 +160,14 @@ fn run_analysis(
             let top3: Vec<String> = preds.iter().take(3)
                 .map(|(name, conf)| format!("{name}={conf:.4}"))
                 .collect();
-            debug!("[{tag}] chunk {i}: top raw = [{}]", top3.join(", "));
+            // Log at info for the first chunk so operators always see
+            // what the model is producing.  Subsequent chunks stay at
+            // debug to avoid flooding.
+            if i == 0 {
+                info!("[{tag}] chunk {i}: top = [{}]", top3.join(", "));
+            } else {
+                debug!("[{tag}] chunk {i}: top = [{}]", top3.join(", "));
+            }
             if top.1 >= config.confidence {
                 info!(
                     "[{tag}] chunk {i}: {} ({:.1}%) ≥ threshold {:.0}%",

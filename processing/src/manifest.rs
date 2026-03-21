@@ -43,6 +43,24 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::info;
 
+/// How raw model outputs (logits) should be transformed into 0..1
+/// confidence scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScoreTransform {
+    /// BirdNET-style sigmoid:  `1/(1+exp(-sensitivity*clip(x,-20,20)))`
+    /// with scores ≤ 0.5 clamped to 0.  This is the default for
+    /// backward compatibility.
+    #[default]
+    Sigmoid,
+    /// Standard softmax normalisation across all classes.
+    Softmax,
+    /// No transformation — raw logits are clamped to 0..1 and used
+    /// as-is.  Suitable for models whose logit magnitude directly
+    /// encodes meaningfully scaled confidence (e.g. Google Perch).
+    None,
+}
+
 /// Top-level manifest structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
@@ -75,9 +93,18 @@ pub struct ModelSection {
     /// BirdNET V1 requires a metadata input tensor.
     #[serde(default)]
     pub v1_metadata: bool,
-    /// Whether to apply softmax to raw logits (e.g. Perch).
+    /// Whether to apply softmax to raw logits.
+    /// **Deprecated** — prefer `score_transform`.  Kept for backward
+    /// compatibility: when `score_transform` is unset and this is `true`,
+    /// softmax is used.
     #[serde(default)]
     pub apply_softmax: bool,
+    /// How to convert raw model logits into 0..1 confidence scores.
+    ///   - `"sigmoid"` (default): BirdNET-style flat sigmoid.
+    ///   - `"softmax"`: standard softmax across all classes.
+    ///   - `"none"`: clamp to 0..1, no transformation (Perch).
+    #[serde(default)]
+    pub score_transform: Option<ScoreTransform>,
     /// When `true`, the ONNX model is a classifier sub-model that expects
     /// a precomputed mel-spectrogram input `[1, 96, 511, 2]` instead of
     /// raw audio `[1, N]`.  Only BirdNET V2.4's extracted classifier needs

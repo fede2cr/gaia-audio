@@ -84,6 +84,10 @@ pub fn is_gpu_requested() -> bool {
 /// `new()` returns `Err` and the caller can skip this path.
 pub struct OrtSession {
     session: ort::session::Session,
+    /// Whether we have logged the output shape info (once per session).
+    shapes_logged: bool,
+    /// Whether we have logged the output data shape (once per session).
+    shape_data_logged: bool,
 }
 
 impl OrtSession {
@@ -191,7 +195,7 @@ impl OrtSession {
             kind,
         );
 
-        Ok(Self { session })
+        Ok(Self { session, shapes_logged: false, shape_data_logged: false })
     }
 
     /// Run inference on a batch of f32 input data.
@@ -207,6 +211,18 @@ impl OrtSession {
         output_index: usize,
     ) -> Result<Vec<f32>> {
         let input_name = self.session.inputs()[0].name().to_string();
+
+        // Log all output names on the first call so operators can
+        // verify the model structure (e.g. embeddings vs predictions).
+        if !self.shapes_logged {
+            self.shapes_logged = true;
+            for (i, out_meta) in self.session.outputs().iter().enumerate() {
+                info!(
+                    "ORT output[{i}]: name={:?}",
+                    out_meta.name(),
+                );
+            }
+        }
 
         let shape_i64: Vec<i64> = input_shape.iter().map(|&d| d as i64).collect();
         let input_tensor =
@@ -224,9 +240,18 @@ impl OrtSession {
             outputs.len()
         );
 
-        let (_shape, data) = outputs[output_index]
+        let (shape, data) = outputs[output_index]
             .try_extract_tensor::<f32>()
             .context("Cannot extract f32 output tensor")?;
+
+        // Log shape/len only on the first successful extraction.
+        if !self.shape_data_logged {
+            self.shape_data_logged = true;
+            info!(
+                "ORT predict: output[{output_index}] shape={shape:?}, len={}",
+                data.len()
+            );
+        }
 
         Ok(data.to_vec())
     }

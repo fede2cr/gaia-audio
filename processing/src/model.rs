@@ -57,6 +57,9 @@ pub struct LoadedModel {
     /// expects a mel-spectrogram input `[1, 96, 511, 2]` instead of raw
     /// audio `[1, N]`.  The mel computation is handled by [`crate::mel`].
     onnx_classifier: bool,
+    /// One-time diagnostic flag: log raw logit statistics on the first
+    /// inference so operators can verify the model's output scale.
+    first_predict_logged: bool,
 }
 
 /// Species-occurrence metadata model (filters by location/week).
@@ -301,6 +304,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         manifest: resolved.clone(),
         sensitivity,
         onnx_classifier,
+        first_predict_logged: false,
     })
 }
 
@@ -409,11 +413,8 @@ impl LoadedModel {
                 ort.predict(chunk.to_vec(), vec![1, n], out_idx)?
             };
 
-            let scores = if self.manifest.manifest.model.apply_softmax {
-                softmax(&logits)
-            } else {
-                self.scale_logits(&logits)
-            };
+            self.log_first_prediction(&logits);
+            let scores = self.transform_scores(&logits);
 
             let mut predictions: Vec<Prediction> = self
                 .labels
@@ -471,11 +472,8 @@ impl LoadedModel {
             .context("Cannot read output tensor")?;
 
         let logits: Vec<f32> = output.iter().copied().collect();
-        let scores = if self.manifest.manifest.model.apply_softmax {
-            softmax(&logits)
-        } else {
-            self.scale_logits(&logits)
-        };
+        self.log_first_prediction(&logits);
+        let scores = self.transform_scores(&logits);
 
         let mut predictions: Vec<Prediction> = self
             .labels
@@ -488,6 +486,90 @@ impl LoadedModel {
         Ok(predictions)
     }
 
+    /// Log raw logit statistics once per model so operators can verify
+    /// the model's output scale and diagnose zero-detection issues.
+    fn log_first_prediction(&mut self, logits: &[f32]) {
+        if self.first_predict_logged {
+            return;
+        }
+        self.first_predict_logged = true;
+
+        let name = &self.manifest.manifest.model.name;
+        let n_logits = logits.len();
+        let n_labels = self.labels.len();
+        let transform = self.effective_transform();
+
+        if logits.is_empty() {
+            info!("[{name}] First inference: 0 logits (model produced no output!)");
+            return;
+        }
+
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_logit = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+        let positive = logits.iter().filter(|&&x| x > 0.0).count();
+
+        // Top-5 raw logits (before any transform).
+        let mut sorted: Vec<f32> = logits.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top5: Vec<String> = sorted.iter().take(5).map(|x| format!("{x:.4}")).collect();
+
+        info!(
+            "[{name}] First inference: {n_logits} logits, {n_labels} labels, \
+             range=[{min_logit:.4}, {max_logit:.4}], {positive} positive, \
+             top5=[{}], transform={transform:?}",
+            top5.join(", ")
+        );
+
+        // Also show what the transform does to the top logit.
+        let top_score = match transform {
+            crate::manifest::ScoreTransform::Sigmoid => {
+                let s = self.sensitivity as f32;
+                let c = max_logit.clamp(-20.0, 20.0);
+                let raw = 1.0 / (1.0 + (-s * c).exp());
+                if raw <= 0.5 { 0.0 } else { raw }
+            }
+            crate::manifest::ScoreTransform::Softmax => {
+                // softmax top would need all logits; just note the transform
+                f32::NAN
+            }
+            crate::manifest::ScoreTransform::None => max_logit.clamp(0.0, 1.0),
+        };
+        if !top_score.is_nan() {
+            info!(
+                "[{name}] Top logit {max_logit:.4} → score {top_score:.4} \
+                 (sensitivity={:.2})",
+                self.sensitivity,
+            );
+        }
+    }
+
+    /// Resolve which score transform to use for this model.
+    ///
+    /// Priority: `score_transform` field > legacy `apply_softmax` bool > sigmoid default.
+    fn effective_transform(&self) -> crate::manifest::ScoreTransform {
+        use crate::manifest::ScoreTransform;
+        if let Some(t) = self.manifest.manifest.model.score_transform {
+            return t;
+        }
+        if self.manifest.manifest.model.apply_softmax {
+            return ScoreTransform::Softmax;
+        }
+        ScoreTransform::Sigmoid
+    }
+
+    /// Transform raw model logits into 0..1 confidence scores.
+    fn transform_scores(&self, logits: &[f32]) -> Vec<f32> {
+        use crate::manifest::ScoreTransform;
+        match self.effective_transform() {
+            ScoreTransform::Softmax => softmax(logits),
+            ScoreTransform::Sigmoid => self.sigmoid_scale(logits),
+            ScoreTransform::None => {
+                // Clamp raw logits to [0, 1].
+                logits.iter().map(|&x| x.clamp(0.0, 1.0)).collect()
+            }
+        }
+    }
+
     /// Apply sigmoid scaling with sensitivity.
     ///
     /// Matches BirdNET-Analyzer `flat_sigmoid`:
@@ -498,7 +580,7 @@ impl LoadedModel {
     /// mathematical "no signal" baseline, so anything at or below it
     /// carries no positive information and should not be treated as a
     /// detection at any confidence threshold.
-    fn scale_logits(&self, logits: &[f32]) -> Vec<f32> {
+    fn sigmoid_scale(&self, logits: &[f32]) -> Vec<f32> {
         let s = self.sensitivity as f32;
         logits
             .iter()
