@@ -33,7 +33,7 @@ tracing-subscriber  = { version = "0.3", features = ["env-filter"], optional = t
 libsql              = { version = "0.9", default-features = false, features = ["core"], optional = true }
 duckdb              = { version = "1", features = ["bundled"], optional = true }
 redis               = { workspace = true, optional = true }
-reqwest             = { version = "0.12", features = ["json"], optional = true }
+reqwest             = { version = "0.13", features = ["json"], optional = true }
 chrono              = { version = "0.4", optional = true }
 http                = { version = "1", optional = true }
 tar                 = { version = "0.4.45", optional = true }

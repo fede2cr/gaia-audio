@@ -13,4 +13,5 @@ chrono.workspace = true
 tracing.workspace = true
 hound.workspace = true
 rubato.workspace = true
+audioadapter-buffers.workspace = true
 mdns-sd.workspace = true

@@ -39,7 +39,7 @@ pub async fn initialize() -> Result<(), String> {
     let max_backoff = std::time::Duration::from_secs(30);
     let conn = loop {
         attempt += 1;
-        match client.get_multiplexed_tokio_connection().await {
+        match client.get_multiplexed_async_connection().await {
             Ok(c) => break c,
             Err(e) => {
                 if attempt == 1 {

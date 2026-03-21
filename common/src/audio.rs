@@ -7,7 +7,8 @@
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
-use rubato::{FftFixedIn, Resampler};
+use rubato::{Fft, FixedSync, Resampler};
+use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use tracing::{debug, info};
 
 /// Read a WAV file, convert to mono f32, resample to `target_sr`, and split
@@ -81,33 +82,24 @@ fn resample(input: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
     let chunk_size = 1024;
     let sub_chunks = 2;
     let mut resampler =
-        FftFixedIn::<f64>::new(sr_in as usize, sr_out as usize, chunk_size, sub_chunks, 1)
+        Fft::<f64>::new(sr_in as usize, sr_out as usize, chunk_size, sub_chunks, 1, FixedSync::Input)
             .context("Failed to create resampler")?;
 
-    let mut output: Vec<f64> = Vec::with_capacity(
-        (input_f64.len() as f64 * sr_out as f64 / sr_in as f64) as usize + chunk_size,
-    );
+    let input_len = input_f64.len();
+    let input_data = vec![input_f64];
+    let input_buf = SequentialSliceOfVecs::new(&input_data, 1, input_len)
+        .context("Failed to create input buffer")?;
 
-    let frames_needed = resampler.input_frames_next();
-    let mut pos = 0;
-    while pos + frames_needed <= input_f64.len() {
-        let chunk = &input_f64[pos..pos + frames_needed];
-        let result = resampler
-            .process(&[chunk.to_vec()], None)
-            .context("Resampler error")?;
-        output.extend_from_slice(&result[0]);
-        pos += frames_needed;
-    }
+    let output_len = resampler.process_all_needed_output_len(input_len);
+    let mut output_data = vec![vec![0.0f64; output_len]; 1];
+    let mut output_buf = SequentialSliceOfVecs::new_mut(&mut output_data, 1, output_len)
+        .context("Failed to create output buffer")?;
 
-    if pos < input_f64.len() {
-        let remaining = &input_f64[pos..];
-        let result = resampler
-            .process_partial(Some(&[remaining.to_vec()]), None)
-            .context("Resampler partial error")?;
-        output.extend_from_slice(&result[0]);
-    }
+    let (_nbr_in, nbr_out) = resampler
+        .process_all_into_buffer(&input_buf, &mut output_buf, input_len, None)
+        .context("Resampler error")?;
 
-    Ok(output.into_iter().map(|s| s as f32).collect())
+    Ok(output_data[0][..nbr_out].iter().map(|&s| s as f32).collect())
 }
 
 /// Split a signal into overlapping chunks, zero-padding the last one if

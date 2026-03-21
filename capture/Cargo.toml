@@ -21,5 +21,4 @@ axum.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower-http.workspace = true
-notify.workspace = true
 ctrlc.workspace = true

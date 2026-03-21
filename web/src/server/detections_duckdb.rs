@@ -41,6 +41,23 @@ static DUCK: OnceLock<Mutex<duckdb::Connection>> = OnceLock::new();
 /// Directory where Parquet files live.
 static DET_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Epoch‐second when the view was last refreshed (throttled to avoid
+/// re-creating the Parquet glob view on every single HTTP request).
+static VIEW_REFRESHED_AT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Minimum seconds between view refreshes.
+const VIEW_REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// Whether the in-memory stats cache tables have been populated.
+static STATS_POPULATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of `.parquet` files at the last stats cache build.
+/// Used to auto-detect new detections and invalidate the cache.
+static PARQUET_FILE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Initialise the DuckDB read layer.
 ///
 /// * `detections_dir` — path to the directory containing `*.parquet` files
@@ -66,11 +83,59 @@ pub fn initialize(detections_dir: &Path) -> Result<(), duckdb::Error> {
 }
 
 /// Re-create the `detections` view so newly-written Parquet files are
-/// visible.  Called automatically before every query.
+/// visible.  Throttled: skips the refresh if the last one was less than
+/// `VIEW_REFRESH_INTERVAL_SECS` ago to avoid repeating the directory scan
+/// and `CREATE OR REPLACE VIEW` on every HTTP request.
 fn refresh_view(conn: &duckdb::Connection) {
-    if let Some(dir) = DET_DIR.get() {
-        let _ = refresh_view_inner(conn, dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prev = VIEW_REFRESHED_AT.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(prev) < VIEW_REFRESH_INTERVAL_SECS {
+        return; // recently refreshed — skip
     }
+    if let Some(dir) = DET_DIR.get() {
+        if refresh_view_inner(conn, dir).is_ok() {
+            VIEW_REFRESHED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+
+            // Auto‐detect new Parquet files and invalidate the stats cache
+            // so the species / excluded pages pick up fresh data.
+            let file_count = count_parquet_files(dir);
+            let prev_count = PARQUET_FILE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            if file_count != prev_count && prev_count != 0 {
+                // New files appeared (or old ones removed); stats are stale.
+                STATS_POPULATED.store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    "Parquet file count changed ({prev_count} → {file_count}), stats cache invalidated"
+                );
+            }
+            PARQUET_FILE_COUNT.store(file_count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Count `.parquet` files in a directory (non-recursive, fast).
+fn count_parquet_files(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path().extension().map(|x| x == "parquet").unwrap_or(false)
+                })
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// Force a view refresh on the next `conn()` call, regardless of throttle.
+pub fn invalidate_view() {
+    VIEW_REFRESHED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Check whether the in-memory stats cache is currently populated.
+pub fn stats_populated() -> bool {
+    STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn refresh_view_inner(conn: &duckdb::Connection, dir: &Path) -> Result<(), duckdb::Error> {
@@ -116,6 +181,18 @@ fn conn() -> Result<std::sync::MutexGuard<'static, duckdb::Connection>, String> 
         .map_err(|e| format!("DuckDB lock poisoned: {e}"))?;
     refresh_view(&guard);
     Ok(guard)
+}
+
+/// Get a lock on the DuckDB connection **without** refreshing the view.
+///
+/// Used by functions that only read from the in-memory cache tables
+/// (`species_stats`, `excluded_species_stats`, etc.) and don't need the
+/// Parquet view to be up-to-date.
+fn conn_raw() -> Result<std::sync::MutexGuard<'static, duckdb::Connection>, String> {
+    DUCK.get()
+        .ok_or("DuckDB not initialised")?
+        .lock()
+        .map_err(|e| format!("DuckDB lock poisoned: {e}"))
 }
 
 /// Shorthand error type used in this module.
@@ -548,6 +625,30 @@ pub async fn top_species_filtered(
     limit: u32,
     model_slug: Option<&str>,
 ) -> Res<Vec<SpeciesSummary>> {
+    let has_model_filter = matches!(model_slug, Some(s) if !s.is_empty());
+
+    // ── Fast path: read from in-memory cache tables ──────────────────
+    if STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
+        if has_model_filter {
+            let safe = model_slug.unwrap().replace('\'', "''");
+            let duck = conn_raw()?;
+            let sql = format!(
+                "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
+                 FROM model_species_stats \
+                 WHERE Model_Slug = '{safe}' \
+                 ORDER BY detection_count DESC LIMIT {limit}"
+            );
+            return read_species_summaries(&duck, &sql);
+        }
+        let duck = conn_raw()?;
+        let sql = format!(
+            "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
+             FROM species_stats ORDER BY detection_count DESC LIMIT {limit}"
+        );
+        return read_species_summaries(&duck, &sql);
+    }
+
+    // ── Slow path: full scan (cache not yet populated) ───────────────
     let overrides = read_overrides(db_path).await;
     let excl = exclusion_clause(&overrides);
     let slug_filter = match model_slug {
@@ -562,7 +663,16 @@ pub async fn top_species_filtered(
          WHERE {excl} {slug_filter} \
          GROUP BY d.Sci_Name, d.Com_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
     );
-    let mut stmt = duck.prepare(&sql)?;
+    read_species_summaries(&duck, &sql)
+}
+
+/// Helper: execute a query returning (Sci_Name, Com_Name, Domain, count, last_seen)
+/// and map to `SpeciesSummary`.
+fn read_species_summaries(
+    duck: &duckdb::Connection,
+    sql: &str,
+) -> Res<Vec<SpeciesSummary>> {
+    let mut stmt = duck.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
         let count: u32 = row.get(3)?;
         Ok(SpeciesSummary {
@@ -676,8 +786,37 @@ pub async fn species_detections_by_model(
 
 /// Excluded species summary.
 pub async fn excluded_species(db_path: &Path) -> Res<Vec<ExcludedSpecies>> {
-    // Also read overrides from SQLite to show override status.
     let overrides = read_overrides(db_path).await;
+
+    // ── Fast path: use in-memory cache table ─────────────────────────
+    if STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
+        let duck = conn_raw()?;
+        let sql = "SELECT Sci_Name, Com_Name, Domain, detection_count, \
+                   last_seen, max_confidence \
+                   FROM excluded_species_stats \
+                   ORDER BY detection_count DESC";
+        let mut stmt = duck.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let sci: String = row.get(0)?;
+            Ok(ExcludedSpecies {
+                scientific_name: sci.clone(),
+                common_name: row.get(1)?,
+                domain: row.get(2)?,
+                detection_count: row.get(3)?,
+                last_seen: row.get(4)?,
+                max_confidence: row.get(5)?,
+                image_url: None,
+                overridden: false,
+            })
+        })?;
+        let mut results: Vec<ExcludedSpecies> = rows.filter_map(|r| r.ok()).collect();
+        for es in &mut results {
+            es.overridden = overrides.contains(&es.scientific_name);
+        }
+        return Ok(results);
+    }
+
+    // ── Slow path: full scan ─────────────────────────────────────────
     let duck = conn()?;
     let sql = "SELECT Sci_Name, Com_Name, Domain, \
                COUNT(*) AS cnt, \
@@ -698,7 +837,7 @@ pub async fn excluded_species(db_path: &Path) -> Res<Vec<ExcludedSpecies>> {
             last_seen: row.get(4)?,
             max_confidence: row.get(5)?,
             image_url: None,
-            overridden: false, // set below
+            overridden: false,
         })
     })?;
     let mut results: Vec<ExcludedSpecies> = rows.filter_map(|r| r.ok()).collect();
@@ -740,9 +879,14 @@ pub async fn excluded_detections_for_species(
 pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
     let overrides = read_overrides(db_path).await;
     let excl = exclusion_clause(&overrides);
+
+    // Force a fresh view so the cache picks up the latest Parquet files.
+    invalidate_view();
     let duck = conn()?;
 
-    // species_stats
+    let t0 = std::time::Instant::now();
+
+    // species_stats — used by the species list page (all models).
     duck.execute_batch(&format!(
         "CREATE OR REPLACE TABLE species_stats AS \
          SELECT Sci_Name, Com_Name, Domain, COUNT(*) AS detection_count, \
@@ -751,6 +895,30 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
          WHERE {excl} \
          GROUP BY Sci_Name, Com_Name, Domain",
     ))?;
+
+    // model_species_stats — used by the species list page (model filter).
+    duck.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE model_species_stats AS \
+         SELECT COALESCE(d.Model_Slug, '') AS Model_Slug, \
+                d.Sci_Name, d.Com_Name, d.Domain, \
+                COUNT(*) AS detection_count, \
+                MAX(d.Date || ' ' || d.Time) AS last_seen \
+         FROM detections d \
+         WHERE {excl} AND COALESCE(d.Model_Slug, '') != '' \
+         GROUP BY d.Model_Slug, d.Sci_Name, d.Com_Name, d.Domain",
+    ))?;
+
+    // excluded_species_stats — used by the excluded species page.
+    duck.execute_batch(
+        "CREATE OR REPLACE TABLE excluded_species_stats AS \
+         SELECT Sci_Name, Com_Name, Domain, \
+                COUNT(*) AS detection_count, \
+                MAX(Date || ' ' || Time) AS last_seen, \
+                MAX(Confidence) AS max_confidence \
+         FROM detections \
+         WHERE COALESCE(Excluded, 0) = 1 \
+         GROUP BY Sci_Name, Com_Name, Domain",
+    )?;
 
     // species_top_recordings (top 10 per species by confidence)
     duck.execute_batch(&format!(
@@ -768,12 +936,32 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
          ) WHERE rn <= 10"
     ))?;
 
+    STATS_POPULATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Record current file count so the view-refresh auto-detect
+    // doesn't immediately re-invalidate.
+    if let Some(dir) = DET_DIR.get() {
+        PARQUET_FILE_COUNT.store(count_parquet_files(dir), std::sync::atomic::Ordering::Relaxed);
+    }
+    info!("Species stats cache refreshed in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Notify the DuckDB layer that new detections have been written.
+///
+/// This invalidates the Parquet view throttle and triggers an async
+/// cache refresh so the species / excluded pages see the new data
+/// within a few seconds rather than waiting for the nightly rebuild.
+pub async fn notify_new_detections(db_path: &Path) {
+    invalidate_view();
+    // Refresh cache tables in the background.  Errors are non-fatal.
+    if let Err(e) = refresh_species_stats(db_path).await {
+        tracing::warn!("Post-detection stats refresh failed: {e}");
+    }
 }
 
 /// Quiz candidates — high-confidence, unambiguous detections for learning.
 pub async fn quiz_candidates(
-    db_path: &Path,
+    _db_path: &Path,
     today_only: bool,
 ) -> Res<Vec<QuizItem>> {
     let today = super::kv::today_for_tz()

@@ -532,6 +532,10 @@ impl LoadedModel {
                 // softmax top would need all logits; just note the transform
                 f32::NAN
             }
+            crate::manifest::ScoreTransform::PlainSigmoid => {
+                let c = max_logit.clamp(-20.0, 20.0);
+                1.0 / (1.0 + (-c).exp())
+            }
             crate::manifest::ScoreTransform::None => max_logit.clamp(0.0, 1.0),
         };
         if !top_score.is_nan() {
@@ -563,6 +567,7 @@ impl LoadedModel {
         match self.effective_transform() {
             ScoreTransform::Softmax => softmax(logits),
             ScoreTransform::Sigmoid => self.sigmoid_scale(logits),
+            ScoreTransform::PlainSigmoid => plain_sigmoid(logits),
             ScoreTransform::None => {
                 // Clamp raw logits to [0, 1].
                 logits.iter().map(|&x| x.clamp(0.0, 1.0)).collect()
@@ -611,6 +616,21 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|&e| e / sum).collect()
+}
+
+// ── plain sigmoid ────────────────────────────────────────────────────────
+
+/// Standard sigmoid `1 / (1 + exp(-x))` without BirdNET sensitivity
+/// scaling or baseline clamping.  Clamps the input to [-20, 20] to
+/// avoid float overflow.
+fn plain_sigmoid(logits: &[f32]) -> Vec<f32> {
+    logits
+        .iter()
+        .map(|&x| {
+            let clamped = x.clamp(-20.0, 20.0);
+            1.0 / (1.0 + (-clamped).exp())
+        })
+        .collect()
 }
 
 // ── metadata model ───────────────────────────────────────────────────────

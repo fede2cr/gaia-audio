@@ -46,7 +46,7 @@ use tracing::info;
 /// How raw model outputs (logits) should be transformed into 0..1
 /// confidence scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ScoreTransform {
     /// BirdNET-style sigmoid:  `1/(1+exp(-sensitivity*clip(x,-20,20)))`
     /// with scores ≤ 0.5 clamped to 0.  This is the default for
@@ -55,9 +55,17 @@ pub enum ScoreTransform {
     Sigmoid,
     /// Standard softmax normalisation across all classes.
     Softmax,
+    /// Standard sigmoid `1/(1+exp(-x))` without BirdNET sensitivity
+    /// scaling or baseline clamping.  Maps any real-valued logit to
+    /// (0, 1) while preserving relative ordering.
+    ///
+    /// Use for models whose raw logits span a wide range and need a
+    /// principled probability mapping (e.g. Google Perch 2.0, whose
+    /// strong-detection logits often exceed 1.0).
+    PlainSigmoid,
     /// No transformation — raw logits are clamped to 0..1 and used
-    /// as-is.  Suitable for models whose logit magnitude directly
-    /// encodes meaningfully scaled confidence (e.g. Google Perch).
+    /// as-is.  Only suitable when the model already outputs values in
+    /// the 0..1 range.
     None,
 }
 

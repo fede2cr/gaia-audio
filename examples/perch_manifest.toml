@@ -24,11 +24,14 @@ labels_file = "labels.csv"
 v1_metadata = false
 # Perch outputs raw logits whose magnitude directly encodes confidence.
 # The official Perch code thresholds raw logits (typically > 1.0).
-# Use score_transform = "none" to clamp logits to 0..1 without sigmoid
-# distortion.  DO NOT use softmax: with ~15K classes it squashes even
-# strong detections to near-zero.
+# Use score_transform = "plain_sigmoid" to map logits through a standard
+# sigmoid — this preserves relative ordering and gives meaningful 0..1
+# confidence without the BirdNET sensitivity parameter.
+# DO NOT use softmax: with ~15K classes it squashes even strong
+# detections to near-zero.
+# DO NOT use "none": raw logits > 1.0 get clamped to 1.0 (100%).
 apply_softmax = false
-score_transform = "none"
+score_transform = "plain_sigmoid"
 # Perch's ONNX model accepts raw audio [1, N], NOT mel spectrograms.
 # Only BirdNET's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false
