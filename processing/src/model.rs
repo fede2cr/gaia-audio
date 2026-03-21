@@ -712,9 +712,15 @@ fn load_labels(
         let mut lines = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
         let first = lines.next().unwrap_or("");
         let lower_first = first.to_lowercase();
+        // Recognised header prefixes (BirdNET, Perch, general CSV).
+        // Also treat single-token lines without a space as non-species
+        // headers (e.g. Perch's "inat2024_fsd50k" dataset identifier),
+        // since valid scientific names are always binomial ("Genus species").
         let is_header = lower_first.starts_with("ebird")
             || lower_first.starts_with("species")
-            || lower_first.starts_with("idx");
+            || lower_first.starts_with("idx")
+            || lower_first.starts_with("inat")
+            || (!first.contains(delim) && !first.contains(' '));
 
         // Find the column index for sci_name (or use 0 as default).
         let sci_col = if is_header {

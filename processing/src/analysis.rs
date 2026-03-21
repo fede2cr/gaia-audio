@@ -40,7 +40,15 @@ pub fn process_file(
     // Collect the top raw predictions across models for the live feed.
     let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
+    // Read the set of enabled models from Redis.  An empty set means
+    // "all loaded models are enabled" (backward-compat / first boot).
+    let enabled = crate::kv::get_enabled_models();
+
     for model in models.iter_mut() {
+        if !enabled.is_empty() && !enabled.contains(&model.manifest.slug()) {
+            debug!("Skipping disabled model: {}", model.manifest.manifest.model.name);
+            continue;
+        }
         let (detections, top_preds) = run_analysis(&file, model, config)?;
         all_detections.extend(detections);
         live_predictions.extend(top_preds);

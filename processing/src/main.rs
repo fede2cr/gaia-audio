@@ -92,16 +92,8 @@ fn main() -> Result<()> {
     let mut config =
         gaia_common::config::load(&PathBuf::from(&config_path)).context("Config load failed")?;
 
-    // Short tag identifying this container's model, shown in every log line.
-    // e.g. "[birdnet3]" or "[perch]".
-    let tag: String = if config.processing_instance.is_empty() {
-        String::new()
-    } else {
-        format!("[{}] ", config.processing_instance)
-    };
-
     info!(
-        "{tag}Processing server starting (capture_url={})",
+        "Processing server starting (capture_url={})",
         config.capture_server_url
     );
 
@@ -138,39 +130,17 @@ fn main() -> Result<()> {
     // ── initialize Parquet detection store ────────────────────────────
     {
         let det_dir = config.db_path.parent().unwrap_or(Path::new("/data")).join("detections");
-        let instance = if config.processing_instance.is_empty() {
-            "default"
-        } else {
-            &config.processing_instance
-        };
-        parquet_store::initialize(&det_dir, instance)?;
+        parquet_store::initialize(&det_dir, "default")?;
     };
 
-    // Register this processing instance so multi-instance deletion
-    // coordination knows how many instances exist.
+    // Register this processing instance for coordination.
     {
-        let instance_id = if config.processing_instance.is_empty() {
-            "default"
-        } else {
-            &config.processing_instance
-        };
-        kv::register_instance(instance_id)?;
-        info!("{tag}Registered processing instance: {instance_id:?}");
+        kv::register_instance("default")?;
+        info!("Registered processing instance: \"default\"");
     }
 
     // ── discover and load models ─────────────────────────────────────
     let mut manifests = manifest::discover_manifests(&config.model_dir)?;
-
-    // Filter to only the model slugs requested via MODEL_SLUGS (if set).
-    if !config.model_slugs.is_empty() {
-        let before = manifests.len();
-        manifests.retain(|m| config.model_slugs.contains(&m.slug()));
-        info!(
-            "MODEL_SLUGS filter: {before} manifests discovered, {} retained ({:?})",
-            manifests.len(),
-            config.model_slugs,
-        );
-    }
 
     // ── auto-download models from Zenodo if needed ───────────────────
     for m in &mut manifests {
@@ -236,7 +206,7 @@ fn main() -> Result<()> {
     } else {
         let names: Vec<&str> = models.iter().map(|m| m.manifest.manifest.model.name.as_str()).collect();
         info!(
-            "{tag}{} model(s) loaded: [{}]",
+            "{} model(s) loaded: [{}]",
             models.len(),
             names.join(", "),
         );
@@ -251,7 +221,7 @@ fn main() -> Result<()> {
 
     let num_workers = config.processing_threads;
     info!(
-        "{tag}Workers: {} (set PROCESSING_THREADS to change)",
+        "Workers: {} (set PROCESSING_THREADS to change)",
         num_workers
     );
 
@@ -332,11 +302,6 @@ fn main() -> Result<()> {
     for worker_id in 0..num_workers {
         let report_tx = report_tx.clone();
         let work_rx = work_rx.clone();
-        let instance_id_owned = if config.processing_instance.is_empty() {
-            "default".to_string()
-        } else {
-            config.processing_instance.clone()
-        };
 
         let mut worker_models = if worker_id == 0 {
             // First worker reuses the models already loaded above.
@@ -367,11 +332,10 @@ fn main() -> Result<()> {
             m
         };
 
-        let tag = tag.clone();
         let handle = std::thread::Builder::new()
             .name(format!("worker-{worker_id}"))
             .spawn(move || {
-                info!("{tag}Worker {worker_id} ready ({} model(s))", worker_models.len());
+                info!("Worker {worker_id} ready ({} model(s))", worker_models.len());
 
                 // Build a per-worker HTTP client for deletion requests.
                 let client = reqwest::blocking::Client::builder()
@@ -390,7 +354,7 @@ fn main() -> Result<()> {
                         Err(_) => break, // channel closed → shutdown
                     };
 
-                    tracing::debug!("{tag}W{worker_id} analysing {}", item.filename);
+                    tracing::debug!("W{worker_id} analysing {}", item.filename);
 
                     // ── run analysis ──────────────────────────────────
                     if let Err(e) = analysis::process_file(
@@ -401,58 +365,44 @@ fn main() -> Result<()> {
                         &item.base_url,
                     ) {
                         tracing::error!(
-                            "{tag}W{worker_id} error processing {}: {e:#}",
+                            "W{worker_id} error processing {}: {e:#}",
                             item.filename
                         );
                     }
 
-                    // ── coordinate multi-instance deletion ───────────
-                    if let Err(e) = crate::kv::mark_file_processed(
-                        &item.filename,
-                        &instance_id_owned,
-                    ) {
-                        tracing::warn!(
-                            "{tag}W{worker_id} cannot mark {} as processed: {e}",
-                            item.filename
-                        );
-                    }
-
-                    if crate::kv::all_instances_done(&item.filename) {
-                        tracing::debug!(
-                            "{tag}W{worker_id} all instances done — deleting {}",
-                            item.filename
-                        );
-                        let url = format!(
-                            "{}/api/recordings/{}",
-                            item.base_url, item.filename
-                        );
-                        match client.delete(&url).send() {
-                            Ok(resp) if resp.status().is_success()
-                                || resp.status() == reqwest::StatusCode::NOT_FOUND =>
-                            {
-                                info!(
-                                    "{tag}W{worker_id} deleted {}",
-                                    item.filename
-                                );
-                            }
-                            Ok(resp) => {
-                                tracing::warn!(
-                                    "{tag}W{worker_id} DELETE {} returned {}",
-                                    item.filename,
-                                    resp.status()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "{tag}W{worker_id} failed to delete {}: {e}",
-                                    item.filename
-                                );
-                            }
+                    // ── delete recording from capture server ─────────
+                    // Single processing container: delete immediately
+                    // after analysis (no multi-instance coordination).
+                    let url = format!(
+                        "{}/api/recordings/{}",
+                        item.base_url, item.filename
+                    );
+                    match client.delete(&url).send() {
+                        Ok(resp) if resp.status().is_success()
+                            || resp.status() == reqwest::StatusCode::NOT_FOUND =>
+                        {
+                            info!(
+                                "W{worker_id} deleted {}",
+                                item.filename
+                            );
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "W{worker_id} DELETE {} returned {}",
+                                item.filename,
+                                resp.status()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "W{worker_id} failed to delete {}: {e}",
+                                item.filename
+                            );
                         }
                     }
                 }
 
-                info!("{tag}Worker {worker_id} stopped");
+                info!("Worker {worker_id} stopped");
             })
             .with_context(|| format!("Cannot spawn worker-{worker_id}"))?;
 
@@ -485,6 +435,6 @@ fn main() -> Result<()> {
         dh.shutdown();
     }
 
-    info!("{tag}Processing server stopped");
+    info!("Processing server stopped");
     Ok(())
 }

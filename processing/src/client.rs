@@ -91,13 +91,8 @@ pub fn poll_and_dispatch(
         // ── refresh settings from DB ─────────────────────────────
         crate::kv::apply_settings_overrides(config);
 
-        // ── heartbeat so other instances know we're alive ────────
-        let instance_id = if config.processing_instance.is_empty() {
-            "default"
-        } else {
-            &config.processing_instance
-        };
-        crate::kv::update_heartbeat(instance_id);
+        // ── heartbeat so coordination layer knows we're alive ────
+        crate::kv::update_heartbeat("default");
 
         // ── periodic mDNS re-discovery ───────────────────────────────
         if last_discovery.elapsed() >= REDISCOVERY_INTERVAL {
@@ -147,13 +142,8 @@ pub fn poll_and_dispatch(
 
                 // Skip files this instance already processed in a previous
                 // run.  The dispatched HashSet is in-memory only and lost on
-                // restart, but the file_processing_log table persists.
-                let instance_id = if config.processing_instance.is_empty() {
-                    "default"
-                } else {
-                    &config.processing_instance
-                };
-                if crate::kv::is_file_processed(&rec.filename, instance_id) {
+                // restart, but the Redis processed set persists (with TTL).
+                if crate::kv::is_file_processed(&rec.filename, "default") {
                     debug!(
                         "[{}] Skipping {} — already processed by this instance",
                         base_url, rec.filename

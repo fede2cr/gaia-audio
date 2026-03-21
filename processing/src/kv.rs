@@ -113,9 +113,6 @@ where
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// TTL for `processed:{filename}` sets — 1 hour (matches old cleanup).
-const PROCESSED_TTL_SECS: i64 = 3600;
-
 /// TTL for daily urban-noise counters — 30 days.
 const URBAN_NOISE_DAY_TTL_SECS: i64 = 30 * 24 * 3600;
 
@@ -199,52 +196,6 @@ pub fn is_file_processed(filename: &str, instance: &str) -> bool {
     with_retry(|c| c.sismember(&key, instance)).unwrap_or(false)
 }
 
-/// Record that this instance has finished processing a file.
-///
-/// Atomic `SADD` + `EXPIRE` via a pipeline — no locks, no retries needed.
-pub fn mark_file_processed(filename: &str, instance: &str) -> Result<()> {
-    let key = format!("processed:{filename}");
-    redis::pipe()
-        .sadd(&key, instance)
-        .expire(&key, PROCESSED_TTL_SECS)
-        .exec(&mut *conn())
-        .context("mark_file_processed")?;
-    debug!("mark_file_processed: {filename} by {instance:?}");
-    Ok(())
-}
-
-/// Check whether every **active** processing instance has processed this file.
-///
-/// Only instances with a heartbeat within the last 5 minutes are
-/// considered active.
-pub fn all_instances_done(filename: &str) -> bool {
-    let mut c = conn();
-    let cutoff = now_unix() - 5 * 60;
-
-    let instances: HashMap<String, i64> = c.hgetall("instances").unwrap_or_default();
-    let live: std::collections::HashSet<String> = instances
-        .into_iter()
-        .filter(|(_, ts)| *ts >= cutoff)
-        .map(|(id, _)| id)
-        .collect();
-
-    if live.is_empty() {
-        return true; // No live instances → fail-open: delete
-    }
-
-    let key = format!("processed:{filename}");
-    let processed: std::collections::HashSet<String> =
-        c.smembers(&key).unwrap_or_default();
-
-    let remaining = live.difference(&processed).count();
-    debug!(
-        "all_instances_done({filename}): {remaining}/{} active instance(s) still pending → {}",
-        live.len(),
-        if remaining == 0 { "ready to delete" } else { "waiting" }
-    );
-    remaining == 0
-}
-
 /// Clean up old processing log entries.
 ///
 /// With Redis TTL on `processed:*` keys, entries expire automatically.
@@ -271,7 +222,14 @@ pub fn increment_urban_noise(date: &str, _hour: u32, category: &str) -> Result<(
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
-
+/// Read the set of enabled audio model slugs from Redis.
+///
+/// Returns an empty vec when the key does not exist, which the caller
+/// should treat as "all loaded models are enabled" (backward-compat
+/// with deployments that haven't been seeded yet).
+pub fn get_enabled_models() -> Vec<String> {
+    with_retry(|c| c.smembers("audio:enabled_models")).unwrap_or_default()
+}
 /// Read a single setting from the `settings` hash.
 pub fn get_setting(key: &str) -> Option<String> {
     with_retry(|c| c.hget("settings", key)).ok()
