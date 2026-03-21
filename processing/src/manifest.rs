@@ -55,14 +55,17 @@ pub enum ScoreTransform {
     Sigmoid,
     /// Standard softmax normalisation across all classes.
     Softmax,
-    /// Standard sigmoid `1/(1+exp(-x))` without BirdNET sensitivity
-    /// scaling or baseline clamping.  Maps any real-valued logit to
-    /// (0, 1) while preserving relative ordering.
+    /// Z-score centered sigmoid: `sigmoid((x - mean) / max(std, 1.0))`.
     ///
-    /// Use for models whose raw logits span a wide range and need a
-    /// principled probability mapping (e.g. Google Perch 2.0, whose
-    /// strong-detection logits often exceed 1.0).
-    PlainSigmoid,
+    /// Normalises each chunk's logits so that the per-chunk average maps
+    /// to 50% confidence.  Species whose logit is significantly above
+    /// the mean get high confidence; species near the average stay near
+    /// 50%.  The standard-deviation divisor (floored at 1.0) prevents
+    /// over-amplification when all logits are similar.
+    ///
+    /// Use for models with many output classes where raw logits cluster
+    /// at similar values (e.g. Google Perch 2.0 with ~15K classes).
+    CenteredSigmoid,
     /// No transformation — raw logits are clamped to 0..1 and used
     /// as-is.  Only suitable when the model already outputs values in
     /// the 0..1 range.

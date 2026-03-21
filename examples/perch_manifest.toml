@@ -23,15 +23,16 @@ labels_file = "labels.csv"
 # Perch does not use V1-style metadata input
 v1_metadata = false
 # Perch outputs raw logits whose magnitude directly encodes confidence.
-# The official Perch code thresholds raw logits (typically > 1.0).
-# Use score_transform = "plain_sigmoid" to map logits through a standard
-# sigmoid — this preserves relative ordering and gives meaningful 0..1
-# confidence without the BirdNET sensitivity parameter.
+# With ~15K classes many logits cluster at similar values, so a plain
+# sigmoid saturates them all near 100%.  Use centered_sigmoid to
+# z-score normalise per-chunk logits before applying sigmoid: the
+# per-chunk mean maps to 50% and only species that stand out from the
+# background receive high confidence.
 # DO NOT use softmax: with ~15K classes it squashes even strong
 # detections to near-zero.
 # DO NOT use "none": raw logits > 1.0 get clamped to 1.0 (100%).
 apply_softmax = false
-score_transform = "plain_sigmoid"
+score_transform = "centered_sigmoid"
 # Perch's ONNX model accepts raw audio [1, N], NOT mel spectrograms.
 # Only BirdNET's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false

@@ -67,6 +67,13 @@ static PARQUET_FILE_COUNT: std::sync::atomic::AtomicU64 =
 /// Parquet files.  Must be called once at startup.
 pub fn initialize(detections_dir: &Path) -> Result<(), duckdb::Error> {
     std::fs::create_dir_all(detections_dir).ok();
+
+    // Run the one-time Sci_Name normalisation migration so that existing
+    // Parquet files have consistent species names before we create the view.
+    if let Err(e) = normalize_parquet_sci_names(detections_dir) {
+        tracing::warn!("Parquet Sci_Name migration failed (non-fatal): {e:#}");
+    }
+
     let conn = duckdb::Connection::open_in_memory()?;
 
     // Create the view.  If the glob matches nothing DuckDB returns an
@@ -449,10 +456,15 @@ pub async fn species_info(db_path: &Path, scientific_name: &str) -> Res<Option<S
     let duck = conn()?;
 
     let sql = format!(
-        "SELECT Domain, Com_Name, COUNT(*) AS cnt, \
+        "SELECT Domain, \
+         COALESCE( \
+             MAX(CASE WHEN Com_Name != Sci_Name THEN Com_Name ELSE NULL END), \
+             MAX(Com_Name) \
+         ) AS Com_Name, \
+         COUNT(*) AS cnt, \
          MIN(Date) AS first_seen, MAX(Date) AS last_seen \
          FROM detections WHERE Sci_Name = '{safe}' AND {excl} \
-         GROUP BY Domain, Com_Name LIMIT 1"
+         GROUP BY Domain LIMIT 1"
     );
     let mut stmt = duck.prepare(&sql)?;
     let mut rows = stmt.query_map([], |row| {
@@ -585,11 +597,16 @@ pub async fn top_species_for_date_filtered(
     };
     let duck = conn()?;
     let sql = format!(
-        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+        "SELECT d.Sci_Name, \
+         COALESCE( \
+             MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
+             MAX(d.Com_Name) \
+         ) AS Com_Name, \
+         d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE d.Date = '{safe_date}' AND {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Com_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
     );
     let mut stmt = duck.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -657,11 +674,16 @@ pub async fn top_species_filtered(
     };
     let duck = conn()?;
     let sql = format!(
-        "SELECT d.Sci_Name, d.Com_Name, d.Domain, COUNT(*) AS cnt, \
+        "SELECT d.Sci_Name, \
+         COALESCE( \
+             MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
+             MAX(d.Com_Name) \
+         ) AS Com_Name, \
+         d.Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Com_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
+         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
     );
     read_species_summaries(&duck, &sql)
 }
@@ -889,35 +911,50 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
     // species_stats — used by the species list page (all models).
     duck.execute_batch(&format!(
         "CREATE OR REPLACE TABLE species_stats AS \
-         SELECT Sci_Name, Com_Name, Domain, COUNT(*) AS detection_count, \
+         SELECT Sci_Name, \
+         COALESCE( \
+             MAX(CASE WHEN Com_Name != Sci_Name THEN Com_Name ELSE NULL END), \
+             MAX(Com_Name) \
+         ) AS Com_Name, \
+         Domain, COUNT(*) AS detection_count, \
          MAX(Date || ' ' || Time) AS last_seen \
          FROM detections d \
          WHERE {excl} \
-         GROUP BY Sci_Name, Com_Name, Domain",
+         GROUP BY Sci_Name, Domain",
     ))?;
 
     // model_species_stats — used by the species list page (model filter).
     duck.execute_batch(&format!(
         "CREATE OR REPLACE TABLE model_species_stats AS \
          SELECT COALESCE(d.Model_Slug, '') AS Model_Slug, \
-                d.Sci_Name, d.Com_Name, d.Domain, \
+                d.Sci_Name, \
+                COALESCE( \
+                    MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
+                    MAX(d.Com_Name) \
+                ) AS Com_Name, \
+                d.Domain, \
                 COUNT(*) AS detection_count, \
                 MAX(d.Date || ' ' || d.Time) AS last_seen \
          FROM detections d \
          WHERE {excl} AND COALESCE(d.Model_Slug, '') != '' \
-         GROUP BY d.Model_Slug, d.Sci_Name, d.Com_Name, d.Domain",
+         GROUP BY d.Model_Slug, d.Sci_Name, d.Domain",
     ))?;
 
     // excluded_species_stats — used by the excluded species page.
     duck.execute_batch(
         "CREATE OR REPLACE TABLE excluded_species_stats AS \
-         SELECT Sci_Name, Com_Name, Domain, \
+         SELECT Sci_Name, \
+                COALESCE( \
+                    MAX(CASE WHEN Com_Name != Sci_Name THEN Com_Name ELSE NULL END), \
+                    MAX(Com_Name) \
+                ) AS Com_Name, \
+                Domain, \
                 COUNT(*) AS detection_count, \
                 MAX(Date || ' ' || Time) AS last_seen, \
                 MAX(Confidence) AS max_confidence \
          FROM detections \
          WHERE COALESCE(Excluded, 0) = 1 \
-         GROUP BY Sci_Name, Com_Name, Domain",
+         GROUP BY Sci_Name, Domain",
     )?;
 
     // species_top_recordings (top 10 per species by confidence)
@@ -1335,4 +1372,130 @@ pub fn get_existing_filenames_set() -> Result<std::collections::HashSet<String>,
     names.extend(opus_variants);
 
     Ok(names)
+}
+
+// ─── Parquet Sci_Name normalisation migration ────────────────────────────────
+
+/// One-time migration: normalise `Sci_Name` in existing Parquet files and
+/// pick the best `Com_Name` per species (preferring a real common name
+/// over one that just repeats the scientific name).
+///
+/// Writes a marker file (`.sci_name_normalised`) so it only runs once.
+fn normalize_parquet_sci_names(detections_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let marker = detections_dir.join(".sci_name_normalised");
+    if marker.exists() {
+        return Ok(());
+    }
+
+    let has_files = std::fs::read_dir(detections_dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().map(|x| x == "parquet").unwrap_or(false))
+        })
+        .unwrap_or(false);
+
+    if !has_files {
+        std::fs::write(&marker, "no files to migrate\n").ok();
+        return Ok(());
+    }
+
+    info!(
+        "Running Sci_Name normalisation migration on {}",
+        detections_dir.display()
+    );
+
+    let t0 = std::time::Instant::now();
+    let glob = format!("{}/*.parquet", detections_dir.display());
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| format!("migration DuckDB: {e}"))?;
+
+    conn.execute_batch(&format!(
+        "CREATE TABLE migration AS SELECT * FROM read_parquet('{glob}', union_by_name=true)"
+    ))
+    .map_err(|e| format!("read parquet: {e}"))?;
+
+    let count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM migration", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    if count == 0 {
+        std::fs::write(&marker, "0 rows\n").ok();
+        return Ok(());
+    }
+
+    // Normalise: replace underscores → spaces, capitalise only genus.
+    conn.execute_batch(
+        "ALTER TABLE migration ADD COLUMN Sci_Norm VARCHAR; \
+         UPDATE migration SET Sci_Norm = \
+             CONCAT( \
+                 UPPER(LEFT(TRIM(REPLACE(Sci_Name, '_', ' ')), 1)), \
+                 LOWER(SUBSTR(TRIM(REPLACE(Sci_Name, '_', ' ')), 2)) \
+             );"
+    ).map_err(|e| format!("normalise: {e}"))?;
+
+    // Best common name per species: prefer real names over sci_name copies.
+    conn.execute_batch(
+        "CREATE TABLE best_names AS \
+         SELECT Sci_Norm, \
+             COALESCE( \
+                 MAX(CASE WHEN TRIM(Com_Name) != '' \
+                          AND TRIM(Com_Name) != Sci_Name \
+                          AND TRIM(Com_Name) != Sci_Norm \
+                     THEN Com_Name ELSE NULL END), \
+                 MAX(Com_Name) \
+             ) AS Best_Com_Name \
+         FROM migration \
+         GROUP BY Sci_Norm"
+    ).map_err(|e| format!("best names: {e}"))?;
+
+    conn.execute_batch(
+        "UPDATE migration SET \
+             Sci_Name = Sci_Norm, \
+             Com_Name = COALESCE( \
+                 (SELECT b.Best_Com_Name FROM best_names b WHERE b.Sci_Norm = migration.Sci_Norm), \
+                 Com_Name \
+             )"
+    ).map_err(|e| format!("update: {e}"))?;
+
+    conn.execute_batch(
+        "ALTER TABLE migration DROP COLUMN Sci_Norm; \
+         DROP TABLE best_names;"
+    ).ok();
+
+    // Write corrected data.
+    let out_path = detections_dir.join("_migrated.parquet");
+    let out_tmp = detections_dir.join("._migrated.parquet.tmp");
+    conn.execute(
+        &format!(
+            "COPY migration TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+            out_tmp.display()
+        ),
+        [],
+    )
+    .map_err(|e| format!("write: {e}"))?;
+
+    std::fs::rename(&out_tmp, &out_path)
+        .map_err(|e| format!("rename: {e}"))?;
+
+    // Remove old files.
+    let mut removed = 0u32;
+    for entry in std::fs::read_dir(detections_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().map(|x| x == "parquet").unwrap_or(false)
+            && path.file_name() != Some(std::ffi::OsStr::new("_migrated.parquet"))
+        {
+            std::fs::remove_file(&path).ok();
+            removed += 1;
+        }
+    }
+
+    info!(
+        "Migration complete: {count} rows, removed {removed} old file(s), \
+         wrote _migrated.parquet ({:.1}s)",
+        t0.elapsed().as_secs_f64()
+    );
+
+    std::fs::write(&marker, format!("{count} rows migrated\n")).ok();
+    Ok(())
 }

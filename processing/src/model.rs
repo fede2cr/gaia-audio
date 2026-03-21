@@ -387,6 +387,16 @@ impl LoadedModel {
         &self.csv_classes
     }
 
+    /// Full list of scientific names the model was trained on.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Whether this model has a species-range (metadata) model loaded.
+    pub fn has_species_range_model(&self) -> bool {
+        self.meta_model.is_some()
+    }
+
     /// Run inference on a single audio chunk.
     ///
     /// Returns a sorted list of `(label, confidence)` pairs,
@@ -532,9 +542,14 @@ impl LoadedModel {
                 // softmax top would need all logits; just note the transform
                 f32::NAN
             }
-            crate::manifest::ScoreTransform::PlainSigmoid => {
-                let c = max_logit.clamp(-20.0, 20.0);
-                1.0 / (1.0 + (-c).exp())
+            crate::manifest::ScoreTransform::CenteredSigmoid => {
+                // Approximate: re-center top logit by the global mean.
+                let n = logits.len() as f32;
+                let mean = logits.iter().sum::<f32>() / n;
+                let var = logits.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+                let std = var.sqrt().max(1.0);
+                let z = ((max_logit - mean) / std).clamp(-20.0, 20.0);
+                1.0 / (1.0 + (-z).exp())
             }
             crate::manifest::ScoreTransform::None => max_logit.clamp(0.0, 1.0),
         };
@@ -567,7 +582,7 @@ impl LoadedModel {
         match self.effective_transform() {
             ScoreTransform::Softmax => softmax(logits),
             ScoreTransform::Sigmoid => self.sigmoid_scale(logits),
-            ScoreTransform::PlainSigmoid => plain_sigmoid(logits),
+            ScoreTransform::CenteredSigmoid => centered_sigmoid(logits),
             ScoreTransform::None => {
                 // Clamp raw logits to [0, 1].
                 logits.iter().map(|&x| x.clamp(0.0, 1.0)).collect()
@@ -618,17 +633,25 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
-// ── plain sigmoid ────────────────────────────────────────────────────────
+// ── centered sigmoid ─────────────────────────────────────────────────────
 
-/// Standard sigmoid `1 / (1 + exp(-x))` without BirdNET sensitivity
-/// scaling or baseline clamping.  Clamps the input to [-20, 20] to
-/// avoid float overflow.
-fn plain_sigmoid(logits: &[f32]) -> Vec<f32> {
+/// Z-score centered sigmoid: normalise logits to zero-mean / unit-variance
+/// (with a floor of 1.0 on the std to avoid over-amplification), then
+/// apply the standard sigmoid.  This ensures the per-chunk average logit
+/// maps to 50% and only genuinely strong activations reach >80%.
+fn centered_sigmoid(logits: &[f32]) -> Vec<f32> {
+    let n = logits.len() as f32;
+    if n == 0.0 {
+        return vec![];
+    }
+    let mean = logits.iter().sum::<f32>() / n;
+    let variance = logits.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    let std = variance.sqrt().max(1.0);
     logits
         .iter()
         .map(|&x| {
-            let clamped = x.clamp(-20.0, 20.0);
-            1.0 / (1.0 + (-clamped).exp())
+            let z = ((x - mean) / std).clamp(-20.0, 20.0);
+            1.0 / (1.0 + (-z).exp())
         })
         .collect()
 }

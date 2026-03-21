@@ -5,6 +5,41 @@
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
+/// Normalise a scientific name to a canonical form:
+///   - Replace underscores with spaces
+///   - Collapse multiple whitespace into single spaces
+///   - Trim leading/trailing whitespace
+///   - Capitalise only the genus (first word)
+///
+/// Examples:
+///   `"turdus_merula"`   → `"Turdus merula"`
+///   `"TURDUS MERULA"`   → `"Turdus merula"`
+///   `"turdus  merula "`  → `"Turdus merula"`
+pub fn normalize_sci_name(raw: &str) -> String {
+    let replaced = raw.replace('_', " ");
+    let words: Vec<&str> = replaced.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(raw.len());
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        if i == 0 {
+            // Capitalise genus
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                result.extend(first.to_uppercase());
+                result.extend(chars.map(|c| c.to_ascii_lowercase()));
+            }
+        } else {
+            result.extend(word.chars().map(|c| c.to_ascii_lowercase()));
+        }
+    }
+    result
+}
+
 /// A single species detection within an audio recording.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Detection {
@@ -66,7 +101,7 @@ impl Detection {
             iso8601: local_dt.to_rfc3339(),
             week: local_dt.iso_week().week(),
             confidence: (confidence * 10000.0).round() / 10000.0,
-            scientific_name: scientific_name.to_string(),
+            scientific_name: normalize_sci_name(scientific_name),
             common_name: common_name.to_string(),
             common_name_safe,
             excluded: false,
@@ -198,5 +233,16 @@ mod tests {
         let s = format!("{d}");
         assert!(s.contains("birds"));
         assert!(s.contains("Turdus merula"));
+    }
+
+    #[test]
+    fn test_normalize_sci_name() {
+        use super::normalize_sci_name;
+        assert_eq!(normalize_sci_name("Turdus merula"), "Turdus merula");
+        assert_eq!(normalize_sci_name("turdus_merula"), "Turdus merula");
+        assert_eq!(normalize_sci_name("TURDUS MERULA"), "Turdus merula");
+        assert_eq!(normalize_sci_name("turdus  merula "), "Turdus merula");
+        assert_eq!(normalize_sci_name(" phaneroptera_nana"), "Phaneroptera nana");
+        assert_eq!(normalize_sci_name(""), "");
     }
 }

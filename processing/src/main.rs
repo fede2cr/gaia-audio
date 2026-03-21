@@ -10,9 +10,11 @@ mod kv;
 mod live_status;
 mod manifest;
 mod mel;
+mod migrate_parquet;
 mod model;
 mod parquet_store;
 mod reporting;
+mod species_range;
 mod spectrogram;
 
 use std::path::{Path, PathBuf};
@@ -130,6 +132,11 @@ fn main() -> Result<()> {
     // ── initialize Parquet detection store ────────────────────────────
     {
         let det_dir = config.db_path.parent().unwrap_or(Path::new("/data")).join("detections");
+        // Run the one-time Sci_Name normalisation migration before
+        // initialising the store, so the store sees clean data.
+        if let Err(e) = migrate_parquet::run_if_needed(&det_dir) {
+            tracing::warn!("Parquet migration failed (non-fatal): {e:#}");
+        }
         parquet_store::initialize(&det_dir, "default")?;
     };
 
