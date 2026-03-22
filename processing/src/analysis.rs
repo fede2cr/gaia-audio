@@ -43,7 +43,10 @@ pub fn process_file(
     let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
     // Read the set of enabled models from Redis (managed in Settings).
+    // An empty set means the Redis key is missing — treat as "all models
+    // are enabled" (backward-compat with deployments not yet seeded).
     let enabled = crate::kv::get_enabled_models();
+    let all_enabled = enabled.is_empty();
 
     // ── shared species-range data ────────────────────────────────────
     // Pre-compute the species-range list from models that have a
@@ -62,7 +65,7 @@ pub fn process_file(
     // proper common names from models that have one (e.g. BirdNET).
     let mut shared_common_names: HashMap<String, String> = HashMap::new();
     for model in models.iter_mut() {
-        if !enabled.contains(&model.manifest.slug()) {
+        if !all_enabled && !enabled.contains(&model.manifest.slug()) {
             continue;
         }
         // Collect common names from every model.
@@ -98,7 +101,7 @@ pub fn process_file(
     }
 
     for model in models.iter_mut() {
-        if !enabled.contains(&model.manifest.slug()) {
+        if !all_enabled && !enabled.contains(&model.manifest.slug()) {
             debug!("Skipping disabled model: {}", model.manifest.manifest.model.name);
             continue;
         }

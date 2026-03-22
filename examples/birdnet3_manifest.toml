@@ -26,7 +26,9 @@ labels_file = "labels.csv"
 v1_metadata = false
 # BirdNET uses sigmoid scaling (flat_sigmoid), not softmax.
 # scale_logits() applies: 1/(1+exp(-sensitivity * clip(x,-20,20)))
+# Only scores > 0.5 are treated as positive (sigmoid(0)=0.5 baseline).
 apply_softmax = false
+score_transform = "sigmoid"
 # BirdNET+ V3.0 accepts raw audio [1, N], NOT mel spectrograms.
 # Only BirdNET V2.4's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false

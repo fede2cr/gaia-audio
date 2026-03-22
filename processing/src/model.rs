@@ -509,6 +509,15 @@ impl LoadedModel {
         let n_labels = self.labels.len();
         let transform = self.effective_transform();
 
+        if n_logits != n_labels {
+            tracing::warn!(
+                "[{name}] Logit/label mismatch: model produced {n_logits} logits \
+                 but labels file has {n_labels} entries.  Predictions will be \
+                 truncated to the shorter of the two — check labels_file in \
+                 the manifest."
+            );
+        }
+
         if logits.is_empty() {
             info!("[{name}] First inference: 0 logits (model produced no output!)");
             return;
