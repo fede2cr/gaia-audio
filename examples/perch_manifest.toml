@@ -22,17 +22,16 @@ onnx_file = "model.onnx"
 labels_file = "labels.csv"
 # Perch does not use V1-style metadata input
 v1_metadata = false
-# Perch outputs raw logits whose magnitude directly encodes confidence.
-# With ~15K classes many logits cluster at similar values, so a plain
-# sigmoid saturates them all near 100%.  Use centered_sigmoid to
-# z-score normalise per-chunk logits before applying sigmoid: the
-# per-chunk mean maps to 50% and only species that stand out from the
-# background receive high confidence.
-# DO NOT use softmax: with ~15K classes it squashes even strong
-# detections to near-zero.
+# Perch outputs raw logits (from nn.Dense, no activation).
+# BirdNET-Analyzer applies softmax to these logits:
+#   tf.nn.softmax(result["label"], axis=-1)
+# Even with ~15K classes, softmax produces meaningful scores because
+# confident detections concentrate probability mass on a few species.
+# DO NOT use sigmoid: all logits cluster at similar values so sigmoid
+# saturates them all near 100%.
 # DO NOT use "none": raw logits > 1.0 get clamped to 1.0 (100%).
 apply_softmax = false
-score_transform = "centered_sigmoid"
+score_transform = "softmax"
 # Perch's ONNX model accepts raw audio [1, N], NOT mel spectrograms.
 # Only BirdNET's extracted classifier sub-model needs this set to true.
 onnx_is_classifier = false

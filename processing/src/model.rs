@@ -539,8 +539,9 @@ impl LoadedModel {
                 if raw <= 0.5 { 0.0 } else { raw }
             }
             crate::manifest::ScoreTransform::Softmax => {
-                // softmax top would need all logits; just note the transform
-                f32::NAN
+                // Compute softmax to show what the top score will be.
+                let sm = softmax(logits);
+                sm.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
             }
             crate::manifest::ScoreTransform::CenteredSigmoid => {
                 // Approximate: re-center top logit by the global mean.
