@@ -91,10 +91,12 @@ pub struct OrtSession {
 }
 
 impl OrtSession {
-    /// Create an ORT session for the given ONNX file.
+    /// Create an ORT session for the given ONNX file with GPU
+    /// acceleration (when `GAIA_ACCEL` is set).
     ///
     /// `cache_dir` is used by MIGraphX / TensorRT to store compiled
     /// plans.  Ignored when running on CPU only.
+    #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         let kind = accel_kind();
 
@@ -193,6 +195,39 @@ impl OrtSession {
             session.inputs().len(),
             session.outputs().len(),
             kind,
+        );
+
+        Ok(Self { session, shapes_logged: false, shape_data_logged: false })
+    }
+
+    /// Create an ORT session with **CPU-only** execution, ignoring
+    /// `GAIA_ACCEL`.
+    ///
+    /// Used when ORT is a fallback for models that tract cannot load
+    /// (e.g. DFT/STFT ops in Perch, BirdNET V3).  These models have
+    /// exotic ops that MIGraphX / TensorRT may not support —
+    /// attempting GPU compilation hangs for 20+ minutes and produces
+    /// no benefit.  CPU inference is fast enough (~66 ms per chunk).
+    pub fn new_cpu(onnx_path: &Path) -> Result<Self> {
+        info!(
+            "Creating ONNX Runtime session (CPU-only fallback) for {}",
+            onnx_path.display()
+        );
+
+        let mut builder = ort::session::Session::builder()
+            .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
+            .with_execution_providers([ort::ep::CPU::default().build()])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let session = builder
+            .commit_from_file(onnx_path)
+            .with_context(|| format!("ORT CPU: failed to load {}", onnx_path.display()))?;
+
+        info!(
+            "ORT session created for {} ({} inputs, {} outputs, accel=CPU-only)",
+            onnx_path.display(),
+            session.inputs().len(),
+            session.outputs().len(),
         );
 
         Ok(Self { session, shapes_logged: false, shape_data_logged: false })

@@ -226,20 +226,22 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
 
             // 3. If tract still failed, try ONNX Runtime CPU fallback.
             //    This handles models with operators tract cannot optimise
-            //    (e.g. DFT/STFT in BirdNET V3).
+            //    (e.g. DFT/STFT in BirdNET V3, Perch V2).
+            //
+            //    We force CPU-only here: models that fail tract have
+            //    exotic ops (DFT, STFT) that MIGraphX / TensorRT
+            //    cannot compile efficiently — attempting GPU compilation
+            //    hangs for 20+ minutes with no benefit.  CPU inference
+            //    is fast enough (~66 ms per 5 s chunk for Perch).
             match tract_result {
                 Ok(r) => (Some(r), None, is_classifier),
                 Err(tract_err) => {
                     tracing::warn!(
                         "tract-onnx failed for {} ({tract_err:#}); \
-                         trying ONNX Runtime fallback",
+                         trying ONNX Runtime CPU-only fallback",
                         onnx_path.display()
                     );
-                    let cache_dir = onnx_path
-                        .parent()
-                        .unwrap_or(Path::new("/tmp"))
-                        .join("ort_cache");
-                    match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                    match crate::accel::OrtSession::new_cpu(&onnx_path) {
                         Ok(sess) => {
                             info!(
                                 "ONNX Runtime fallback active for {}",
