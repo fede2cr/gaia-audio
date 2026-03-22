@@ -25,6 +25,19 @@ if [ -f "$STALE_META" ] && [ -f "$BUNDLED_DIR/birdnet3/meta-model.onnx" ]; then
     fi
 fi
 
+# ── Purge stale Perch model.onnx (renamed to perch_v2.onnx) ──────
+# Earlier builds downloaded perch_v2_no_dft.onnx as "model.onnx".
+# tract-onnx loaded it but produced near-uniform garbage outputs
+# because its optimisation passes distorted the MatMul-based DFT
+# replacement.  The manifest now uses "perch_v2.onnx" (standard
+# model with native DFT op) which forces the ORT fallback where
+# inference is correct.  Remove the stale copy to free ~300 MB.
+STALE_PERCH="/models/perch/model.onnx"
+if [ -f "$STALE_PERCH" ]; then
+    echo "[entrypoint] Removing stale $STALE_PERCH (switched to perch_v2.onnx)"
+    rm -f "$STALE_PERCH"
+fi
+
 if [ -d "$BUNDLED_DIR" ]; then
     for model_dir in "$BUNDLED_DIR"/*/; do
         slug=$(basename "$model_dir")

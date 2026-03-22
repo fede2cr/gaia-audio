@@ -18,7 +18,16 @@ chunk_duration = 5.0
 # Perch is ONNX-only — no TFLite file needed for inference.
 # Set to a placeholder; the ONNX path takes priority when present.
 tflite_file = "model.tflite"
-onnx_file = "model.onnx"
+# Use the standard ONNX export (with native DFT op), NOT the
+# perch_v2_no_dft.onnx variant.  The no_dft model replaces DFT
+# with MatMul; tract-onnx loads it but its optimisation passes
+# distort the computation, producing near-uniform garbage logits
+# (~0.01 top softmax score across 15K classes).
+#
+# The standard model's DFT op is unsupported by tract-onnx, which
+# triggers the ORT fallback — where inference is correct.
+# (Same pattern as BirdNET+ V3.0.)
+onnx_file = "perch_v2.onnx"
 labels_file = "labels.csv"
 # Perch does not use V1-style metadata input
 v1_metadata = false
@@ -32,11 +41,16 @@ v1_metadata = false
 # DO NOT use "none": raw logits > 1.0 get clamped to 1.0 (100%).
 apply_softmax = false
 score_transform = "softmax"
-# Perch's ONNX model accepts raw audio [1, N], NOT mel spectrograms.
-# Only BirdNET's extracted classifier sub-model needs this set to true.
+# Perch's ONNX model accepts raw audio [1, N] at 32 kHz, NOT mel
+# spectrograms.  The model does internal STFT/mel computation.
+# Only BirdNET V2.4's extracted classifier sub-model needs this
+# set to true.
 onnx_is_classifier = false
 # Perch V2 has 4 ONNX outputs:
-#   [0] = embedding, [1] = spatial_embedding, [2] = spectrogram, [3] = predictions.
+#   [0] = embedding (1536-dim)
+#   [1] = spatial_embedding (16×4×1536)
+#   [2] = spectrogram (500×128)
+#   [3] = label predictions (14795)
 prediction_output_index = 3
 
 # ── Automatic download from HuggingFace ──────────────────────────────
@@ -53,11 +67,16 @@ prediction_output_index = 3
 #
 # Species coverage: ~15,000 species including birds, frogs, crickets,
 # grasshoppers, and mammals.
+#
+# NOTE: we download the STANDARD perch_v2.onnx (with native DFT op),
+# NOT perch_v2_no_dft.onnx.  The no_dft variant (DFT→MatMul) loads in
+# tract-onnx but produces near-uniform garbage; the standard variant's
+# DFT op forces the ORT fallback where inference is correct.
 
 [download]
 # No Zenodo variants — files are downloaded directly from HuggingFace.
 default_variant = "default"
 
 [download.direct_files]
-"model.onnx" = "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2_no_dft.onnx"
+"perch_v2.onnx" = "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2.onnx"
 "labels.csv" = "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv"
