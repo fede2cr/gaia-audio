@@ -2,6 +2,7 @@
 //! runs inference, writes detections to Parquet, coordinates via Redis.
 
 mod accel;
+mod agreement;
 mod analysis;
 mod client;
 mod compress;

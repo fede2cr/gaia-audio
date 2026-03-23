@@ -150,8 +150,16 @@ RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000
 # rather than the GitHub releases tarball.  The pip-bundled build
 # handles DFT/STFT models correctly, while the tarball build hangs
 # indefinitely in CreateSession for those same models.
+#
+# VERSION PIN: ort-sys 2.0.0-rc.12 generates FFI bindings for ORT C API v17
+# and ships prebuilt binaries for ORT 1.24.2 (see dist.txt:  ms@1.24.2).
+# With `load-dynamic`, the crate loads whatever libonnxruntime.so is on
+# the system.  While API v17 is forward-compatible, newer ORT releases
+# can change internal thread-pool / graph-analysis behaviour, causing
+# the same CreateSession deadlocks we previously fixed.  Pin to the
+# exact version ort-sys targets to guarantee identical behaviour.
 FROM python:3.11-slim AS ort-download
-RUN pip install --no-cache-dir onnxruntime && \
+RUN pip install --no-cache-dir 'onnxruntime==1.24.2' && \
     ORT_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))") && \
     cp "${ORT_LIB}"/libonnxruntime.so* /usr/lib/ && \
     ls -lh /usr/lib/libonnxruntime.so* && \
@@ -229,17 +237,17 @@ COPY --from=birdnet3converter /convert/birdnet3.onnx  /test/models/birdnet3/bird
 COPY --from=converter /convert/meta-model.onnx        /test/models/birdnet3/meta-model.onnx
 COPY --from=converter /convert/en_us.txt              /test/models/birdnet3/meta-labels.txt
 # Download V3.0 labels (small CSV, ~600 KB)
-RUN curl -sSL -o /test/models/birdnet3/labels.csv \
+RUN curl -fsSL -o /test/models/birdnet3/labels.csv \
     "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_Labels.csv/content" && \
     echo "BirdNET V3.0 labels: $(wc -l < /test/models/birdnet3/labels.csv) lines"
 
 # ── Assemble Perch V2.0 model directory ───────────────────────────
 COPY examples/perch_manifest.toml /test/models/perch/manifest.toml
 # Download Perch ONNX model (~68 MB) and labels from HuggingFace.
-RUN curl -sSL -o /test/models/perch/model.onnx \
+RUN curl -fsSL -o /test/models/perch/model.onnx \
     "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2.onnx" && \
     ls -lh /test/models/perch/model.onnx
-RUN curl -sSL -o /test/models/perch/labels.csv \
+RUN curl -fsSL -o /test/models/perch/labels.csv \
     "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv" && \
     echo "Perch labels: $(wc -l < /test/models/perch/labels.csv) lines"
 
@@ -253,7 +261,12 @@ RUN curl -sSL -o /test/models/perch/labels.csv \
 # NOTE: ORT_DYLIB_PATH is intentionally NOT set here.  The runtime
 # stage relies on ldconfig to find libonnxruntime.so, so the smoke
 # test must do the same to verify the library is properly installed.
+#
+# timeout 300 (5 min): prevents indefinite hangs if an ORT version
+# regression reintroduces the CreateSession deadlock.  Normal smoke
+# tests complete in under 60 seconds.
 RUN RUST_LOG=info \
+    timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
         --models /test/models \

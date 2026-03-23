@@ -172,7 +172,10 @@ fn refresh_view_inner(conn: &duckdb::Connection, dir: &Path) -> Result<(), duckd
              0.0::DOUBLE AS Sens, 0.0::DOUBLE AS Overlap, \
              ''::VARCHAR AS File_Name, ''::VARCHAR AS Source_Node, \
              0::INTEGER AS Excluded, ''::VARCHAR AS Model_Slug, \
-             ''::VARCHAR AS Model_Name \
+             ''::VARCHAR AS Model_Name, \
+             0::INTEGER AS Model_Beta, \
+             0.0::DOUBLE AS Agreement_Score, \
+             ''::VARCHAR AS Agreement_Models \
              WHERE false",
         )?;
     }
@@ -284,6 +287,9 @@ fn parse_detection(row: &duckdb::Row<'_>) -> Result<WebDetection, duckdb::Error>
         image_url: None,
         model_slug: row.get::<_, String>(10)?,
         model_name: row.get::<_, String>(11)?,
+        model_beta: row.get::<_, i32>(12).unwrap_or(0) != 0,
+        agreement_score: row.get::<_, f64>(13).unwrap_or(0.0),
+        agreement_models: row.get::<_, String>(14).unwrap_or_default(),
         display_date: String::new(),
         display_time: String::new(),
     })
@@ -327,7 +333,9 @@ pub async fn recent_detections_filtered(
     let sql = format!(
         "SELECT id, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
-         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), \
+         COALESCE(Model_Beta, 0), \
+         COALESCE(Agreement_Score, 0.0), COALESCE(Agreement_Models, '') \
          FROM detections \
          WHERE true {id_filter} {slug_filter} \
          ORDER BY id DESC LIMIT {limit}"
@@ -409,7 +417,9 @@ pub async fn day_detections_filtered(
     let sql = format!(
         "SELECT id, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
-         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), \
+         COALESCE(Model_Beta, 0), \
+         COALESCE(Agreement_Score, 0.0), COALESCE(Agreement_Models, '') \
          FROM detections WHERE Date = '{safe_date}' {slug_filter} \
          ORDER BY Sci_Name, Time DESC"
     );
@@ -793,7 +803,9 @@ pub async fn species_detections_by_model(
     let sql = format!(
         "SELECT id, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
-         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), \
+         COALESCE(Model_Beta, 0), \
+         COALESCE(Agreement_Score, 0.0), COALESCE(Agreement_Models, '') \
          FROM detections WHERE Sci_Name = '{safe}' {slug_filter} \
          ORDER BY Date DESC, Time DESC LIMIT {limit}"
     );
@@ -881,7 +893,9 @@ pub async fn excluded_detections_for_species(
     let sql = format!(
         "SELECT id, Domain, Sci_Name, Com_Name, Confidence, Date, Time, File_Name, \
          COALESCE(Source_Node, ''), COALESCE(Excluded, 0), \
-         COALESCE(Model_Slug, ''), COALESCE(Model_Name, '') \
+         COALESCE(Model_Slug, ''), COALESCE(Model_Name, ''), \
+         COALESCE(Model_Beta, 0), \
+         COALESCE(Agreement_Score, 0.0), COALESCE(Agreement_Models, '') \
          FROM detections WHERE Sci_Name = '{safe}' AND COALESCE(Excluded, 0) = 1 \
          ORDER BY Date DESC, Time DESC LIMIT {limit}"
     );
@@ -1236,7 +1250,10 @@ pub async fn migrate_sqlite_to_parquet(db_path: &Path) -> Result<(), String> {
             Source_Node VARCHAR  NOT NULL,
             Excluded    INTEGER  NOT NULL,
             Model_Slug  VARCHAR  NOT NULL,
-            Model_Name  VARCHAR  NOT NULL
+            Model_Name  VARCHAR  NOT NULL,
+            Model_Beta  INTEGER  NOT NULL,
+            Agreement_Score  DOUBLE  NOT NULL,
+            Agreement_Models VARCHAR NOT NULL
         )",
     )
     .map_err(|e| format!("DuckDB buffer schema: {e}"))?;
@@ -1283,11 +1300,12 @@ pub async fn migrate_sqlite_to_parquet(db_path: &Path) -> Result<(), String> {
         let id = ((base_ms & 0xFFFF_FFFF_FFFF) << 16) | (seq & 0xFFFF);
 
         if let Err(e) = duck.execute(
-            "INSERT INTO buffer VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO buffer VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             duckdb::params![
                 id as i64, date, time, domain, sci, com, conf,
                 lat, lon, cutoff, week, sens, overlap, fname,
-                source, excluded, model_slug, model_name
+                source, excluded, model_slug, model_name, 0i32,
+                0.0f64, String::new()
             ],
         ) {
             tracing::warn!("Migration row insert error: {e}");

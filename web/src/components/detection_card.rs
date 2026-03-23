@@ -25,6 +25,11 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
     let source_label = detection.source_label();
     let model_label = detection.model_label();
     let is_excluded = detection.excluded;
+    let is_beta = detection.model_beta;
+    let agreement = detection.agreement_score;
+    // Show agreement badge only when multiple models are active
+    // (agreement < 1.0 means not all models agree, or only one model ran).
+    let show_agreement = agreement > 0.0 && agreement < 1.0;
 
     // URLs for the extracted audio clip and its spectrogram
     let audio_url = detection.clip_url();
@@ -68,7 +73,19 @@ pub fn DetectionCard(detection: WebDetection) -> impl IntoView {
                     <span class="domain-badge">{detection.domain.clone()}</span>
                     <span class={confidence_class}>{confidence_pct}</span>
                     <span class="model-badge" title="Detection model">"🧠 " {model_label}</span>
+                    {is_beta.then(|| view! { <span class="beta-badge" title="Experimental model">"BETA"</span> })}
                     {is_excluded.then(|| view! { <span class="excluded-badge">"Excluded"</span> })}
+                    {show_agreement.then(|| {
+                        let pct = format!("{:.0}%", agreement * 100.0);
+                        let cls = if agreement >= 0.7 {
+                            "agreement-badge high"
+                        } else if agreement >= 0.4 {
+                            "agreement-badge medium"
+                        } else {
+                            "agreement-badge low"
+                        };
+                        view! { <span class={cls} title="Cross-model agreement">"🤝 " {pct}</span> }
+                    })}
                     <span class="source-badge" title="Capture node">{source_label}</span>
                 </div>
                 <div class="detection-timestamp">

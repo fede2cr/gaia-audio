@@ -37,6 +37,15 @@ prediction_output_index = 1
 # Force ONNX Runtime — tract loads the patched model but its DFT
 # implementation produces all-zero output.  ORT handles it correctly.
 prefer_ort = true
+# Developer preview — less proven than BirdNET V2.4.  Displayed with
+# a "BETA" badge in the UI.
+beta = true
+# Lower trust weight for agreement scoring (BirdNET V2.4 = 1.0).
+trust_weight = 0.5
+# Developer preview — mark as beta so the UI shows a badge and
+# agreement scoring weights this model lower than BirdNET V2.4.
+beta = true
+trust_weight = 0.5
 
 # ── Species-range filter (reusing BirdNET V2.4 metadata model) ───────
 #

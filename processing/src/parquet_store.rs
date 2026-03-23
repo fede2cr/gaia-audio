@@ -86,7 +86,10 @@ pub fn initialize(output_dir: &Path, instance: &str) -> Result<()> {
             Source_Node VARCHAR  NOT NULL,
             Excluded    INTEGER  NOT NULL,
             Model_Slug  VARCHAR  NOT NULL,
-            Model_Name  VARCHAR  NOT NULL
+            Model_Name  VARCHAR  NOT NULL,
+            Model_Beta  INTEGER  NOT NULL,
+            Agreement_Score  DOUBLE  NOT NULL,
+            Agreement_Models VARCHAR NOT NULL
         );",
     )
     .context("Cannot create DuckDB buffer table")?;
@@ -137,7 +140,7 @@ pub fn write_detection(
     let id = ((epoch_ms & 0xFFFF_FFFF_FFFF) << 16) | (s.seq & 0xFFFF);
 
     s.conn.execute(
-        "INSERT INTO buffer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO buffer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             id as i64,
             d.date,
@@ -157,6 +160,9 @@ pub fn write_detection(
             d.excluded as i32,
             d.model_slug,
             d.model_name,
+            d.model_beta as i32,
+            d.agreement_score,
+            d.agreement_models,
         ],
     )
     .context("Failed to buffer detection in DuckDB")?;

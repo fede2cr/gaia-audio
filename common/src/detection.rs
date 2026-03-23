@@ -71,6 +71,19 @@ pub struct Detection {
     /// Human-readable model name (e.g. `"BirdNET V2.4"`).
     #[serde(default)]
     pub model_name: String,
+    /// `true` when the model is marked as beta / experimental.
+    #[serde(default)]
+    pub model_beta: bool,
+    /// Cross-model agreement score (0.0 – 1.0).
+    ///
+    /// Computed by `agreement::score_agreement()` after all models have
+    /// processed a file.  Higher values mean more models agree on this
+    /// detection.  1.0 = all active models agree.
+    #[serde(default)]
+    pub agreement_score: f64,
+    /// Comma-separated slugs of models that agree on this detection.
+    #[serde(default)]
+    pub agreement_models: String,
 }
 
 impl Detection {
@@ -108,6 +121,9 @@ impl Detection {
             file_name_extr: None,
             model_slug: String::new(),
             model_name: String::new(),
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
         }
     }
 

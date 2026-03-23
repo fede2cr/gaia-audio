@@ -40,6 +40,15 @@ pub struct WebDetection {
     /// Human-readable model name (e.g. `"BirdNET V2.4"`).
     #[serde(default)]
     pub model_name: String,
+    /// `true` when the model is marked as beta / experimental.
+    #[serde(default)]
+    pub model_beta: bool,
+    /// Cross-model agreement score (0.0 – 1.0).
+    #[serde(default)]
+    pub agreement_score: f64,
+    /// Comma-separated slugs of agreeing models.
+    #[serde(default)]
+    pub agreement_models: String,
     /// Timezone-adjusted date for display (YYYY-MM-DD).
     /// Same as `date` when tz_offset is 0 or unset.
     /// Kept separate so `clip_url()` always uses the UTC `date` for file paths.

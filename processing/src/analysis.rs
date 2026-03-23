@@ -16,6 +16,7 @@ use gaia_common::detection::{Detection, ParsedFileName};
 
 use crate::live_status::{self, LivePrediction};
 use crate::model::{self, LoadedModel, Prediction};
+use crate::agreement::{self, ModelWeight};
 use crate::ReportPayload;
 
 /// Process a single WAV file through all loaded models.
@@ -112,6 +113,22 @@ pub fn process_file(
         )?;
         all_detections.extend(detections);
         live_predictions.extend(top_preds);
+    }
+
+    // ── Cross-model agreement scoring ────────────────────────────────
+    // Compute weighted agreement scores across all models that
+    // processed this file.  BirdNET V2.4 (trust_weight=1.0) carries
+    // more weight than beta models (trust_weight=0.5).
+    {
+        let model_weights: Vec<ModelWeight> = models
+            .iter()
+            .filter(|m| all_enabled || enabled.contains(&m.manifest.slug()))
+            .map(|m| ModelWeight {
+                slug: m.manifest.slug(),
+                trust_weight: m.manifest.manifest.model.trust_weight,
+            })
+            .collect();
+        agreement::score_agreement(&mut all_detections, &model_weights);
     }
 
     // ── Update live analysis status ──────────────────────────────────
@@ -438,6 +455,7 @@ fn run_analysis(
             det.excluded = excluded;
             det.model_slug = model_slug.clone();
             det.model_name = model_name.clone();
+            det.model_beta = model.manifest.manifest.model.beta;
             confident_detections.push(det);
         }
     }

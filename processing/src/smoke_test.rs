@@ -78,6 +78,11 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str) -> Resu
     info!("Audio:    {}", audio_path.display());
     info!("Models:   {}", models_dir.display());
     info!("Expected: {}", expected_species);
+
+    // Log the ORT shared library version so CI output shows exactly
+    // which onnxruntime is loaded.  Helps diagnose version-drift hangs.
+    log_ort_library_version();
+
     info!("");
 
     // ── Discover manifests ───────────────────────────────────────────
@@ -474,5 +479,29 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str) -> Resu
             "{} smoke test assertion(s) failed — see above for details",
             failures.len()
         );
+    }
+}
+
+/// Log the version of the ONNX Runtime shared library found on the system.
+///
+/// Scans `/usr/lib/libonnxruntime.so*` for versioned symlinks (e.g.
+/// `libonnxruntime.so.1.24.2`).  This appears in CI build logs so
+/// version-drift issues are immediately visible.
+fn log_ort_library_version() {
+    let lib_dir = std::path::Path::new("/usr/lib");
+    let mut versions: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(lib_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("libonnxruntime.so") {
+                versions.push(name);
+            }
+        }
+    }
+    versions.sort();
+    if versions.is_empty() {
+        warn!("No libonnxruntime.so found in /usr/lib — ORT models will fail to load");
+    } else {
+        info!("ORT libs: {}", versions.join(", "));
     }
 }

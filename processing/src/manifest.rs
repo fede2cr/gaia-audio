@@ -146,6 +146,18 @@ pub struct ModelSection {
     /// `libonnxruntime.so` to be available.
     #[serde(default)]
     pub prefer_ort: bool,
+    /// Mark this model as beta / experimental.  Beta detections are
+    /// displayed with a "BETA" badge in the UI so ornithologists know
+    /// the model is less proven than established ones (e.g. BirdNET V2.4).
+    #[serde(default)]
+    pub beta: bool,
+    /// Trust weight for cross-model agreement scoring.
+    ///
+    /// Higher values give this model more influence when computing
+    /// consensus scores.  BirdNET V2.4 (proven accurate) defaults to
+    /// 1.0; experimental models should use lower values (e.g. 0.5).
+    #[serde(default = "default_trust_weight")]
+    pub trust_weight: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +249,10 @@ fn default_variant() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_trust_weight() -> f64 {
+    1.0
 }
 fn default_l18n() -> String {
     "l18n".to_string()
