@@ -134,6 +134,18 @@ pub struct ModelSection {
     /// Defaults to `0` for backward compatibility with single-output models.
     #[serde(default)]
     pub prediction_output_index: usize,
+    /// Skip tract-onnx and go directly to ONNX Runtime (CPU).
+    ///
+    /// Some models load in tract but produce incorrect inference:
+    ///   - BirdNET+ V3.0: patched DFT ops load but output all zeros.
+    ///   - Perch no_dft: MatMul-replaced DFT loads but outputs are
+    ///     input-independent (identical for all audio chunks).
+    ///
+    /// Setting this to `true` forces the ORT CPU fallback path,
+    /// which handles these models correctly.  Requires
+    /// `libonnxruntime.so` to be available.
+    #[serde(default)]
+    pub prefer_ort: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -190,11 +190,41 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
     let (runner, ort_session, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
             let is_classifier = resolved.manifest.model.onnx_is_classifier;
+            let prefer_ort = resolved.manifest.model.prefer_ort;
             info!(
-                "Loading ONNX model from {} (classifier={})",
+                "Loading ONNX model from {} (classifier={}, prefer_ort={})",
                 onnx_path.display(),
-                is_classifier
+                is_classifier,
+                prefer_ort,
             );
+
+            // 0. If the manifest says prefer_ort, skip tract entirely.
+            //    Some models load in tract but produce incorrect inference
+            //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
+            //    → input-independent predictions).  ORT handles them
+            //    correctly.  Uses full GPU chain when GAIA_ACCEL is set.
+            if prefer_ort {
+                let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
+                match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                    Ok(sess) => {
+                        info!(
+                            "ONNX Runtime active (prefer_ort, accel={:?}) for {}",
+                            crate::accel::accel_kind(),
+                            onnx_path.display()
+                        );
+                        (None, Some(sess), is_classifier)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "prefer_ort is set but ONNX Runtime failed: {e:#}"
+                        );
+                        return Err(e.context(
+                            "prefer_ort is set but ONNX Runtime is unavailable \
+                             (is libonnxruntime.so installed?)"
+                        ));
+                    }
+                }
+            } else {
 
             // 1. Try tract-onnx.
             let tract_result = load_onnx_runner(&onnx_path);
@@ -226,13 +256,12 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
 
             // 3. If tract still failed, try ONNX Runtime CPU fallback.
             //    This handles models with operators tract cannot optimise
-            //    (e.g. DFT/STFT in BirdNET V3, Perch V2).
+            //    (e.g. DFT/STFT in BirdNET V3).
             //
             //    We force CPU-only here: models that fail tract have
             //    exotic ops (DFT, STFT) that MIGraphX / TensorRT
             //    cannot compile efficiently — attempting GPU compilation
-            //    hangs for 20+ minutes with no benefit.  CPU inference
-            //    is fast enough (~66 ms per 5 s chunk for Perch).
+            //    can hang for a very long time with no benefit.
             match tract_result {
                 Ok(r) => (Some(r), None, is_classifier),
                 Err(tract_err) => {
@@ -241,7 +270,8 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                          trying ONNX Runtime CPU-only fallback",
                         onnx_path.display()
                     );
-                    match crate::accel::OrtSession::new_cpu(&onnx_path) {
+                    let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
+                    match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
                         Ok(sess) => {
                             info!(
                                 "ONNX Runtime fallback active for {}",
@@ -261,6 +291,7 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                     }
                 }
             }
+            } // else (tract path)
         } else {
             info!(
                 "ONNX file configured but missing ({}), falling back to TFLite",

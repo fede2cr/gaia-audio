@@ -25,17 +25,32 @@ if [ -f "$STALE_META" ] && [ -f "$BUNDLED_DIR/birdnet3/meta-model.onnx" ]; then
     fi
 fi
 
-# ── Purge stale Perch model.onnx (renamed to perch_v2.onnx) ──────
-# Earlier builds downloaded perch_v2_no_dft.onnx as "model.onnx".
-# tract-onnx loaded it but produced near-uniform garbage outputs
-# because its optimisation passes distorted the MatMul-based DFT
-# replacement.  The manifest now uses "perch_v2.onnx" (standard
-# model with native DFT op) which forces the ORT fallback where
-# inference is correct.  Remove the stale copy to free ~300 MB.
-STALE_PERCH="/models/perch/model.onnx"
-if [ -f "$STALE_PERCH" ]; then
-    echo "[entrypoint] Removing stale $STALE_PERCH (switched to perch_v2.onnx)"
-    rm -f "$STALE_PERCH"
+# ── Purge stale Perch no-DFT variant (switched to standard model) ─
+# Previous builds downloaded perch_v2_no_dft.onnx (MatMul-replaced
+# DFT) as model.onnx.  That variant hangs ORT during graph
+# optimisation.  The manifest now downloads the standard
+# perch_v2.onnx (native DFT) which ORT handles correctly.
+# Remove the stale no-DFT copy so the download logic fetches the
+# correct standard model.
+STALE_PERCH="/models/perch/perch_v2.onnx"
+STALE_PERCH_NODFT="/models/perch/perch_v2_no_dft.onnx"
+for f in "$STALE_PERCH" "$STALE_PERCH_NODFT"; do
+    if [ -f "$f" ]; then
+        echo "[entrypoint] Removing stale $f (using standard model.onnx now)"
+        rm -f "$f"
+    fi
+done
+# Force re-download of model.onnx if it's the old no-DFT variant.
+# We detect it by size: the no-DFT variant is ~300 MB, the standard
+# model is ~68 MB.
+PERCH_MODEL="/models/perch/model.onnx"
+if [ -f "$PERCH_MODEL" ]; then
+    SIZE=$(stat -c%s "$PERCH_MODEL" 2>/dev/null || echo 0)
+    # If > 200 MB it's almost certainly the no-DFT variant
+    if [ "$SIZE" -gt 200000000 ]; then
+        echo "[entrypoint] Removing stale Perch no-DFT model.onnx (${SIZE} bytes, > 200 MB)"
+        rm -f "$PERCH_MODEL"
+    fi
 fi
 
 if [ -d "$BUNDLED_DIR" ]; then

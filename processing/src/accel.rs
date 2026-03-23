@@ -20,6 +20,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use ort::session::builder::GraphOptimizationLevel;
 use tracing::info;
 
 // ── Runtime check ────────────────────────────────────────────────────────
@@ -96,7 +97,6 @@ impl OrtSession {
     ///
     /// `cache_dir` is used by MIGraphX / TensorRT to store compiled
     /// plans.  Ignored when running on CPU only.
-    #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         let kind = accel_kind();
 
@@ -117,6 +117,16 @@ impl OrtSession {
 
         let mut builder = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?;
+
+        // GPU EPs (MIGraphX, TensorRT) do their own compilation/optimisation,
+        // so full graph optimisation is fine.  For CPU-only, disable all
+        // graph optimisation — even Level1 (Constant Folding) can hang
+        // for 10+ minutes on models with complex DFT/STFT subgraphs.
+        if kind == AccelKind::None {
+            builder = builder
+                .with_optimization_level(GraphOptimizationLevel::Disable)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
 
         builder = match kind {
             AccelKind::Rocm => {
@@ -208,7 +218,10 @@ impl OrtSession {
     /// exotic ops that MIGraphX / TensorRT may not support —
     /// attempting GPU compilation hangs for 20+ minutes and produces
     /// no benefit.  CPU inference is fast enough (~66 ms per chunk).
-    pub fn new_cpu(onnx_path: &Path) -> Result<Self> {
+    ///
+    /// `cache_dir` is provided for future use but currently ignored
+    /// (CPU EP has no caching).
+    pub fn new_cpu(onnx_path: &Path, _cache_dir: &Path) -> Result<Self> {
         info!(
             "Creating ONNX Runtime session (CPU-only fallback) for {}",
             onnx_path.display()
@@ -216,6 +229,8 @@ impl OrtSession {
 
         let mut builder = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
+            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_execution_providers([ort::ep::CPU::default().build()])
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 

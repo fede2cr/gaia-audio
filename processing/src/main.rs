@@ -14,6 +14,7 @@ mod migrate_parquet;
 mod model;
 mod parquet_store;
 mod reporting;
+mod smoke_test;
 mod species_range;
 mod spectrogram;
 
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{error, info};
 
 use gaia_common::detection::{Detection, ParsedFileName};
 
@@ -81,6 +82,75 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    // ── smoke-test subcommand (build-time end-to-end validation) ─────
+    // Usage: gaia-processing smoke-test --audio <path.wav> --models <dir> --species "Turdus merula"
+    //
+    // Loads every bird model from the models directory, runs real
+    // inference on a known bird recording, and asserts that all models
+    // detect the expected species with comparable confidence.
+    //
+    // This is invoked during `docker build` after all models are
+    // assembled, so inference regressions are caught before the image
+    // is published.
+    if args.get(1).map(|s| s.as_str()) == Some("smoke-test") {
+        let mut audio_path: Option<String> = None;
+        let mut models_dir: Option<String> = None;
+        let mut species: Option<String> = None;
+        let mut ort_script: Option<String> = None;
+
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--audio" => {
+                    audio_path = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                "--models" => {
+                    models_dir = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                "--species" => {
+                    species = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                "--ort-script" => {
+                    ort_script = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Unknown argument: {}", args[i]);
+                    i += 1;
+                }
+            }
+        }
+
+        let audio = audio_path.unwrap_or_else(|| {
+            eprintln!(
+                "Usage: gaia-processing smoke-test \
+                 --audio <path.wav> --models <dir> --species \"Turdus merula\" \
+                 [--ort-script <path.py>]"
+            );
+            std::process::exit(2);
+        });
+        let models = models_dir.unwrap_or_else(|| {
+            eprintln!("Missing --models <dir>");
+            std::process::exit(2);
+        });
+        let species = species.unwrap_or_else(|| {
+            eprintln!("Missing --species <name>");
+            std::process::exit(2);
+        });
+
+        let ort_script_path = ort_script.as_deref().map(Path::new);
+        match smoke_test::run(Path::new(&audio), Path::new(&models), &species, ort_script_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                error!("Smoke test failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if std::env::var("RUST_LOG").map_or(false, |v| v.contains("debug")) {

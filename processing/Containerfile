@@ -186,7 +186,90 @@ COPY --from=batconverter /convert/batdetect2.onnx /validate/batdetect2.onnx
 RUN gaia-processing validate-model \
         /validate/audio-model.onnx \
         /validate/meta-model.onnx \
-        /validate/batdetect2.onnx
+        /validate/batdetect2.onnx && \
+    touch /validate/.tract-ok
+
+# ── End-to-end smoke test ──────────────────────────────────────────
+# Uses a baked-in recording of Keel-billed Toucan (Ramphastos
+# sulfuratus) from test-fixtures/, assembles all bird models with
+# their manifests and labels, then runs real inference through every
+# model.  Asserts that:
+#   1. Every model detects the expected species in its top-5.
+#   2. Confidence scores are in a sane range (not near-zero garbage).
+#   3. All models agree within a reasonable confidence spread.
+#
+# Two test runners:
+#   - Rust binary (gaia-processing smoke-test): validates tract models
+#     (BirdNET V2.4).  Models with prefer_ort=true are skipped here.
+#   - Python onnxruntime (smoke_test_ort.py): validates ORT models
+#     (BirdNET+ V3.0, Perch).  The Rust `ort` crate's CPU EP hangs
+#     on session creation for models with DFT/STFT ops, but the
+#     Python onnxruntime pip package handles them instantly.
+#
+# Together they cover all three bird models end-to-end.
+#
+# Adds ~2–3 minutes to the build (model downloads + inference).
+# To skip during rapid iteration: podman build --target runtime …
+FROM python:3.11-slim AS smoke-test-runner
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates ffmpeg curl && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir onnxruntime numpy
+
+# Binary + ORT library (for the Rust tract-based smoke test)
+COPY --from=builder      /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+COPY --from=ort-download /usr/lib/libonnxruntime.so*           /usr/lib/
+RUN ldconfig
+
+# ── Convert baked-in test audio to WAV ────────────────────────────
+# Source: Keel-billed Toucan (Ramphastos sulfuratus) from a live
+# gaia-audio deployment, ~20 s of verified detections.
+WORKDIR /test
+COPY processing/test-fixtures/smoke-test-bird.opus /test/bird.opus
+RUN ffmpeg -y -i /test/bird.opus -ac 1 -ar 48000 -c:a pcm_s16le /test/bird.wav && \
+    echo "Test audio: $(du -h /test/bird.wav | cut -f1), $(ffprobe -v error -show_entries format=duration -of csv=p=0 /test/bird.wav)s"
+
+# ── Assemble BirdNET V2.4 model directory ─────────────────────────
+COPY examples/birds_manifest.toml /test/models/birdnet/manifest.toml
+COPY --from=converter /convert/audio-model.onnx /test/models/birdnet/audio-model.onnx
+COPY --from=converter /convert/meta-model.onnx  /test/models/birdnet/meta-model.onnx
+COPY --from=converter /convert/en_us.txt        /test/models/birdnet/en_us.txt
+
+# ── Assemble BirdNET+ V3.0 model directory ────────────────────────
+COPY examples/birdnet3_manifest.toml /test/models/birdnet3/manifest.toml
+COPY --from=birdnet3converter /convert/birdnet3.onnx  /test/models/birdnet3/birdnet3.onnx
+COPY --from=converter /convert/meta-model.onnx        /test/models/birdnet3/meta-model.onnx
+COPY --from=converter /convert/en_us.txt              /test/models/birdnet3/meta-labels.txt
+# Download V3.0 labels (small CSV, ~600 KB)
+RUN curl -sSL -o /test/models/birdnet3/labels.csv \
+    "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_Labels.csv/content" && \
+    echo "BirdNET V3.0 labels: $(wc -l < /test/models/birdnet3/labels.csv) lines"
+
+# ── Assemble Perch V2.0 model directory ───────────────────────────
+COPY examples/perch_manifest.toml /test/models/perch/manifest.toml
+# Download Perch ONNX model (~68 MB) and labels from HuggingFace.
+RUN curl -sSL -o /test/models/perch/model.onnx \
+    "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2.onnx" && \
+    ls -lh /test/models/perch/model.onnx
+RUN curl -sSL -o /test/models/perch/labels.csv \
+    "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv" && \
+    echo "Perch labels: $(wc -l < /test/models/perch/labels.csv) lines"
+
+# ── Python ORT smoke test script ──────────────────────────────────
+COPY scripts/smoke_test_ort.py /test/smoke_test_ort.py
+
+# ── Run smoke tests ──────────────────────────────────────────────
+# Single invocation covers ALL bird models:
+#   - BirdNET V2.4: Rust/tract (direct inference)
+#   - BirdNET+ V3.0 + Google Perch 2.0: Python onnxruntime via
+#     --ort-script (the Rust ort crate's CPU EP hangs on DFT/STFT
+#     models, but Python's pip onnxruntime handles them instantly)
+RUN RUST_LOG=info ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
+    gaia-processing smoke-test \
+        --audio /test/bird.wav \
+        --models /test/models \
+        --species "Ramphastos sulfuratus" \
+        --ort-script /test/smoke_test_ort.py && \
+    touch /test/.smoke-ok
 
 # ── Runtime stage ──────────────────────────────────────────────────
 # Minimal image: Rust binary + pre-converted ONNX model.
@@ -199,6 +282,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+
+# Force Docker to run test stages (they are otherwise skipped because
+# nothing in the final image references them).  These sentinel files
+# are only created when the tests pass.
+COPY --from=tract-validator    /validate/.tract-ok /tmp/.tract-ok
+COPY --from=smoke-test-runner  /test/.smoke-ok     /tmp/.smoke-ok
 
 # ONNX Runtime shared library for CPU fallback inference.
 COPY --from=ort-download /usr/lib/libonnxruntime.so* /usr/lib/

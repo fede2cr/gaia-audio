@@ -34,6 +34,9 @@ score_transform = "sigmoid"
 onnx_is_classifier = false
 # BirdNET V3.0 has 2 ONNX outputs: [0] = 1280-dim embeddings, [1] = predictions.
 prediction_output_index = 1
+# Force ONNX Runtime — tract loads the patched model but its DFT
+# implementation produces all-zero output.  ORT handles it correctly.
+prefer_ort = true
 
 # ── Species-range filter (reusing BirdNET V2.4 metadata model) ───────
 #
