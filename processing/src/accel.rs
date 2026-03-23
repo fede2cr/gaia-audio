@@ -1,10 +1,7 @@
 //! ONNX Runtime integration – adaptive GPU / CPU inference.
 //!
-//! [`OrtSession`] wraps either a native `ort::session::Session` or a
-//! persistent Python `onnxruntime` subprocess, and presents a uniform
-//! `predict()` API to the rest of the codebase.
-//!
-//! ## Native ORT (`new`, `new_cpu`)
+//! [`OrtSession`] wraps an `ort::session::Session` and presents a
+//! uniform `predict()` API to the rest of the codebase.
 //!
 //! | `GAIA_ACCEL` env var | EP chain tried                          |
 //! |----------------------|-----------------------------------------|
@@ -17,23 +14,12 @@
 //! returns an error and the caller falls through to tract-onnx or
 //! skips the model.
 //!
-//! ## Python ORT subprocess (`new_python`)
-//!
-//! For models with DFT/STFT ops (BirdNET V3, Perch), the Rust `ort`
-//! crate hangs indefinitely in `CreateSession` regardless of EP or
-//! optimization level.  Python's `onnxruntime` pip package handles
-//! them without issue.  `new_python()` spawns a persistent
-//! `ort_worker.py` child process and communicates via a JSON-lines +
-//! raw-binary protocol over stdin/stdout.
-//!
 //! Both MIGraphX and TensorRT cache compiled plans on disk so
 //! subsequent starts skip the slow compilation step.
 
-use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use tracing::info;
 
@@ -80,13 +66,9 @@ pub fn is_gpu_requested() -> bool {
 
 // ── Adaptive ORT session ─────────────────────────────────────────────────
 
-/// Default path to the Python ORT worker script (baked into the container).
-const DEFAULT_ORT_WORKER: &str = "/usr/local/share/gaia/ort_worker.py";
-
-/// An ONNX Runtime session that either uses the native `ort` crate or
-/// a persistent Python `onnxruntime` subprocess.
+/// An ONNX Runtime session wrapping the `ort` crate.
 ///
-/// ### Native mode (`new`, `new_cpu`)
+/// ### GPU mode (`new`)
 ///
 /// When `GAIA_ACCEL=rocm` is set, the session is configured with:
 ///   1. MIGraphX EP (compiles ONNX → optimised HIP kernels)
@@ -98,67 +80,18 @@ const DEFAULT_ORT_WORKER: &str = "/usr/local/share/gaia/ort_worker.py";
 ///   2. CUDA EP
 ///   3. CPU fallback
 ///
-/// Otherwise only the CPU EP is registered.
+/// ### CPU mode (`new_cpu`)
 ///
-/// ### Python mode (`new_python`)
-///
-/// Spawns `ort_worker.py` and communicates over stdin/stdout.  Used for
-/// models with DFT/STFT ops that hang the Rust `ort` crate.
+/// CPU-only with explicit thread limits.  Critical for models with
+/// DFT/STFT ops (BirdNET V3, Perch): without explicit
+/// `intra_threads` / `inter_threads`, ORT's default thread pool
+/// deadlocks inside `CreateSession`.
 pub struct OrtSession {
-    inner: SessionKind,
+    session: ort::session::Session,
     /// Whether we have logged the output shape info (once per session).
     shapes_logged: bool,
     /// Whether we have logged the output data shape (once per session).
     shape_data_logged: bool,
-}
-
-/// Either a native ORT session or a Python subprocess.
-enum SessionKind {
-    Native(ort::session::Session),
-    Python {
-        child: Child,
-        stdin: std::io::BufWriter<ChildStdin>,
-        /// Raw (unbuffered) stdout — no BufReader.  We read byte-by-byte
-        /// for JSON lines and exact counts for binary tensor data.
-        /// A BufReader's internal read-ahead would consume binary bytes
-        /// when reading the JSON header, corrupting the tensor data.
-        stdout: ChildStdout,
-        model_id: String,
-    },
-}
-
-/// Read a single `\n`-terminated line from a raw reader (no buffering).
-/// Returns the line content WITHOUT the trailing newline.
-fn raw_read_line(r: &mut impl Read) -> Result<String> {
-    let mut buf = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    loop {
-        match r.read(&mut byte) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                buf.push(byte[0]);
-            }
-            Err(e) => return Err(e).context("raw_read_line failed"),
-        }
-    }
-    String::from_utf8(buf).context("Non-UTF8 line from Python worker")
-}
-
-/// Read exactly `n` bytes from a raw reader.
-fn raw_read_exact(r: &mut impl Read, n: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    let mut filled = 0;
-    while filled < n {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => bail!("EOF after {filled}/{n} bytes"),
-            Ok(k) => filled += k,
-            Err(e) => return Err(e).context("raw_read_exact failed"),
-        }
-    }
-    Ok(buf)
 }
 
 impl OrtSession {
@@ -168,11 +101,8 @@ impl OrtSession {
     /// `cache_dir` is used by MIGraphX / TensorRT to store compiled
     /// plans.  Ignored when running on CPU only.
     ///
-    /// **Not currently used**: `prefer_ort` models use `new_cpu()`
-    /// because the pip-bundled `libonnxruntime.so` (which handles
-    /// DFT/STFT models without hanging) is CPU-only.  Kept for
-    /// future use when GPU-capable ORT builds that handle DFT ops
-    /// become available.
+    /// **Not currently used**: `prefer_ort` models use `new_cpu()`.
+    /// Kept for future GPU-accelerated inference.
     #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         let kind = accel_kind();
@@ -193,7 +123,14 @@ impl OrtSession {
         }
 
         let mut builder = ort::session::Session::builder()
-            .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?;
+            .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
+            // Thread limits prevent deadlocks in CreateSession for models
+            // with DFT/STFT ops.  Applied to all EP chains — the CPU
+            // fallback within a GPU chain can trigger the same hang.
+            .with_intra_threads(4)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // GPU EPs (MIGraphX, TensorRT) do their own compilation/optimisation,
         // so full graph optimisation is fine.  For CPU-only, disable all
@@ -285,7 +222,7 @@ impl OrtSession {
         );
 
         Ok(Self {
-            inner: SessionKind::Native(session),
+            session,
             shapes_logged: false,
             shape_data_logged: false,
         })
@@ -308,14 +245,22 @@ impl OrtSession {
             onnx_path.display()
         );
 
-        let mut builder = ort::session::Session::builder()
+        // Thread configuration is critical for models with DFT/STFT ops
+        // (BirdNET V3, Perch).  Without explicit limits the ORT default
+        // (0 = "let ORT decide") creates a huge thread pool that deadlocks
+        // inside CreateSession for complex signal-processing subgraphs.
+        // Match the values used by the Python onnxruntime pip package
+        // (inter=1, intra=4), which loads these models without issue.
+        let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
+            .with_intra_threads(4)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Disable)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let session = builder
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(onnx_path)
             .with_context(|| format!("ORT CPU: failed to load {}", onnx_path.display()))?;
 
@@ -327,88 +272,7 @@ impl OrtSession {
         );
 
         Ok(Self {
-            inner: SessionKind::Native(session),
-            shapes_logged: false,
-            shape_data_logged: false,
-        })
-    }
-
-    /// Create an ORT session backed by a **persistent Python subprocess**.
-    ///
-    /// The Rust `ort` crate hangs in `CreateSession` for models with
-    /// DFT/STFT ops, regardless of EP or optimisation level.
-    /// Python's `onnxruntime` pip package handles them without issue.
-    ///
-    /// `model_id` is a short unique slug (e.g. `"birdnet3"`) used to
-    /// identify the model in the worker protocol.
-    pub fn new_python(onnx_path: &Path, model_id: &str) -> Result<Self> {
-        let worker_script = std::env::var("GAIA_ORT_WORKER")
-            .unwrap_or_else(|_| DEFAULT_ORT_WORKER.to_string());
-
-        info!(
-            "Spawning Python ORT worker for {} (script={})",
-            onnx_path.display(),
-            worker_script,
-        );
-
-        let mut child = Command::new("python3")
-            .arg(&worker_script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // so Python tracebacks appear in container logs
-            .spawn()
-            .with_context(|| format!(
-                "Failed to spawn Python ORT worker (is python3 installed?). \
-                 Script: {worker_script}"
-            ))?;
-
-        let child_stdin = child.stdin.take().context("No stdin on Python child")?;
-        let child_stdout = child.stdout.take().context("No stdout on Python child")?;
-
-        let mut stdin_writer = std::io::BufWriter::new(child_stdin);
-        let mut stdout_raw = child_stdout;
-
-        // Send load command
-        let load_cmd = serde_json::json!({
-            "cmd": "load",
-            "id": model_id,
-            "path": onnx_path.to_string_lossy(),
-        });
-        writeln!(stdin_writer, "{}", load_cmd).context("Failed to write load command")?;
-        stdin_writer.flush()?;
-
-        // Read load response (byte-at-a-time, no buffering)
-        let resp_line = raw_read_line(&mut stdout_raw)
-            .context("Failed to read load response from Python ORT worker")?;
-
-        let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-            .with_context(|| format!("Invalid JSON from worker: {resp_line:?}"))?;
-
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err_msg = resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            bail!("Python ORT worker failed to load {}: {err_msg}", onnx_path.display());
-        }
-
-        let n_inputs = resp.get("inputs").and_then(|v| v.as_u64()).unwrap_or(0);
-        let n_outputs = resp.get("outputs").and_then(|v| v.as_u64()).unwrap_or(0);
-
-        info!(
-            "Python ORT session ready for {} ({} inputs, {} outputs)",
-            onnx_path.display(),
-            n_inputs,
-            n_outputs,
-        );
-
-        Ok(Self {
-            inner: SessionKind::Python {
-                child,
-                stdin: stdin_writer,
-                stdout: stdout_raw,
-                model_id: model_id.to_string(),
-            },
+            session,
             shapes_logged: false,
             shape_data_logged: false,
         })
@@ -426,123 +290,44 @@ impl OrtSession {
         input_shape: Vec<usize>,
         output_index: usize,
     ) -> Result<Vec<f32>> {
-        match &mut self.inner {
-            SessionKind::Native(session) => {
-                let input_name = session.inputs()[0].name().to_string();
+        let session = &mut self.session;
+        let input_name = session.inputs()[0].name().to_string();
 
-                // Log all output names on the first call.
-                if !self.shapes_logged {
-                    self.shapes_logged = true;
-                    for (i, out_meta) in session.outputs().iter().enumerate() {
-                        info!("ORT output[{i}]: name={:?}", out_meta.name());
-                    }
-                }
-
-                let shape_i64: Vec<i64> = input_shape.iter().map(|&d| d as i64).collect();
-                let input_tensor =
-                    ort::value::Tensor::from_array((shape_i64, input_data.into_boxed_slice()))
-                        .context("Failed to create input tensor")?;
-
-                let outputs = session
-                    .run(ort::inputs![input_name => input_tensor])
-                    .context("ORT inference failed")?;
-
-                anyhow::ensure!(
-                    output_index < outputs.len(),
-                    "Model has {} outputs but prediction_output_index = {output_index}",
-                    outputs.len()
-                );
-
-                let (shape, data) = outputs[output_index]
-                    .try_extract_tensor::<f32>()
-                    .context("Cannot extract f32 output tensor")?;
-
-                if !self.shape_data_logged {
-                    self.shape_data_logged = true;
-                    info!(
-                        "ORT predict: output[{output_index}] shape={shape:?}, len={}",
-                        data.len()
-                    );
-                }
-
-                Ok(data.to_vec())
-            }
-            SessionKind::Python {
-                stdin,
-                stdout,
-                model_id,
-                ..
-            } => {
-                let n_floats = input_data.len();
-
-                // 1. Send JSON header
-                let cmd = serde_json::json!({
-                    "cmd": "predict",
-                    "id": model_id,
-                    "shape": input_shape,
-                    "output_index": output_index,
-                    "n_floats": n_floats,
-                });
-                writeln!(stdin, "{}", cmd).context("Failed to write predict command")?;
-                stdin.flush()?;
-
-                // 2. Send raw f32 bytes (little-endian)
-                let raw_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        input_data.as_ptr() as *const u8,
-                        n_floats * std::mem::size_of::<f32>(),
-                    )
-                };
-                stdin.write_all(raw_bytes).context("Failed to write input tensor bytes")?;
-                stdin.flush()?;
-
-                // 3. Read JSON response header (byte-at-a-time, no buffering)
-                let resp_line = raw_read_line(stdout)
-                    .context("Failed to read predict response")?;
-
-                let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-                    .with_context(|| format!("Invalid JSON from worker: {resp_line:?}"))?;
-
-                if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                    let err_msg = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    bail!("Python ORT predict failed: {err_msg}");
-                }
-
-                let out_n = resp
-                    .get("n_floats")
-                    .and_then(|v| v.as_u64())
-                    .context("Missing n_floats in response")? as usize;
-
-                if !self.shapes_logged {
-                    self.shapes_logged = true;
-                    info!("Python ORT predict: output[{output_index}] len={out_n}");
-                }
-
-                // 4. Read raw f32 output bytes (exact count, no buffering)
-                let out_bytes = raw_read_exact(stdout, out_n * std::mem::size_of::<f32>())
-                    .context("Failed to read output tensor bytes")?;
-
-                let out_floats: Vec<f32> = out_bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-
-                Ok(out_floats)
+        // Log all output names on the first call.
+        if !self.shapes_logged {
+            self.shapes_logged = true;
+            for (i, out_meta) in session.outputs().iter().enumerate() {
+                info!("ORT output[{i}]: name={:?}", out_meta.name());
             }
         }
-    }
-}
 
-impl Drop for OrtSession {
-    fn drop(&mut self) {
-        if let SessionKind::Python { stdin, child, .. } = &mut self.inner {
-            // Try to send quit command; ignore errors (process may already be dead)
-            let _ = writeln!(stdin, r#"{{"cmd":"quit"}}"#);
-            let _ = stdin.flush();
-            let _ = child.wait();
+        let shape_i64: Vec<i64> = input_shape.iter().map(|&d| d as i64).collect();
+        let input_tensor =
+            ort::value::Tensor::from_array((shape_i64, input_data.into_boxed_slice()))
+                .context("Failed to create input tensor")?;
+
+        let outputs = session
+            .run(ort::inputs![input_name => input_tensor])
+            .context("ORT inference failed")?;
+
+        anyhow::ensure!(
+            output_index < outputs.len(),
+            "Model has {} outputs but prediction_output_index = {output_index}",
+            outputs.len()
+        );
+
+        let (shape, data) = outputs[output_index]
+            .try_extract_tensor::<f32>()
+            .context("Cannot extract f32 output tensor")?;
+
+        if !self.shape_data_logged {
+            self.shape_data_logged = true;
+            info!(
+                "ORT predict: output[{output_index}] shape={shape:?}, len={}",
+                data.len()
+            );
         }
+
+        Ok(data.to_vec())
     }
 }

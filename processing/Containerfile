@@ -193,24 +193,18 @@ RUN gaia-processing validate-model \
 #   2. Confidence scores are in a sane range (not near-zero garbage).
 #   3. All models agree within a reasonable confidence spread.
 #
-# Two test runners:
-#   - Rust binary (gaia-processing smoke-test): validates tract models
-#     (BirdNET V2.4).  Models with prefer_ort=true are skipped here.
-#   - Python onnxruntime (smoke_test_ort.py): validates ORT models
-#     (BirdNET+ V3.0, Perch).  The Rust `ort` crate's CPU EP hangs
-#     on session creation for models with DFT/STFT ops, but the
-#     Python onnxruntime pip package handles them instantly.
-#
-# Together they cover all three bird models end-to-end.
+# All models (BirdNET V2.4, V3.0, Perch) are validated through the
+# Rust binary using the native `ort` crate with explicit thread
+# limits (inter=1, intra=4) to prevent CreateSession deadlocks on
+# DFT/STFT models.
 #
 # Adds ~2–3 minutes to the build (model downloads + inference).
 # To skip during rapid iteration: podman build --target runtime …
-FROM python:3.11-slim AS smoke-test-runner
+FROM debian:trixie-slim AS smoke-test-runner
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg curl && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir onnxruntime numpy
 
-# Binary + ORT library (for the Rust tract-based smoke test)
+# Binary + ORT library
 COPY --from=builder      /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 COPY --from=ort-download /usr/lib/libonnxruntime.so*           /usr/lib/
 RUN ldconfig
@@ -249,35 +243,33 @@ RUN curl -sSL -o /test/models/perch/labels.csv \
     "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv" && \
     echo "Perch labels: $(wc -l < /test/models/perch/labels.csv) lines"
 
-# ── Python ORT smoke test script ──────────────────────────────────
-COPY scripts/smoke_test_ort.py /test/smoke_test_ort.py
-
 # ── Run smoke tests ──────────────────────────────────────────────
-# Single invocation covers ALL bird models:
-#   - BirdNET V2.4: Rust/tract (direct inference)
-#   - BirdNET+ V3.0 + Google Perch 2.0: Python onnxruntime via
-#     --ort-script (the Rust ort crate's CPU EP hangs on DFT/STFT
-#     models, but Python's pip onnxruntime handles them instantly)
-RUN RUST_LOG=info ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
+# Single invocation covers ALL bird models through the exact same
+# Rust code path used at runtime (model::load_model → OrtSession::
+# new_cpu → predict).  No special-casing, no Python, no env-var
+# overrides — so regressions like thread-pool deadlocks or library-
+# discovery failures are caught here before the image is published.
+#
+# NOTE: ORT_DYLIB_PATH is intentionally NOT set here.  The runtime
+# stage relies on ldconfig to find libonnxruntime.so, so the smoke
+# test must do the same to verify the library is properly installed.
+RUN RUST_LOG=info \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
         --models /test/models \
-        --species "Ramphastos sulfuratus" \
-        --ort-script /test/smoke_test_ort.py && \
+        --species "Ramphastos sulfuratus" && \
     touch /test/.smoke-ok
 
 # ── Runtime stage ──────────────────────────────────────────────────
-# Rust binary + pre-converted ONNX models.  Python is included for
-# prefer_ort models (BirdNET V3, Perch) whose DFT/STFT ops hang the
-# Rust `ort` crate — inference runs via a persistent Python subprocess
-# (ort_worker.py).  No TensorFlow at runtime.
-FROM python:3.11-slim
+# Rust binary + pre-converted ONNX models.  No Python at runtime —
+# all inference (including DFT/STFT models like BirdNET V3 and Perch)
+# runs natively through the `ort` crate with explicit thread limits.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir onnxruntime numpy
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 
@@ -287,14 +279,10 @@ COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-pr
 COPY --from=tract-validator    /validate/.tract-ok /tmp/.tract-ok
 COPY --from=smoke-test-runner  /test/.smoke-ok     /tmp/.smoke-ok
 
-# ONNX Runtime shared library for native Rust fallback inference
-# (models that fail tract but don't have DFT/STFT ops, e.g. batdetect2).
+# ONNX Runtime shared library for native Rust inference.
 # Extracted from the pip onnxruntime package in the ort-download stage.
 COPY --from=ort-download /usr/lib/libonnxruntime.so* /usr/lib/
 RUN ldconfig
-
-# Python ORT worker script — persistent subprocess for prefer_ort models.
-COPY scripts/ort_worker.py /usr/local/share/gaia/ort_worker.py
 
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory

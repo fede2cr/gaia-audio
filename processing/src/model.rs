@@ -203,27 +203,26 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
             //    → input-independent predictions).
             //
-            //    Use the Python onnxruntime subprocess: the Rust `ort`
-            //    crate hangs in CreateSession for models with DFT/STFT
-            //    ops, regardless of EP or optimisation level.  Python's
-            //    pip `onnxruntime` package handles them without issue.
+            //    Use ONNX Runtime CPU-only with explicit thread limits:
+            //    without them, ORT deadlocks in CreateSession for models
+            //    with DFT/STFT ops.
             if prefer_ort {
-                let slug = resolved.slug();
-                match crate::accel::OrtSession::new_python(&onnx_path, &slug) {
+                let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
+                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
                     Ok(sess) => {
                         info!(
-                            "Python ORT active (prefer_ort) for {}",
+                            "ORT active (prefer_ort) for {}",
                             onnx_path.display()
                         );
                         (None, Some(sess), is_classifier)
                     }
                     Err(e) => {
                         tracing::error!(
-                            "prefer_ort is set but Python ORT worker failed: {e:#}"
+                            "prefer_ort is set but ORT session failed: {e:#}"
                         );
                         return Err(e.context(
-                            "prefer_ort is set but Python ORT worker failed \
-                             (is python3 + onnxruntime installed?)"
+                            "prefer_ort is set but ORT session creation failed \
+                             (is libonnxruntime.so installed?)"
                         ));
                     }
                 }

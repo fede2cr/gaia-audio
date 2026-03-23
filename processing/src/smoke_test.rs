@@ -19,7 +19,6 @@
 //! Exits 0 on success, 1 on any assertion failure, 2 on usage error.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use tracing::{error, info, warn};
@@ -72,7 +71,7 @@ struct ModelResult {
 
 /// Run the build-stage smoke test.  Returns `Ok(())` on pass, `Err` on
 /// any failure.
-pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str, ort_script: Option<&Path>) -> Result<()> {
+pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str) -> Result<()> {
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║           BUILD-STAGE SMOKE TEST                        ║");
     info!("╚══════════════════════════════════════════════════════════╝");
@@ -161,64 +160,8 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str, ort_scr
 
     // ── Load models and run inference ────────────────────────────────
     let mut results: Vec<ModelResult> = Vec::new();
-    let mut ort_tested: usize = 0;
 
     for manifest in &bird_manifests {
-        // Models with prefer_ort=true cannot be loaded through the
-        // Rust `ort` crate's CPU EP (hangs on session creation for
-        // DFT/STFT ops).  Instead, shell out to the Python ORT
-        // smoke test script which uses the pip `onnxruntime` package.
-        if manifest.manifest.model.prefer_ort {
-            if let Some(script) = ort_script {
-                info!("━━━ {} (Python ORT) ━━━", manifest.manifest.model.name);
-
-                let onnx_path = manifest.onnx_path().unwrap_or_else(|| {
-                    manifest.base_dir.join(&manifest.manifest.model.tflite_file)
-                });
-
-                let transform_str = match manifest.manifest.model.score_transform {
-                    Some(ScoreTransform::Softmax) => "softmax",
-                    Some(ScoreTransform::CenteredSigmoid) => "sigmoid",
-                    Some(ScoreTransform::Sigmoid) | None => "sigmoid",
-                    Some(ScoreTransform::None) => "none",
-                };
-
-                let status = Command::new("python3")
-                    .arg(script)
-                    .arg("--audio").arg(audio_path)
-                    .arg("--species").arg(expected_species)
-                    .arg("--model").arg(&onnx_path)
-                    .arg("--labels").arg(manifest.labels_path())
-                    .arg("--sr").arg(manifest.manifest.model.sample_rate.to_string())
-                    .arg("--chunk").arg(manifest.manifest.model.chunk_duration.to_string())
-                    .arg("--output-index").arg(manifest.manifest.model.prediction_output_index.to_string())
-                    .arg("--transform").arg(transform_str)
-                    .arg("--name").arg(&manifest.manifest.model.name)
-                    .status()
-                    .with_context(|| format!(
-                        "Failed to spawn Python ORT script: {}",
-                        script.display()
-                    ))?;
-
-                if !status.success() {
-                    let code = status.code().unwrap_or(-1);
-                    bail!(
-                        "{}: Python ORT smoke test failed (exit code {})",
-                        manifest.manifest.model.name, code
-                    );
-                }
-
-                ort_tested += 1;
-                info!("");
-            } else {
-                info!(
-                    "SKIP: {} (prefer_ort=true — pass --ort-script to validate)",
-                    manifest.manifest.model.name
-                );
-            }
-            continue;
-        }
-
         info!("━━━ {} ━━━", manifest.manifest.model.name);
 
         let mut loaded = match model::load_model(manifest, &config) {
@@ -334,19 +277,22 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str, ort_scr
     }
 
     // ── Assertions ───────────────────────────────────────────────────
-    let total_tested = results.len() + ort_tested;
-    if total_tested == 0 {
+    // Every model must be tested — no silent skips.  This guarantees
+    // the build-time test exercises the exact same load + predict path
+    // that runs at container startup.
+    if results.len() != bird_manifests.len() {
         bail!(
-            "No models were tested — all {} bird/wildlife model(s) were skipped. \
-             Pass --ort-script to test prefer_ort models.",
+            "Only {}/{} bird/wildlife model(s) were tested — \
+             all models must pass to keep build-time and runtime parity",
+            results.len(),
             bird_manifests.len()
         );
     }
 
     info!("═══════════════════════════════════════════════════════════");
     info!(
-        "ASSERTIONS  ({} Rust + {} Python ORT = {} of {} tested)",
-        results.len(), ort_tested, total_tested, bird_manifests.len()
+        "ASSERTIONS  ({} model(s) tested)",
+        results.len()
     );
     info!("═══════════════════════════════════════════════════════════");
 
@@ -511,8 +457,8 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str, ort_scr
     if failures.is_empty() {
         info!("");
         info!(
-            "✅ ALL SMOKE TESTS PASSED ({} Rust + {} Python ORT = {} model(s))",
-            results.len(), ort_tested, total_tested
+            "✅ ALL SMOKE TESTS PASSED ({} model(s))",
+            results.len()
         );
         Ok(())
     } else {

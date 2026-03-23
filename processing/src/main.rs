@@ -98,7 +98,6 @@ fn main() -> Result<()> {
         let mut audio_path: Option<String> = None;
         let mut models_dir: Option<String> = None;
         let mut species: Option<String> = None;
-        let mut ort_script: Option<String> = None;
 
         let mut i = 2;
         while i < args.len() {
@@ -115,10 +114,6 @@ fn main() -> Result<()> {
                     species = args.get(i + 1).cloned();
                     i += 2;
                 }
-                "--ort-script" => {
-                    ort_script = args.get(i + 1).cloned();
-                    i += 2;
-                }
                 _ => {
                     eprintln!("Unknown argument: {}", args[i]);
                     i += 1;
@@ -129,8 +124,7 @@ fn main() -> Result<()> {
         let audio = audio_path.unwrap_or_else(|| {
             eprintln!(
                 "Usage: gaia-processing smoke-test \
-                 --audio <path.wav> --models <dir> --species \"Turdus merula\" \
-                 [--ort-script <path.py>]"
+                 --audio <path.wav> --models <dir> --species \"Turdus merula\""
             );
             std::process::exit(2);
         });
@@ -143,8 +137,7 @@ fn main() -> Result<()> {
             std::process::exit(2);
         });
 
-        let ort_script_path = ort_script.as_deref().map(Path::new);
-        match smoke_test::run(Path::new(&audio), Path::new(&models), &species, ort_script_path) {
+        match smoke_test::run(Path::new(&audio), Path::new(&models), &species) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 error!("Smoke test failed: {e:#}");
