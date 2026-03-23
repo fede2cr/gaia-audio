@@ -201,30 +201,29 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             // 0. If the manifest says prefer_ort, skip tract entirely.
             //    Some models load in tract but produce incorrect inference
             //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
-            //    → input-independent predictions).  ORT handles them
-            //    correctly.
+            //    → input-independent predictions).
             //
-            //    Always use CPU-only sessions for prefer_ort models:
-            //    MIGraphX/ROCm/TensorRT cannot compile DFT/STFT ops,
-            //    and the GPU EP chain hangs during session creation.
-            //    CPU inference is fast enough (~66 ms per 3-5 s chunk).
+            //    Use the Python onnxruntime subprocess: the Rust `ort`
+            //    crate hangs in CreateSession for models with DFT/STFT
+            //    ops, regardless of EP or optimisation level.  Python's
+            //    pip `onnxruntime` package handles them without issue.
             if prefer_ort {
-                let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
-                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                let slug = resolved.slug();
+                match crate::accel::OrtSession::new_python(&onnx_path, &slug) {
                     Ok(sess) => {
                         info!(
-                            "ONNX Runtime active (prefer_ort, CPU-only) for {}",
+                            "Python ORT active (prefer_ort) for {}",
                             onnx_path.display()
                         );
                         (None, Some(sess), is_classifier)
                     }
                     Err(e) => {
                         tracing::error!(
-                            "prefer_ort is set but ONNX Runtime failed: {e:#}"
+                            "prefer_ort is set but Python ORT worker failed: {e:#}"
                         );
                         return Err(e.context(
-                            "prefer_ort is set but ONNX Runtime is unavailable \
-                             (is libonnxruntime.so installed?)"
+                            "prefer_ort is set but Python ORT worker failed \
+                             (is python3 + onnxruntime installed?)"
                         ));
                     }
                 }
