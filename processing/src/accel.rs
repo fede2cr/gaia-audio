@@ -29,7 +29,7 @@
 //! Both MIGraphX and TensorRT cache compiled plans on disk so
 //! subsequent starts skip the slow compilation step.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -118,9 +118,47 @@ enum SessionKind {
     Python {
         child: Child,
         stdin: std::io::BufWriter<ChildStdin>,
-        stdout: BufReader<ChildStdout>,
+        /// Raw (unbuffered) stdout — no BufReader.  We read byte-by-byte
+        /// for JSON lines and exact counts for binary tensor data.
+        /// A BufReader's internal read-ahead would consume binary bytes
+        /// when reading the JSON header, corrupting the tensor data.
+        stdout: ChildStdout,
         model_id: String,
     },
+}
+
+/// Read a single `\n`-terminated line from a raw reader (no buffering).
+/// Returns the line content WITHOUT the trailing newline.
+fn raw_read_line(r: &mut impl Read) -> Result<String> {
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        match r.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            Err(e) => return Err(e).context("raw_read_line failed"),
+        }
+    }
+    String::from_utf8(buf).context("Non-UTF8 line from Python worker")
+}
+
+/// Read exactly `n` bytes from a raw reader.
+fn raw_read_exact(r: &mut impl Read, n: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => bail!("EOF after {filled}/{n} bytes"),
+            Ok(k) => filled += k,
+            Err(e) => return Err(e).context("raw_read_exact failed"),
+        }
+    }
+    Ok(buf)
 }
 
 impl OrtSession {
@@ -328,7 +366,7 @@ impl OrtSession {
         let child_stdout = child.stdout.take().context("No stdout on Python child")?;
 
         let mut stdin_writer = std::io::BufWriter::new(child_stdin);
-        let mut stdout_reader = BufReader::new(child_stdout);
+        let mut stdout_raw = child_stdout;
 
         // Send load command
         let load_cmd = serde_json::json!({
@@ -339,10 +377,8 @@ impl OrtSession {
         writeln!(stdin_writer, "{}", load_cmd).context("Failed to write load command")?;
         stdin_writer.flush()?;
 
-        // Read load response
-        let mut resp_line = String::new();
-        stdout_reader
-            .read_line(&mut resp_line)
+        // Read load response (byte-at-a-time, no buffering)
+        let resp_line = raw_read_line(&mut stdout_raw)
             .context("Failed to read load response from Python ORT worker")?;
 
         let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
@@ -370,7 +406,7 @@ impl OrtSession {
             inner: SessionKind::Python {
                 child,
                 stdin: stdin_writer,
-                stdout: stdout_reader,
+                stdout: stdout_raw,
                 model_id: model_id.to_string(),
             },
             shapes_logged: false,
@@ -460,10 +496,8 @@ impl OrtSession {
                 stdin.write_all(raw_bytes).context("Failed to write input tensor bytes")?;
                 stdin.flush()?;
 
-                // 3. Read JSON response header
-                let mut resp_line = String::new();
-                stdout
-                    .read_line(&mut resp_line)
+                // 3. Read JSON response header (byte-at-a-time, no buffering)
+                let resp_line = raw_read_line(stdout)
                     .context("Failed to read predict response")?;
 
                 let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
@@ -487,10 +521,8 @@ impl OrtSession {
                     info!("Python ORT predict: output[{output_index}] len={out_n}");
                 }
 
-                // 4. Read raw f32 output bytes
-                let mut out_bytes = vec![0u8; out_n * std::mem::size_of::<f32>()];
-                stdout
-                    .read_exact(&mut out_bytes)
+                // 4. Read raw f32 output bytes (exact count, no buffering)
+                let out_bytes = raw_read_exact(stdout, out_n * std::mem::size_of::<f32>())
                     .context("Failed to read output tensor bytes")?;
 
                 let out_floats: Vec<f32> = out_bytes
