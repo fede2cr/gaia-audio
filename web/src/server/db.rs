@@ -208,6 +208,9 @@ pub async fn recent_detections(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
@@ -287,6 +290,9 @@ pub async fn day_detections(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
@@ -965,6 +971,9 @@ pub async fn recent_detections_filtered(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
@@ -1096,6 +1105,9 @@ pub async fn day_detections_filtered(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
@@ -1185,6 +1197,9 @@ pub async fn species_detections_by_model(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
@@ -1353,6 +1368,9 @@ pub async fn excluded_detections_for_species(
             image_url: None,
             model_slug: row.get::<String>(10)?,
             model_name: row.get::<String>(11)?,
+            model_beta: false,
+            agreement_score: 0.0,
+            agreement_models: String::new(),
             display_date: String::new(),
             display_time: String::new(),
         });
