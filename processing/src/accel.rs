@@ -97,6 +97,13 @@ impl OrtSession {
     ///
     /// `cache_dir` is used by MIGraphX / TensorRT to store compiled
     /// plans.  Ignored when running on CPU only.
+    ///
+    /// **Not currently used**: `prefer_ort` models use `new_cpu()`
+    /// because the pip-bundled `libonnxruntime.so` (which handles
+    /// DFT/STFT models without hanging) is CPU-only.  Kept for
+    /// future use when GPU-capable ORT builds that handle DFT ops
+    /// become available.
+    #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         let kind = accel_kind();
 

@@ -141,26 +141,21 @@ RUN python3 patch_birdnet3_onnx.py -o /convert/birdnet3.onnx && \
 # Validate BirdNET+ V3.0 ONNX: input = (1, 96000) raw audio at 32 kHz × 3s
 RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000
 
-# ── ONNX Runtime shared library (CPU inference fallback) ──────────
+# ── ONNX Runtime shared library ───────────────────────────────────
 # When tract-onnx cannot handle a model (e.g. DFT/STFT ops in BirdNET
-# V3), the processing server falls back to ONNX Runtime via the `ort`
-# crate with the CPU execution provider.  This stage downloads the
-# official release tarball so no Python is needed at runtime.
-FROM debian:trixie-slim AS ort-download
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates && rm -rf /var/lib/apt/lists/*
-ARG ORT_VERSION=1.21.0
-RUN ARCH=$(uname -m) && \
-    case "${ARCH}" in \
-      x86_64)  ORT_ARCH=x64     ;; \
-      aarch64) ORT_ARCH=aarch64 ;; \
-      *)       echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
-    esac && \
-    curl -sSL \
-      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" | \
-    tar xz -C /tmp && \
-    cp "/tmp/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /usr/lib/ && \
-    ln -sf "libonnxruntime.so.${ORT_VERSION}" /usr/lib/libonnxruntime.so
+# V3, Perch), the processing server falls back to ONNX Runtime via the
+# `ort` crate.
+#
+# IMPORTANT: we extract libonnxruntime.so from the Python pip package
+# rather than the GitHub releases tarball.  The pip-bundled build
+# handles DFT/STFT models correctly, while the tarball build hangs
+# indefinitely in CreateSession for those same models.
+FROM python:3.11-slim AS ort-download
+RUN pip install --no-cache-dir onnxruntime && \
+    ORT_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))") && \
+    cp "${ORT_LIB}"/libonnxruntime.so* /usr/lib/ && \
+    ls -lh /usr/lib/libonnxruntime.so* && \
+    ldconfig
 
 # ── tract-onnx dry-run validation ──────────────────────────────────
 # Actually load every ONNX model through tract-onnx (the runtime

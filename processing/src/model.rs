@@ -202,14 +202,18 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             //    Some models load in tract but produce incorrect inference
             //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
             //    → input-independent predictions).  ORT handles them
-            //    correctly.  Uses full GPU chain when GAIA_ACCEL is set.
+            //    correctly.
+            //
+            //    Always use CPU-only sessions for prefer_ort models:
+            //    MIGraphX/ROCm/TensorRT cannot compile DFT/STFT ops,
+            //    and the GPU EP chain hangs during session creation.
+            //    CPU inference is fast enough (~66 ms per 3-5 s chunk).
             if prefer_ort {
                 let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
-                match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
                     Ok(sess) => {
                         info!(
-                            "ONNX Runtime active (prefer_ort, accel={:?}) for {}",
-                            crate::accel::accel_kind(),
+                            "ONNX Runtime active (prefer_ort, CPU-only) for {}",
                             onnx_path.display()
                         );
                         (None, Some(sess), is_classifier)
