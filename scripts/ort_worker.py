@@ -56,16 +56,16 @@ def handle_load(msg: dict) -> dict:
     }
 
 
-def handle_predict(msg: dict) -> dict | None:
+def handle_predict(msg: dict, stdin) -> dict | None:
     """Read raw f32 bytes from stdin, run inference, write raw f32 bytes to stdout."""
     model_id = msg["id"]
     shape = msg["shape"]
     output_index = msg["output_index"]
     n_floats = msg["n_floats"]
 
-    # Read raw input tensor bytes
+    # Read raw input tensor bytes from the binary stdin handle
     n_bytes = n_floats * 4
-    raw = sys.stdin.buffer.read(n_bytes)
+    raw = stdin.read(n_bytes)
     if len(raw) != n_bytes:
         return {"ok": False, "error": f"Expected {n_bytes} bytes, got {len(raw)}"}
 
@@ -95,8 +95,17 @@ def handle_predict(msg: dict) -> dict | None:
 
 
 def main() -> None:
-    for line in sys.stdin:
-        line = line.strip()
+    # IMPORTANT: read from sys.stdin.buffer (binary mode) exclusively.
+    # `for line in sys.stdin:` uses text-mode read-ahead buffering that
+    # consumes the raw binary tensor bytes that follow JSON lines,
+    # causing predict to hang waiting for data that's already been eaten.
+    stdin = sys.stdin.buffer
+
+    while True:
+        raw_line = stdin.readline()
+        if not raw_line:
+            break  # EOF
+        line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
 
@@ -115,7 +124,7 @@ def main() -> None:
         elif cmd == "load":
             resp = handle_load(msg)
         elif cmd == "predict":
-            resp = handle_predict(msg)
+            resp = handle_predict(msg, stdin)
             if resp is None:
                 continue  # already sent in handle_predict
         else:
