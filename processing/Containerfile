@@ -271,7 +271,12 @@ RUN gaia-processing validate-manifests /test/models
 # timeout 300 (5 min): prevents indefinite hangs if an ORT version
 # regression reintroduces the CreateSession deadlock.  Normal smoke
 # tests complete in under 60 seconds.
+# ORT_INTRA_THREADS=1: prevent thread-pool deadlocks during
+# CreateSession for DFT/STFT models (Perch, BirdNET V3) in the
+# constrained BuildKit environment.  At runtime the default (4)
+# is used for better inference throughput.
 RUN RUST_LOG=info \
+    ORT_INTRA_THREADS=1 \
     timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \

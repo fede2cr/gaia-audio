@@ -23,6 +23,18 @@ use anyhow::{Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use tracing::info;
 
+/// Read the `ORT_INTRA_THREADS` env var, falling back to `default`.
+///
+/// In constrained environments (Docker build, CI) set this to `1` to
+/// avoid thread-pool deadlocks during `CreateSession` for models with
+/// complex DFT/STFT subgraphs (Perch, BirdNET V3).
+fn ort_intra_threads(default: usize) -> usize {
+    std::env::var("ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 // ── Runtime check ────────────────────────────────────────────────────────
 
 /// Detected acceleration backend from the `GAIA_ACCEL` env var.
@@ -122,12 +134,18 @@ impl OrtSession {
             ),
         }
 
+        let intra = ort_intra_threads(4);
+        info!("ORT thread config: intra={intra}, inter=1");
+
         let mut builder = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
             // Thread limits prevent deadlocks in CreateSession for models
             // with DFT/STFT ops.  Applied to all EP chains — the CPU
             // fallback within a GPU chain can trigger the same hang.
-            .with_intra_threads(4)
+            //
+            // Configurable via ORT_INTRA_THREADS (default 4).  Set to 1
+            // in Docker builds / CI where CPU resources are constrained.
+            .with_intra_threads(intra)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -249,11 +267,16 @@ impl OrtSession {
         // (BirdNET V3, Perch).  Without explicit limits the ORT default
         // (0 = "let ORT decide") creates a huge thread pool that deadlocks
         // inside CreateSession for complex signal-processing subgraphs.
-        // Match the values used by the Python onnxruntime pip package
-        // (inter=1, intra=4), which loads these models without issue.
+        //
+        // Configurable via ORT_INTRA_THREADS (default 4).  Set to 1
+        // in Docker builds / CI to avoid deadlocks when CPU resources
+        // are constrained (BuildKit containers often have limited cores).
+        let intra = ort_intra_threads(4);
+        info!("ORT thread config: intra={intra}, inter=1");
+
         let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
-            .with_intra_threads(4)
+            .with_intra_threads(intra)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
