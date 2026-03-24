@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::manifest::ResolvedManifest;
 use gaia_common::config::Config;
+use gaia_common::detection::normalize_sci_name;
 
 // ── constants ────────────────────────────────────────────────────────────
 
@@ -875,7 +876,10 @@ impl MetaDataModel {
         let list: Vec<String> = scored
             .iter()
             .filter(|(score, _)| *score >= self.sf_thresh as f32)
-            .map(|(_, label)| label.split('_').next().unwrap_or(label).to_string())
+            .map(|(_, label)| {
+                let sci = label.split('_').next().unwrap_or(label);
+                normalize_sci_name(sci)
+            })
             .collect();
 
         tracing::info!(
@@ -995,7 +999,7 @@ fn load_labels(
         data_lines
             .map(|line| {
                 let cols: Vec<&str> = line.split(delim).collect();
-                let sci = cols.get(sci_col).unwrap_or(&line).trim().to_string();
+                let sci = normalize_sci_name(cols.get(sci_col).unwrap_or(&line).trim());
                 if let Some(ci) = com_col {
                     if let Some(cn) = cols.get(ci) {
                         let cn = cn.trim();
@@ -1020,14 +1024,14 @@ fn load_labels(
             .map(|line| {
                 let line = line.trim();
                 if line.matches('_').count() == 1 {
-                    let sci = line.split('_').next().unwrap_or(line).to_string();
+                    let sci = normalize_sci_name(line.split('_').next().unwrap_or(line));
                     let com = line.split('_').nth(1).unwrap_or("");
                     if !com.is_empty() {
                         common_names.insert(sci.clone(), com.to_string());
                     }
                     sci
                 } else {
-                    line.to_string()
+                    normalize_sci_name(line)
                 }
             })
             .collect()

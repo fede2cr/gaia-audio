@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use gaia_common::audio;
 use gaia_common::config::Config;
-use gaia_common::detection::{Detection, ParsedFileName};
+use gaia_common::detection::{normalize_sci_name, Detection, ParsedFileName};
 
 use crate::live_status::{self, LivePrediction};
 use crate::model::{self, LoadedModel, Prediction};
@@ -96,7 +96,7 @@ pub fn process_file(
             for label in model.labels() {
                 // BirdNET labels: "Sci Name_Common Name" or just "Sci Name".
                 let sci = label.split('_').next().unwrap_or(label);
-                known_bird_labels.insert(sci.to_string());
+                known_bird_labels.insert(normalize_sci_name(sci));
             }
         }
     }
@@ -309,6 +309,26 @@ fn run_analysis(
     } else {
         shared_species_range
     };
+    let predicted_species_set: HashSet<String> = predicted_species_list
+        .iter()
+        .map(|s| normalize_sci_name(s))
+        .collect();
+    let include_set: HashSet<String> = include_list
+        .iter()
+        .map(|s| normalize_sci_name(s))
+        .collect();
+    let exclude_set: HashSet<String> = exclude_list
+        .iter()
+        .map(|s| normalize_sci_name(s))
+        .collect();
+    let whitelist_set: HashSet<String> = whitelist
+        .iter()
+        .map(|s| normalize_sci_name(s))
+        .collect();
+    let class_map_norm: HashMap<String, String> = class_map
+        .iter()
+        .map(|(k, v)| (normalize_sci_name(k), v.clone()))
+        .collect();
     let using_shared = own_species_list.is_empty() && !shared_species_range.is_empty();
 
     if !predicted_species_list.is_empty() {
@@ -365,16 +385,19 @@ fn run_analysis(
                 continue;
             }
 
+            let sci_norm = normalize_sci_name(sci_name);
+
             let com_name = names
                 .get(sci_name.as_str())
+                .or_else(|| names.get(sci_norm.as_str()))
                 .cloned()
                 .unwrap_or_else(|| sci_name.clone());
 
-            if !include_list.is_empty() && !include_list.contains(sci_name) {
+            if !include_set.is_empty() && !include_set.contains(sci_norm.as_str()) {
                 warn!("[{tag}] Excluded (not in include list): {sci_name}");
                 continue;
             }
-            if !exclude_list.is_empty() && exclude_list.contains(sci_name) {
+            if !exclude_set.is_empty() && exclude_set.contains(sci_norm.as_str()) {
                 warn!("[{tag}] Excluded (in exclude list): {sci_name}");
                 continue;
             }
@@ -397,8 +420,10 @@ fn run_analysis(
             // says otherwise.
             let is_bird = if let Some(cls) = class_map.get(sci_name.as_str()) {
                 cls == "Aves"
+            } else if let Some(cls) = class_map_norm.get(sci_norm.as_str()) {
+                cls == "Aves"
             } else if !known_bird_labels.is_empty() {
-                known_bird_labels.contains(sci_name.as_str())
+                known_bird_labels.contains(sci_norm.as_str())
             } else {
                 // No class info and no bird reference set — assume bird
                 // for backward compatibility (matches previous default).
@@ -407,15 +432,15 @@ fn run_analysis(
 
             // Check the neural species-range model (birds).
             let excluded_by_range_model = is_bird
-                && !predicted_species_list.is_empty()
-                && !predicted_species_list.contains(sci_name)
-                && !whitelist.contains(sci_name);
+                && !predicted_species_set.is_empty()
+                && !predicted_species_set.contains(sci_norm.as_str())
+                && !whitelist_set.contains(sci_norm.as_str());
 
             // Check the static CSV range file (non-birds: insects, frogs, bats, etc.).
             let static_ranges = crate::species_range::global();
             let excluded_by_static = if !is_bird && !static_ranges.is_empty() {
-                match static_ranges.check(sci_name, config.latitude, config.longitude, file.file_date.month()) {
-                    Some(false) => !whitelist.contains(sci_name),
+                match static_ranges.check(sci_norm.as_str(), config.latitude, config.longitude, file.file_date.month()) {
+                    Some(false) => !whitelist_set.contains(sci_norm.as_str()),
                     _ => false, // in range, or not in file → accept
                 }
             } else {
@@ -441,6 +466,7 @@ fn run_analysis(
             // otherwise fall back to the model-wide domain.
             let det_domain = class_map
                 .get(sci_name.as_str())
+                .or_else(|| class_map_norm.get(sci_norm.as_str()))
                 .map_or(&domain, |c| c);
 
             let mut det = Detection::new(

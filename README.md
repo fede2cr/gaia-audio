@@ -275,6 +275,10 @@ That smoke test prints per-model detection logs for:
 It validates not only model loading, but also what each model detects on the
 same input audio and whether confidence scores are sane.
 
+Build-time ONNX validation now runs through a native Rust binary
+(`validate_onnx`) baked from the processing crate, replacing the previous
+Python validator script.
+
 The processing image includes:
 - Pre-converted BirdNET V2.4 ONNX models (classifier ~49 MB + metadata ~28 MB)
 - Bundled manifests for BirdNET, Perch, and BatDetect2
