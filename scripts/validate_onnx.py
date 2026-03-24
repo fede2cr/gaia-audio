@@ -29,7 +29,11 @@ import sys
 import time
 
 
-def validate(model_path: str, expected_shape: list[int]) -> None:
+def validate(
+    model_path: str,
+    expected_shape: list[int],
+    enforce_tract_checks: bool = True,
+) -> None:
     import numpy as np
     import onnxruntime as ort
 
@@ -116,6 +120,11 @@ def validate(model_path: str, expected_shape: list[int]) -> None:
     # ── 5. tract-onnx compatibility checks ─────────────────────────────
     # tract-onnx is stricter than onnxruntime.  Catch incompatibilities
     # at build time so they don't surface after publishing the container.
+    if not enforce_tract_checks:
+        print("  tract-onnx compatibility checks skipped (--skip-tract-checks)")
+        print(f"  PASS ✓")
+        return
+
     try:
         import onnx
         from onnx import numpy_helper
@@ -225,13 +234,22 @@ def main():
         "--shape", required=True,
         help="Expected input shape as comma-separated ints, "
              "e.g. 1,96,511,2")
+    parser.add_argument(
+        "--skip-tract-checks",
+        action="store_true",
+        help="Validate ONNX Runtime load/inference only; skip tract-onnx compatibility checks",
+    )
     args = parser.parse_args()
 
     shape = [int(d) for d in args.shape.split(",")]
     print(f"Validating {args.model} (expected input: {shape})")
 
     try:
-        validate(args.model, shape)
+        validate(
+            args.model,
+            shape,
+            enforce_tract_checks=not args.skip_tract_checks,
+        )
     except RuntimeError as e:
         print(f"  FAIL ✗  {e}", file=sys.stderr)
         sys.exit(1)

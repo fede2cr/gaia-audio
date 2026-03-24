@@ -49,6 +49,11 @@ md5.workspace = true
 # needed at build time.  `rocm` and `cuda` just expose the EP types
 # (MIGraphX/ROCm and TensorRT/CUDA respectively); the actual GPU
 # libraries only need to be present at runtime.
+#
+# default-features = false avoids pulling in `download-binaries`
+# (wasteful with `load-dynamic`).  `tracing` gives us the ORT →
+# tracing bridge for structured logging.
 [dependencies.ort]
 version = "2.0.0-rc.12"
-features = ["load-dynamic", "rocm", "cuda"]
+default-features = false
+features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-24"]

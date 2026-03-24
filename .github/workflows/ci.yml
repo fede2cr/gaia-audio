@@ -84,7 +84,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
 
       - name: Build and push by digest
-        id: build
+        if: matrix.image != 'processing'
+        id: build_other
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -95,11 +96,25 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }},ignore-error=true
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
+      - name: Build and push processing by digest (runtime stage with mandatory smoke tests)
+        if: matrix.image == 'processing'
+        id: build_processing
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }},ignore-error=true
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+
       - name: Export digest
         if: github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
+          digest="${{ steps.build_processing.outputs.digest || steps.build_other.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest

@@ -17,11 +17,80 @@
 //! Both MIGraphX and TensorRT cache compiled plans on disk so
 //! subsequent starts skip the slow compilation step.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::{Context, Result};
-use ort::session::builder::GraphOptimizationLevel;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Initialise the ORT global environment exactly once.
+fn init_ort_environment() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Some(lib_path) = resolve_ort_dylib_path() {
+            match ort::init_from(&lib_path) {
+                Ok(builder) => {
+                    builder.commit();
+                    if let Ok(env) = ort::environment::Environment::current() {
+                        env.set_log_level(ort::logging::LogLevel::Warning);
+                    }
+                    info!("ORT environment initialised from {}", lib_path.display());
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to init ORT from {}: {e}; falling back to default loader",
+                        lib_path.display()
+                    );
+                }
+            }
+        }
+
+        ort::init().commit();
+        if let Ok(env) = ort::environment::Environment::current() {
+            env.set_log_level(ort::logging::LogLevel::Warning);
+        }
+        info!("ORT environment initialised");
+    });
+}
+
+/// Resolve the ONNX Runtime shared library path for `ort::init_from`.
+///
+/// Priority:
+/// 1. `ORT_DYLIB_PATH` environment variable (if it points to a file)
+/// 2. Common system locations used by the container image
+fn resolve_ort_dylib_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "/usr/lib/libonnxruntime.so",
+        "/usr/local/lib/libonnxruntime.so",
+    ];
+    for candidate in CANDIDATES {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir("/usr/lib") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("libonnxruntime.so") && p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Read the `ORT_INTRA_THREADS` env var, falling back to `default`.
 ///
@@ -94,16 +163,12 @@ pub fn is_gpu_requested() -> bool {
 ///
 /// ### CPU mode (`new_cpu`)
 ///
-/// CPU-only with explicit thread limits.  Critical for models with
-/// DFT/STFT ops (BirdNET V3, Perch): without explicit
-/// `intra_threads` / `inter_threads`, ORT's default thread pool
-/// deadlocks inside `CreateSession`.
+/// CPU-only with ORT defaults.  Used for DFT/STFT models that tract
+/// cannot handle (BirdNET V3, Perch).
+///
+/// Build-time smoke tests exercise this path for BirdNET V3/Perch.
 pub struct OrtSession {
     session: ort::session::Session,
-    /// Whether we have logged the output shape info (once per session).
-    shapes_logged: bool,
-    /// Whether we have logged the output data shape (once per session).
-    shape_data_logged: bool,
 }
 
 impl OrtSession {
@@ -117,6 +182,7 @@ impl OrtSession {
     /// Kept for future GPU-accelerated inference.
     #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
+        init_ort_environment();
         let kind = accel_kind();
 
         match kind {
@@ -138,37 +204,16 @@ impl OrtSession {
         info!("ORT thread config: intra={intra}, inter=1");
 
         let mut builder = ort::session::Session::builder()
-            .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
-            // Thread limits prevent deadlocks in CreateSession for models
-            // with DFT/STFT ops.  Applied to all EP chains — the CPU
-            // fallback within a GPU chain can trigger the same hang.
-            //
-            // Configurable via ORT_INTRA_THREADS (default 4).  Set to 1
-            // in Docker builds / CI where CPU resources are constrained.
-            .with_intra_threads(intra)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_inter_threads(1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            // Disable memory-pattern optimisation — it does a full graph
-            // walk to plan memory reuse and can hang on complex DFT/STFT
-            // subgraphs (Perch V2, BirdNET V3).
-            .with_memory_pattern(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            // Disable thread spinning — in constrained environments
-            // (Docker builds / CI) spinning threads cause contention
-            // that can escalate into deadlocks during session init.
-            .with_intra_op_spinning(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_inter_op_spinning(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?;
 
-        // GPU EPs (MIGraphX, TensorRT) do their own compilation/optimisation,
-        // so full graph optimisation is fine.  For CPU-only, disable all
-        // graph optimisation — even Level1 (Constant Folding) can hang
-        // for 10+ minutes on models with complex DFT/STFT subgraphs.
-        if kind == AccelKind::None {
+        // For GPU paths, explicit thread config helps overlap EP compilation.
+        // For CPU-only, use ORT defaults (matching birdnet-onnx) to avoid
+        // deadlocks during graph optimisation of DFT/STFT subgraphs.
+        if kind != AccelKind::None {
             builder = builder
-                .with_optimization_level(GraphOptimizationLevel::Disable)
+                .with_intra_threads(intra)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_inter_threads(1)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
@@ -253,8 +298,6 @@ impl OrtSession {
 
         Ok(Self {
             session,
-            shapes_logged: false,
-            shape_data_logged: false,
         })
     }
 
@@ -275,53 +318,39 @@ impl OrtSession {
             onnx_path.display()
         );
 
-        // Thread configuration is critical for models with DFT/STFT ops
-        // (BirdNET V3, Perch).  Without explicit limits the ORT default
-        // (0 = "let ORT decide") creates a huge thread pool that deadlocks
-        // inside CreateSession for complex signal-processing subgraphs.
-        //
-        // Configurable via ORT_INTRA_THREADS (default 4).  Set to 1
-        // in Docker builds / CI to avoid deadlocks when CPU resources
-        // are constrained (BuildKit containers often have limited cores).
-        let intra = ort_intra_threads(4);
-        info!("ORT thread config: intra={intra}, inter=1");
+        // Log the model file size — useful for diagnosing issues
+        if let Ok(meta) = std::fs::metadata(onnx_path) {
+            info!(
+                "Model file: {} ({:.1} MB)",
+                onnx_path.display(),
+                meta.len() as f64 / 1_048_576.0
+            );
+        }
 
+        // Ensure ORT environment is initialized before creating sessions.
+        init_ort_environment();
+
+        let start = std::time::Instant::now();
+        info!("  Calling CreateSession for {}...", onnx_path.display());
+
+        // Match birda/rust-birdnet-onnx defaults: no explicit thread,
+        // optimisation, or EP overrides in CPU fallback mode.
         let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
-            .with_intra_threads(intra)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_inter_threads(1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Disable)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            // Disable memory-pattern optimisation — it does a full graph
-            // walk to plan memory reuse and can hang on complex DFT/STFT
-            // subgraphs (Perch V2, BirdNET V3).  Adds negligible runtime
-            // cost since these models are loaded once.
-            .with_memory_pattern(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            // Disable thread spinning to prevent contention deadlocks
-            // during session init in constrained environments.
-            .with_intra_op_spinning(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_inter_op_spinning(false)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(onnx_path)
-            .with_context(|| format!("ORT CPU: failed to load {}", onnx_path.display()))?;
+            .with_context(|| format!("ORT: failed to load {}", onnx_path.display()))?;
 
+        let elapsed = start.elapsed();
         info!(
-            "ORT session created for {} ({} inputs, {} outputs, accel=CPU-only)",
+            "ORT session created for {} ({} inputs, {} outputs, accel=CPU-only) in {:.1}s",
             onnx_path.display(),
             session.inputs().len(),
             session.outputs().len(),
+            elapsed.as_secs_f64(),
         );
 
         Ok(Self {
             session,
-            shapes_logged: false,
-            shape_data_logged: false,
         })
     }
 
@@ -340,14 +369,6 @@ impl OrtSession {
         let session = &mut self.session;
         let input_name = session.inputs()[0].name().to_string();
 
-        // Log all output names on the first call.
-        if !self.shapes_logged {
-            self.shapes_logged = true;
-            for (i, out_meta) in session.outputs().iter().enumerate() {
-                info!("ORT output[{i}]: name={:?}", out_meta.name());
-            }
-        }
-
         let shape_i64: Vec<i64> = input_shape.iter().map(|&d| d as i64).collect();
         let input_tensor =
             ort::value::Tensor::from_array((shape_i64, input_data.into_boxed_slice()))
@@ -363,17 +384,9 @@ impl OrtSession {
             outputs.len()
         );
 
-        let (shape, data) = outputs[output_index]
+        let (_shape, data) = outputs[output_index]
             .try_extract_tensor::<f32>()
             .context("Cannot extract f32 output tensor")?;
-
-        if !self.shape_data_logged {
-            self.shape_data_logged = true;
-            info!(
-                "ORT predict: output[{output_index}] shape={shape:?}, len={}",
-                data.len()
-            );
-        }
 
         Ok(data.to_vec())
     }

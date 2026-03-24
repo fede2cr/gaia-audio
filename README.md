@@ -233,12 +233,47 @@ cd web && cargo leptos build --release
 # Build capture image
 podman build -f capture/Containerfile -t fede2/gaia-audio-capture .
 
-# Build processing image (includes Keras→ONNX conversion + bundled manifests)
-podman build -f processing/Containerfile -t fede2/gaia-audio-processing .
+# Build processing image (recommended). This ALWAYS runs build-time
+# validations + smoke tests before producing the final image.
+podman build -f processing/Containerfile --progress=plain \
+  -t fede2/gaia-audio-processing .
 
 # Build web dashboard image
 podman build -f web/Containerfile -t fede2/gaia-audio-web .
 ```
+
+### Processing Container Build Pipeline (recommended)
+
+```bash
+# 0) Always run from projects/gaia-audio/
+cd projects/gaia-audio
+
+# 1) Optional: validate conversion stages independently
+podman build -f processing/Containerfile --progress=plain --target converter .
+podman build -f processing/Containerfile --progress=plain --target birdnet3converter .
+podman build -f processing/Containerfile --progress=plain --target tract-validator .
+
+# 2) Run end-to-end model smoke test (required in CI)
+podman build -f processing/Containerfile --progress=plain \
+  --target smoke-test-runner -t gaia-processing-smoke-rust .
+
+# 3) Build final runtime image (default path; includes smoke tests)
+podman build -f processing/Containerfile --progress=plain \
+  -t fede2/gaia-audio-processing .
+
+# 4) Use --no-cache when diagnosing model/runtime regressions
+podman build -f processing/Containerfile --no-cache --progress=plain \
+  --target smoke-test-runner -t gaia-processing-smoke-rust .
+```
+
+The default final image build runs `smoke-test-runner` automatically.
+That smoke test prints per-model detection logs for:
+- BirdNET V2.4
+- BirdNET+ V3.0
+- Google Perch 2.0
+
+It validates not only model loading, but also what each model detects on the
+same input audio and whether confidence scores are sane.
 
 The processing image includes:
 - Pre-converted BirdNET V2.4 ONNX models (classifier ~49 MB + metadata ~28 MB)

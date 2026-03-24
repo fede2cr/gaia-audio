@@ -465,9 +465,12 @@ impl LoadedModel {
                 .labels
                 .iter()
                 .zip(scores.iter())
-                .map(|(label, &score)| (label.clone(), score as f64))
+                .map(|(label, &score)| {
+                    let safe_score = if score.is_finite() { score } else { 0.0 };
+                    (label.clone(), safe_score as f64)
+                })
                 .collect();
-            predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            predictions.sort_by(|a, b| b.1.total_cmp(&a.1));
             return Ok(predictions);
         }
 
@@ -524,10 +527,13 @@ impl LoadedModel {
             .labels
             .iter()
             .zip(scores.iter())
-            .map(|(label, &score)| (label.clone(), score as f64))
+            .map(|(label, &score)| {
+                let safe_score = if score.is_finite() { score } else { 0.0 };
+                (label.clone(), safe_score as f64)
+            })
             .collect();
 
-        predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        predictions.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(predictions)
     }
 
@@ -558,21 +564,42 @@ impl LoadedModel {
             return;
         }
 
-        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let min_logit = logits.iter().cloned().fold(f32::INFINITY, f32::min);
-        let positive = logits.iter().filter(|&&x| x > 0.0).count();
+        let finite_logits: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+        let non_finite = logits.len().saturating_sub(finite_logits.len());
+
+        let max_logit = finite_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_logit = finite_logits
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let positive = finite_logits.iter().filter(|&&x| x > 0.0).count();
 
         // Top-5 raw logits (before any transform).
-        let mut sorted: Vec<f32> = logits.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let top5: Vec<String> = sorted.iter().take(5).map(|x| format!("{x:.4}")).collect();
+        let mut sorted: Vec<f32> = finite_logits.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let top5: Vec<String> = if sorted.is_empty() {
+            vec!["<no finite logits>".to_string()]
+        } else {
+            sorted.iter().take(5).map(|x| format!("{x:.4}")).collect()
+        };
 
         info!(
             "[{name}] First inference: {n_logits} logits, {n_labels} labels, \
              range=[{min_logit:.4}, {max_logit:.4}], {positive} positive, \
-             top5=[{}], transform={transform:?}",
+             non_finite={non_finite}, top5=[{}], transform={transform:?}",
             top5.join(", ")
         );
+
+        if sorted.is_empty() {
+            tracing::warn!(
+                "[{name}] All logits are non-finite (NaN/Inf). \
+                 This usually indicates model/runtime incompatibility."
+            );
+            return;
+        }
 
         // Also show what the transform does to the top logit.
         let top_score = match transform {
@@ -630,7 +657,10 @@ impl LoadedModel {
             ScoreTransform::CenteredSigmoid => centered_sigmoid(logits),
             ScoreTransform::None => {
                 // Clamp raw logits to [0, 1].
-                logits.iter().map(|&x| x.clamp(0.0, 1.0)).collect()
+                logits
+                    .iter()
+                    .map(|&x| if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 })
+                    .collect()
             }
         }
     }
@@ -650,6 +680,9 @@ impl LoadedModel {
         logits
             .iter()
             .map(|&x| {
+                if !x.is_finite() {
+                    return 0.0;
+                }
                 let clamped = x.clamp(-20.0, 20.0);
                 let score = 1.0 / (1.0 + (-s * clamped).exp());
                 if score <= 0.5 { 0.0 } else { score }
@@ -672,9 +705,26 @@ impl LoadedModel {
 // ── softmax ──────────────────────────────────────────────────────────────
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    if logits.is_empty() {
+        return vec![];
+    }
+
+    let finite: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; logits.len()];
+    }
+
+    let max = finite.into_iter().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&x| if x.is_finite() { (x - max).exp() } else { 0.0 })
+        .collect();
     let sum: f32 = exps.iter().sum();
+
+    if !sum.is_finite() || sum <= 0.0 {
+        return vec![0.0; logits.len()];
+    }
+
     exps.iter().map(|&e| e / sum).collect()
 }
 
@@ -685,16 +735,25 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 /// apply the standard sigmoid.  This ensures the per-chunk average logit
 /// maps to 50% and only genuinely strong activations reach >80%.
 fn centered_sigmoid(logits: &[f32]) -> Vec<f32> {
-    let n = logits.len() as f32;
-    if n == 0.0 {
+    if logits.is_empty() {
         return vec![];
     }
-    let mean = logits.iter().sum::<f32>() / n;
-    let variance = logits.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+
+    let finite: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; logits.len()];
+    }
+
+    let n = finite.len() as f32;
+    let mean = finite.iter().sum::<f32>() / n;
+    let variance = finite.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
     let std = variance.sqrt().max(1.0);
     logits
         .iter()
         .map(|&x| {
+            if !x.is_finite() {
+                return 0.0;
+            }
             let z = ((x - mean) / std).clamp(-20.0, 20.0);
             1.0 / (1.0 + (-z).exp())
         })

@@ -33,11 +33,24 @@ pub fn read_audio(
     let n_channels = spec.channels as usize;
 
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => reader
-            .into_samples::<i32>()
-            .take_while(|s| s.is_ok())
-            .map(|s| s.unwrap() as f32 / i32::MAX as f32)
-            .collect(),
+        hound::SampleFormat::Int => {
+            // Scale signed PCM according to the file's bit depth.
+            // Using i32::MAX for all integer WAVs under-scales common
+            // 16-bit audio by ~65k×, which can make raw-audio models
+            // (e.g. BirdNET+ V3.0) numerically unstable.
+            let bits = spec.bits_per_sample.clamp(1, 32) as u32;
+            let max_amplitude = if bits == 32 {
+                i32::MAX as f32
+            } else {
+                ((1_i64 << (bits - 1)) - 1) as f32
+            };
+
+            reader
+                .into_samples::<i32>()
+                .take_while(|s| s.is_ok())
+                .map(|s| (s.unwrap() as f32 / max_amplitude).clamp(-1.0, 1.0))
+                .collect()
+        }
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
             .take_while(|s| s.is_ok())

@@ -1,3 +1,29 @@
+# ── Build instructions (from projects/gaia-audio/) ──────────────────
+#
+# Default (recommended): build final image. This ALWAYS runs all
+# build-time validations and smoke tests because the final stage copies
+# sentinel files produced by `tract-validator` and `smoke-test-runner`.
+#
+#    podman build -f processing/Containerfile --progress=plain \
+#      -t fede2/gaia-audio-processing .
+#
+# Optional: build only the smoke-test stage while debugging:
+#
+#    podman build -f processing/Containerfile --progress=plain \
+#      --target smoke-test-runner -t gaia-processing-smoke-rust .
+#
+# Optional: debug intermediate conversion/validation stages:
+#    podman build -f processing/Containerfile --progress=plain --target converter .
+#    podman build -f processing/Containerfile --progress=plain --target birdnet3converter .
+#    podman build -f processing/Containerfile --progress=plain --target tract-validator .
+#
+# 4) Rebuild without cache when investigating model/runtime drift:
+#    podman build -f processing/Containerfile --no-cache --progress=plain \
+#      --target smoke-test-runner -t gaia-processing-smoke-rust .
+#
+# The smoke-test-runner stage executes gaia-processing smoke-test and logs
+# per-model detections for BirdNET V2.4, BirdNET+ V3.0, and Google Perch 2.0.
+#
 # ── Build stage ─────────────────────────────────────────────────────
 FROM debian:trixie AS builder
 
@@ -120,26 +146,51 @@ RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
 # Validate BatDetect2 ONNX: input = (1, 1, 128, 256) pre-computed spectrogram
 RUN python3 validate_onnx.py /convert/batdetect2.onnx --shape 1,1,128,256
 
-# ── BirdNET+ V3.0 ONNX patch at build time ────────────────────────
-# Downloads the BirdNET+ V3.0 ONNX model from Zenodo, patches
-# Resize nodes and freezes symbolic dimensions to concrete values
-# for tract-onnx compatibility, then validates the result with
-# onnxruntime.
+# ── BirdNET+ V3.0 ONNX download at build time ─────────────────────
+# Downloads the original BirdNET+ V3.0 ONNX model from Zenodo and
+# validates it with onnxruntime.
 #
-# The resulting ~516 MB ONNX file is baked into the image.
-# No Python is needed at runtime.
+# We run BirdNET3 through ONNX Runtime (`prefer_ort=true`), so we keep
+# the original graph to preserve ORT numerical behavior.
 FROM python:3.11-slim AS birdnet3converter
 
 RUN pip install --no-cache-dir onnx onnxruntime numpy
 
 WORKDIR /convert
-COPY scripts/patch_birdnet3_onnx.py .
 COPY scripts/validate_onnx.py .
-RUN python3 patch_birdnet3_onnx.py -o /convert/birdnet3.onnx && \
-    ls -lh /convert/birdnet3.onnx
+RUN python3 - <<'PY' && ls -lh /convert/birdnet3.onnx
+import hashlib
+import urllib.request
 
-# Validate BirdNET+ V3.0 ONNX: input = (1, 96000) raw audio at 32 kHz × 3s
-RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000
+url = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_FP32.onnx/content"
+out = "/convert/birdnet3.onnx"
+expected_md5 = "7b32222e13fd61114246b46a4c88d09d"
+
+with urllib.request.urlopen(url) as resp, open(out, "wb") as f:
+    while True:
+        chunk = resp.read(1 << 20)
+        if not chunk:
+            break
+        f.write(chunk)
+
+h = hashlib.md5()
+with open(out, "rb") as f:
+    while True:
+        chunk = f.read(1 << 20)
+        if not chunk:
+            break
+        h.update(chunk)
+
+actual = h.hexdigest()
+if actual != expected_md5:
+    raise SystemExit(f"MD5 mismatch: expected {expected_md5}, got {actual}")
+print("BirdNET3 MD5 verified:", actual)
+PY
+
+# Validate BirdNET+ V3.0 ONNX runtime path: input = (1, 96000)
+# BirdNET3 is ORT-only (prefer_ort=true), so tract compatibility checks
+# are intentionally skipped here.
+RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000 --skip-tract-checks
 
 # ── ONNX Runtime shared library ───────────────────────────────────
 # When tract-onnx cannot handle a model (e.g. DFT/STFT ops in BirdNET
@@ -151,19 +202,16 @@ RUN python3 validate_onnx.py /convert/birdnet3.onnx --shape 1,96000
 # handles DFT/STFT models correctly, while the tarball build hangs
 # indefinitely in CreateSession for those same models.
 #
-# VERSION PIN: ort-sys 2.0.0-rc.12 generates FFI bindings for ORT C API v17
-# and ships prebuilt binaries for ORT 1.24.2 (see dist.txt:  ms@1.24.2).
-# With `load-dynamic`, the crate loads whatever libonnxruntime.so is on
-# the system.  While API v17 is forward-compatible, newer ORT releases
-# can change internal thread-pool / graph-analysis behaviour, causing
-# the same CreateSession deadlocks we previously fixed.  Pin to the
-# exact version ort-sys targets to guarantee identical behaviour.
+# VERSION PIN: ort-sys 2.0.0-rc.12 targets ORT C API v24.  Pin the
+# pip package to 1.24.2 for matching ABI.  The perch-smoke-test stage
+# and the runtime both use the same ORT version.
 FROM python:3.11-slim AS ort-download
 RUN pip install --no-cache-dir 'onnxruntime==1.24.2' && \
     ORT_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))") && \
     cp "${ORT_LIB}"/libonnxruntime.so* /usr/lib/ && \
     ls -lh /usr/lib/libonnxruntime.so* && \
     ldconfig
+
 
 # ── tract-onnx dry-run validation ──────────────────────────────────
 # Actually load every ONNX model through tract-onnx (the runtime
@@ -201,10 +249,8 @@ RUN gaia-processing validate-model \
 #   2. Confidence scores are in a sane range (not near-zero garbage).
 #   3. All models agree within a reasonable confidence spread.
 #
-# All models (BirdNET V2.4, V3.0, Perch) are validated through the
-# Rust binary using the native `ort` crate with explicit thread
-# limits (inter=1, intra=4) to prevent CreateSession deadlocks on
-# DFT/STFT models.
+# Build-time CI requirement: run Rust smoke over all bird/wildlife
+# models so logs show what each model detects on the same audio file.
 #
 # Adds ~2–3 minutes to the build (model downloads + inference).
 # To skip during rapid iteration: podman build --target runtime …
@@ -241,9 +287,8 @@ RUN curl -fsSL -o /test/models/birdnet3/labels.csv \
     "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_Labels.csv/content" && \
     echo "BirdNET V3.0 labels: $(wc -l < /test/models/birdnet3/labels.csv) lines"
 
-# ── Assemble Perch V2.0 model directory ───────────────────────────
+# ── Assemble Perch V2 model directory ─────────────────────────────
 COPY examples/perch_manifest.toml /test/models/perch/manifest.toml
-# Download Perch ONNX model (~68 MB) and labels from HuggingFace.
 RUN curl -fsSL -o /test/models/perch/model.onnx \
     "https://huggingface.co/justinchuby/Perch-onnx/resolve/main/perch_v2.onnx" && \
     ls -lh /test/models/perch/model.onnx
@@ -258,11 +303,10 @@ RUN curl -fsSL -o /test/models/perch/labels.csv \
 RUN gaia-processing validate-manifests /test/models
 
 # ── Run smoke tests ──────────────────────────────────────────────
-# Single invocation covers ALL bird models through the exact same
-# Rust code path used at runtime (model::load_model → OrtSession::
-# new_cpu → predict).  No special-casing, no Python, no env-var
-# overrides — so regressions like thread-pool deadlocks or library-
-# discovery failures are caught here before the image is published.
+# Tests BirdNET V2.4, BirdNET+ V3.0, and Perch V2 through the exact
+# same Rust code path used at runtime.
+#
+# --expect-models 3: BirdNET V2.4 + V3.0 + Perch V2.
 #
 # NOTE: ORT_DYLIB_PATH is intentionally NOT set here.  The runtime
 # stage relies on ldconfig to find libonnxruntime.so, so the smoke
@@ -271,16 +315,7 @@ RUN gaia-processing validate-manifests /test/models
 # timeout 300 (5 min): prevents indefinite hangs if an ORT version
 # regression reintroduces the CreateSession deadlock.  Normal smoke
 # tests complete in under 60 seconds.
-# ORT_INTRA_THREADS=1: prevent thread-pool deadlocks during
-# CreateSession for DFT/STFT models (Perch, BirdNET V3) in the
-# constrained BuildKit environment.  At runtime the default (4)
-# is used for better inference throughput.
-# OMP_NUM_THREADS=1: limit OpenMP parallelism inside ORT's internal
-# kernels — prevents spinlock contention in constrained containers.
 RUN RUST_LOG=info \
-    ORT_INTRA_THREADS=1 \
-    OMP_NUM_THREADS=1 \
-    OMP_WAIT_POLICY=PASSIVE \
     timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
@@ -292,8 +327,8 @@ RUN RUST_LOG=info \
 # ── Runtime stage ──────────────────────────────────────────────────
 # Rust binary + pre-converted ONNX models.  No Python at runtime —
 # all inference (including DFT/STFT models like BirdNET V3 and Perch)
-# runs natively through the `ort` crate with explicit thread limits.
-FROM debian:trixie-slim
+# runs natively through the `ort` crate with ORT 1.24.2.
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -305,8 +340,8 @@ COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-pr
 # Force Docker to run test stages (they are otherwise skipped because
 # nothing in the final image references them).  These sentinel files
 # are only created when the tests pass.
-COPY --from=tract-validator    /validate/.tract-ok /tmp/.tract-ok
-COPY --from=smoke-test-runner  /test/.smoke-ok     /tmp/.smoke-ok
+COPY --from=tract-validator    /validate/.tract-ok    /tmp/.tract-ok
+COPY --from=smoke-test-runner  /test/.smoke-ok        /tmp/.smoke-ok
 
 # ONNX Runtime shared library for native Rust inference.
 # Extracted from the pip onnxruntime package in the ort-download stage.
@@ -328,8 +363,7 @@ COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta
 COPY --from=batconverter /convert/batdetect2.onnx  /usr/local/share/gaia/models/batdetect2.onnx
 COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models/batdetect2-labels.csv
 
-# Pre-patched BirdNET+ V3.0 ONNX model (~541 MB).
-# Resize nodes patched: pytorch_half_pixel → half_pixel for tract-onnx.
+# Original BirdNET+ V3.0 ONNX model (~541 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory.
 COPY --from=birdnet3converter /convert/birdnet3.onnx /usr/local/share/gaia/models/birdnet3.onnx
 
