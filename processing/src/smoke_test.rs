@@ -71,7 +71,16 @@ struct ModelResult {
 
 /// Run the build-stage smoke test.  Returns `Ok(())` on pass, `Err` on
 /// any failure.
-pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str) -> Result<()> {
+///
+/// `expected_model_count`: if `Some(n)`, the test asserts that exactly
+/// `n` bird/wildlife models were discovered.  This catches the case
+/// where a malformed manifest silently excludes a model.
+pub fn run(
+    audio_path: &Path,
+    models_dir: &Path,
+    expected_species: &str,
+    expected_model_count: Option<usize>,
+) -> Result<()> {
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║           BUILD-STAGE SMOKE TEST                        ║");
     info!("╚══════════════════════════════════════════════════════════╝");
@@ -118,6 +127,21 @@ pub fn run(audio_path: &Path, models_dir: &Path, expected_species: &str) -> Resu
 
     if bird_manifests.is_empty() {
         bail!("No bird/wildlife models found — cannot run smoke test");
+    }
+
+    // Assert expected model count when provided.  This catches the case
+    // where a malformed manifest.toml (e.g. duplicate keys) is silently
+    // skipped by discover_manifests(), leaving fewer models than expected.
+    if let Some(expected) = expected_model_count {
+        if bird_manifests.len() != expected {
+            bail!(
+                "Expected {} bird/wildlife model(s) but discovered {} — \
+                 a manifest may be malformed or missing.  \
+                 Run `gaia-processing validate-manifests <dir>` for details.",
+                expected,
+                bird_manifests.len(),
+            );
+        }
     }
 
     info!("Testing {} bird/wildlife model(s):", bird_manifests.len());

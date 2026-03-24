@@ -42,10 +42,6 @@ prefer_ort = true
 beta = true
 # Lower trust weight for agreement scoring (BirdNET V2.4 = 1.0).
 trust_weight = 0.5
-# Developer preview — mark as beta so the UI shows a badge and
-# agreement scoring weights this model lower than BirdNET V2.4.
-beta = true
-trust_weight = 0.5
 
 # ── Species-range filter (reusing BirdNET V2.4 metadata model) ───────
 #

@@ -85,6 +85,34 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // ── validate-manifests subcommand (build-time manifest check) ────
+    // Usage: gaia-processing validate-manifests <models-dir>
+    //
+    // Parses every manifest.toml under models-dir with strict TOML
+    // validation (duplicate keys, missing required fields, wrong types).
+    // Exits 0 when all manifests are valid, 1 on any failure.
+    //
+    // Invoked during `docker build` BEFORE the smoke test so that
+    // malformed manifests (e.g. duplicate keys) are caught early
+    // instead of silently skipping models.
+    if args.get(1).map(|s| s.as_str()) == Some("validate-manifests") {
+        let dir = args.get(2).unwrap_or_else(|| {
+            eprintln!("Usage: gaia-processing validate-manifests <models-dir>");
+            std::process::exit(2);
+        });
+        info!("Validating manifests in {dir}");
+        match manifest::validate_all_manifests(Path::new(dir)) {
+            Ok(paths) => {
+                info!("✅ All {} manifest(s) valid", paths.len());
+                return Ok(());
+            }
+            Err(e) => {
+                error!("❌ Manifest validation failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // ── smoke-test subcommand (build-time end-to-end validation) ─────
     // Usage: gaia-processing smoke-test --audio <path.wav> --models <dir> --species "Turdus merula"
     //
@@ -99,6 +127,7 @@ fn main() -> Result<()> {
         let mut audio_path: Option<String> = None;
         let mut models_dir: Option<String> = None;
         let mut species: Option<String> = None;
+        let mut expect_models: Option<usize> = None;
 
         let mut i = 2;
         while i < args.len() {
@@ -115,6 +144,10 @@ fn main() -> Result<()> {
                     species = args.get(i + 1).cloned();
                     i += 2;
                 }
+                "--expect-models" => {
+                    expect_models = args.get(i + 1).and_then(|s| s.parse().ok());
+                    i += 2;
+                }
                 _ => {
                     eprintln!("Unknown argument: {}", args[i]);
                     i += 1;
@@ -125,7 +158,8 @@ fn main() -> Result<()> {
         let audio = audio_path.unwrap_or_else(|| {
             eprintln!(
                 "Usage: gaia-processing smoke-test \
-                 --audio <path.wav> --models <dir> --species \"Turdus merula\""
+                 --audio <path.wav> --models <dir> --species \"Turdus merula\" \
+                 [--expect-models N]"
             );
             std::process::exit(2);
         });
@@ -138,7 +172,7 @@ fn main() -> Result<()> {
             std::process::exit(2);
         });
 
-        match smoke_test::run(Path::new(&audio), Path::new(&models), &species) {
+        match smoke_test::run(Path::new(&audio), Path::new(&models), &species, expect_models) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 error!("Smoke test failed: {e:#}");

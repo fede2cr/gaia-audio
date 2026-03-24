@@ -422,11 +422,81 @@ impl ResolvedManifest {
     }
 }
 
+/// Validate raw TOML text as a model manifest.
+///
+/// This performs a strict parse + deserialise check and returns a clear
+/// error message on failure (e.g. duplicate keys, missing required
+/// fields).  Used both by `load_manifest` and by the build-time
+/// `validate-manifests` subcommand to fail fast on malformed files.
+pub fn validate_manifest_toml(text: &str) -> Result<()> {
+    // Step 1: parse as generic TOML value — catches syntax errors
+    // (duplicate keys, invalid types, bad escapes) before serde runs.
+    let _: toml::Value = toml::from_str(text).context("TOML syntax error")?;
+    // Step 2: deserialise into the typed Manifest struct — catches
+    // missing required fields, wrong types, unknown enum variants.
+    let _: Manifest = toml::from_str(text).context("Manifest schema error")?;
+    Ok(())
+}
+
+/// Validate all manifest TOML files under `root_dir`.
+///
+/// Returns the list of validated paths on success, or an error listing
+/// every file that failed validation.  This is stricter than
+/// `discover_manifests` which logs a warning and skips invalid entries.
+pub fn validate_all_manifests(root_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut ok: Vec<PathBuf> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let dirs_to_check: Vec<PathBuf> = if root_dir.join("manifest.toml").exists() {
+        vec![root_dir.to_path_buf()]
+    } else {
+        std::fs::read_dir(root_dir)
+            .with_context(|| format!("Cannot read {}", root_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("manifest.toml").exists())
+            .collect()
+    };
+
+    for dir in &dirs_to_check {
+        let manifest_path = dir.join("manifest.toml");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("{}: {e}", manifest_path.display()));
+                continue;
+            }
+        };
+        match validate_manifest_toml(&text) {
+            Ok(()) => {
+                info!("  PASS  {}", manifest_path.display());
+                ok.push(manifest_path);
+            }
+            Err(e) => {
+                tracing::error!("  FAIL  {}: {e:#}", manifest_path.display());
+                errors.push(format!("{}: {e:#}", manifest_path.display()));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(ok)
+    } else {
+        anyhow::bail!(
+            "{} manifest(s) failed validation:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+}
+
 /// Load a single manifest from a directory.
 pub fn load_manifest(dir: &Path) -> Result<ResolvedManifest> {
     let manifest_path = dir.join("manifest.toml");
     let text = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("Cannot read {}", manifest_path.display()))?;
+    validate_manifest_toml(&text)
+        .with_context(|| format!("Invalid manifest: {}", manifest_path.display()))?;
     let manifest: Manifest =
         toml::from_str(&text).with_context(|| format!("Invalid manifest: {}", manifest_path.display()))?;
     info!(
@@ -667,5 +737,46 @@ zenodo_file = "test.zip"
             resolved.effective_variant(Some("int8")),
             Some("int8".to_string())
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_keys() {
+        let toml = r#"
+[model]
+name = "Broken"
+slug = "broken"
+domain = "birds"
+sample_rate = 48000
+chunk_duration = 3.0
+tflite_file = "model.tflite"
+labels_file = "labels.txt"
+beta = true
+trust_weight = 0.5
+beta = true
+trust_weight = 0.5
+"#;
+        let err = validate_manifest_toml(toml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate key"),
+            "Expected 'duplicate key' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_manifest() {
+        let toml = r#"
+[model]
+name = "BirdNET V2.4"
+slug = "birdnet"
+domain = "birds"
+sample_rate = 48000
+chunk_duration = 3.0
+tflite_file = "model.tflite"
+labels_file = "labels.txt"
+beta = true
+trust_weight = 0.5
+"#;
+        validate_manifest_toml(toml).unwrap();
     }
 }

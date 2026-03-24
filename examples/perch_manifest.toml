@@ -57,10 +57,6 @@ prefer_ort = true
 beta = true
 # Lower trust weight for agreement scoring (BirdNET V2.4 = 1.0).
 trust_weight = 0.5
-# Less proven than BirdNET V2.4 — mark as beta so the UI shows a
-# badge and agreement scoring weights this model lower.
-beta = true
-trust_weight = 0.5
 
 # ── Automatic download from HuggingFace ──────────────────────────────
 #

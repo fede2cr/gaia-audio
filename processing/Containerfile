@@ -251,6 +251,12 @@ RUN curl -fsSL -o /test/models/perch/labels.csv \
     "https://huggingface.co/cgeorgiaw/Perch/resolve/main/assets/labels.csv" && \
     echo "Perch labels: $(wc -l < /test/models/perch/labels.csv) lines"
 
+# ── Validate all manifests before running inference ───────────────
+# Strict TOML parse + schema check for every manifest.toml.
+# Catches duplicate keys, missing required fields, and typos that
+# discover_manifests() would silently skip at runtime.
+RUN gaia-processing validate-manifests /test/models
+
 # ── Run smoke tests ──────────────────────────────────────────────
 # Single invocation covers ALL bird models through the exact same
 # Rust code path used at runtime (model::load_model → OrtSession::
@@ -270,7 +276,8 @@ RUN RUST_LOG=info \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
         --models /test/models \
-        --species "Ramphastos sulfuratus" && \
+        --species "Ramphastos sulfuratus" \
+        --expect-models 3 && \
     touch /test/.smoke-ok
 
 # ── Runtime stage ──────────────────────────────────────────────────
