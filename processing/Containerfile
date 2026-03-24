@@ -275,8 +275,12 @@ RUN gaia-processing validate-manifests /test/models
 # CreateSession for DFT/STFT models (Perch, BirdNET V3) in the
 # constrained BuildKit environment.  At runtime the default (4)
 # is used for better inference throughput.
+# OMP_NUM_THREADS=1: limit OpenMP parallelism inside ORT's internal
+# kernels — prevents spinlock contention in constrained containers.
 RUN RUST_LOG=info \
     ORT_INTRA_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    OMP_WAIT_POLICY=PASSIVE \
     timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \

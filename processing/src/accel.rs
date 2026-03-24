@@ -148,6 +148,18 @@ impl OrtSession {
             .with_intra_threads(intra)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            // Disable memory-pattern optimisation — it does a full graph
+            // walk to plan memory reuse and can hang on complex DFT/STFT
+            // subgraphs (Perch V2, BirdNET V3).
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            // Disable thread spinning — in constrained environments
+            // (Docker builds / CI) spinning threads cause contention
+            // that can escalate into deadlocks during session init.
+            .with_intra_op_spinning(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_op_spinning(false)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // GPU EPs (MIGraphX, TensorRT) do their own compilation/optimisation,
@@ -281,6 +293,18 @@ impl OrtSession {
             .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            // Disable memory-pattern optimisation — it does a full graph
+            // walk to plan memory reuse and can hang on complex DFT/STFT
+            // subgraphs (Perch V2, BirdNET V3).  Adds negligible runtime
+            // cost since these models are loaded once.
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            // Disable thread spinning to prevent contention deadlocks
+            // during session init in constrained environments.
+            .with_intra_op_spinning(false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_op_spinning(false)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_execution_providers([ort::ep::CPU::default().build()])
             .map_err(|e| anyhow::anyhow!("{e}"))?
