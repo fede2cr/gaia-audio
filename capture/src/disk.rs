@@ -111,7 +111,7 @@ pub fn recode_wav_to_opus(dir: &Path, min_age: Duration) -> RecodeSummary {
 
         let src_size = meta.len();
         let opus_path = wav_path.with_extension("opus");
-        let tmp_opus = wav_path.with_extension("opus.tmp");
+        let tmp_opus = wav_path.with_extension("tmp.opus");
 
         let status = Command::new("ffmpeg")
             .args([
@@ -122,6 +122,8 @@ pub fn recode_wav_to_opus(dir: &Path, min_age: Duration) -> RecodeSummary {
                 "-y",
                 "-i",
                 wav_path.to_string_lossy().as_ref(),
+                "-f",
+                "opus",
                 "-c:a",
                 "libopus",
                 "-b:a",
