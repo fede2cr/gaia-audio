@@ -2,9 +2,9 @@
 //!
 //! Routes:
 //!   GET  /api/health              → health check
-//!   GET  /api/recordings          → list available WAV files
-//!   GET  /api/recordings/:name    → download a WAV file
-//!   DELETE /api/recordings/:name  → remove a processed WAV file
+//!   GET  /api/recordings          → list available WAV/Opus files
+//!   GET  /api/recordings/:name    → download a recording file
+//!   DELETE /api/recordings/:name  → remove a processed recording
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,7 +150,8 @@ async fn list_recordings(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("wav") && ext != Some("opus") {
             continue;
         }
         if let Ok(meta) = path.metadata() {
@@ -224,7 +225,11 @@ async fn download_recording(
     let body = Body::from_stream(stream);
 
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "audio/wav".parse().unwrap());
+    let content_type = match file_path.extension().and_then(|e| e.to_str()) {
+        Some("opus") => "audio/opus",
+        _ => "audio/wav",
+    };
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     headers.insert(
         header::CONTENT_LENGTH,
         file_size.to_string().parse().unwrap(),

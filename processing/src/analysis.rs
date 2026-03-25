@@ -418,16 +418,27 @@ fn run_analysis(
             // species (crickets, frogs, …) would not be in that set and
             // should pass through unfiltered unless the static range file
             // says otherwise.
-            let is_bird = if let Some(cls) = class_map.get(sci_name.as_str()) {
-                cls == "Aves"
-            } else if let Some(cls) = class_map_norm.get(sci_norm.as_str()) {
-                cls == "Aves"
-            } else if !known_bird_labels.is_empty() {
-                known_bird_labels.contains(sci_norm.as_str())
-            } else {
-                // No class info and no bird reference set — assume bird
-                // for backward compatibility (matches previous default).
-                true
+            let class_is_bird = class_map
+                .get(sci_name.as_str())
+                .or_else(|| class_map_norm.get(sci_norm.as_str()))
+                .map(|cls| is_bird_class(cls));
+            let known_bird = known_bird_labels.contains(sci_norm.as_str());
+
+            let is_bird = match class_is_bird {
+                // If class says bird, trust it. If class is ambiguous or
+                // non-bird but this species is known in bird-only labels,
+                // trust the bird reference set (BirdNET V2.4 baseline).
+                Some(true) => true,
+                Some(false) => known_bird,
+                None => {
+                    if !known_bird_labels.is_empty() {
+                        known_bird
+                    } else {
+                        // No class info and no bird reference set — assume bird
+                        // for backward compatibility (matches previous default).
+                        true
+                    }
+                }
             };
 
             // Check the neural species-range model (birds).
@@ -555,4 +566,9 @@ fn filter_humans(predictions: &[Vec<Prediction>], config: &Config) -> Vec<Vec<Pr
             }
         })
         .collect()
+}
+
+fn is_bird_class(class_name: &str) -> bool {
+    let c = class_name.trim().to_ascii_lowercase();
+    c == "aves" || c == "bird" || c == "birds"
 }

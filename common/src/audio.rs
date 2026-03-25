@@ -5,6 +5,7 @@
 //! chunking, and clip extraction.
 
 use std::io::Cursor;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use rubato::{Fft, FixedSync, Resampler};
@@ -21,59 +22,63 @@ pub fn read_audio(
 ) -> Result<Vec<Vec<f32>>> {
     info!("Reading audio: {}", path.display());
 
-    let mut raw = std::fs::read(path)
-        .with_context(|| format!("Cannot read {}", path.display()))?;
-    if fix_wav_data_chunk(&mut raw) {
-        debug!("Fixed WAV data-chunk alignment for {}", path.display());
-    }
-    let reader = hound::WavReader::new(Cursor::new(raw))
-        .with_context(|| format!("Cannot parse WAV: {}", path.display()))?;
-    let spec = reader.spec();
-    let native_sr = spec.sample_rate;
-    let n_channels = spec.channels as usize;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            // Scale signed PCM according to the file's bit depth.
-            // Using i32::MAX for all integer WAVs under-scales common
-            // 16-bit audio by ~65k×, which can make raw-audio models
-            // (e.g. BirdNET+ V3.0) numerically unstable.
-            let bits = spec.bits_per_sample.clamp(1, 32) as u32;
-            let max_amplitude = if bits == 32 {
-                i32::MAX as f32
-            } else {
-                ((1_i64 << (bits - 1)) - 1) as f32
-            };
-
-            reader
-                .into_samples::<i32>()
-                .take_while(|s| s.is_ok())
-                .map(|s| (s.unwrap() as f32 / max_amplitude).clamp(-1.0, 1.0))
-                .collect()
+    let resampled = if ext == "wav" {
+        let mut raw = std::fs::read(path)
+            .with_context(|| format!("Cannot read {}", path.display()))?;
+        if fix_wav_data_chunk(&mut raw) {
+            debug!("Fixed WAV data-chunk alignment for {}", path.display());
         }
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .take_while(|s| s.is_ok())
-            .map(|s| s.unwrap())
-            .collect(),
-    };
+        let reader = hound::WavReader::new(Cursor::new(raw))
+            .with_context(|| format!("Cannot parse WAV: {}", path.display()))?;
+        let spec = reader.spec();
+        let native_sr = spec.sample_rate;
+        let n_channels = spec.channels as usize;
 
-    // Convert to mono
-    let mono: Vec<f32> = if n_channels == 1 {
-        samples
-    } else {
-        samples
-            .chunks(n_channels)
-            .map(|frame| frame.iter().sum::<f32>() / n_channels as f32)
-            .collect()
-    };
-    debug!("Read {} mono samples at {} Hz", mono.len(), native_sr);
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let bits = spec.bits_per_sample.clamp(1, 32) as u32;
+                let max_amplitude = if bits == 32 {
+                    i32::MAX as f32
+                } else {
+                    ((1_i64 << (bits - 1)) - 1) as f32
+                };
 
-    // Resample if needed
-    let resampled = if native_sr == target_sr {
-        mono
+                reader
+                    .into_samples::<i32>()
+                    .take_while(|s| s.is_ok())
+                    .map(|s| (s.unwrap() as f32 / max_amplitude).clamp(-1.0, 1.0))
+                    .collect()
+            }
+            hound::SampleFormat::Float => reader
+                .into_samples::<f32>()
+                .take_while(|s| s.is_ok())
+                .map(|s| s.unwrap())
+                .collect(),
+        };
+
+        let mono: Vec<f32> = if n_channels == 1 {
+            samples
+        } else {
+            samples
+                .chunks(n_channels)
+                .map(|frame| frame.iter().sum::<f32>() / n_channels as f32)
+                .collect()
+        };
+        debug!("Read {} mono samples at {} Hz", mono.len(), native_sr);
+
+        if native_sr == target_sr {
+            mono
+        } else {
+            resample(&mono, native_sr, target_sr)?
+        }
     } else {
-        resample(&mono, native_sr, target_sr)?
+        decode_audio_ffmpeg(path, target_sr)?
     };
     info!(
         "Audio ready: {} samples at {} Hz",
@@ -84,6 +89,52 @@ pub fn read_audio(
     let chunks = split_signal(&resampled, target_sr, chunk_duration, overlap, 1.5);
     info!("Split into {} chunk(s)", chunks.len());
     Ok(chunks)
+}
+
+fn decode_audio_ffmpeg(path: &std::path::Path, target_sr: u32) -> Result<Vec<f32>> {
+    debug!(
+        "Decoding non-WAV audio via ffmpeg: {} → mono f32 @ {} Hz",
+        path.display(),
+        target_sr
+    );
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            path.to_string_lossy().as_ref(),
+            "-f",
+            "f32le",
+            "-ac",
+            "1",
+            "-ar",
+            &target_sr.to_string(),
+            "pipe:1",
+        ])
+        .output()
+        .with_context(|| format!("Failed to run ffmpeg for {}", path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg decode failed for {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+
+    if output.stdout.len() < 4 {
+        anyhow::bail!("ffmpeg decode produced no audio for {}", path.display());
+    }
+
+    let mut out = Vec::with_capacity(output.stdout.len() / 4);
+    for chunk in output.stdout.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
 }
 
 /// Resample a mono signal from `sr_in` to `sr_out` using rubato.
@@ -159,6 +210,46 @@ pub fn extract_clip(
     start_sec: f64,
     stop_sec: f64,
 ) -> Result<()> {
+    let ext = in_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext != "wav" {
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-ss",
+                &format!("{start_sec:.3}"),
+                "-to",
+                &format!("{stop_sec:.3}"),
+                "-i",
+                in_path.to_string_lossy().as_ref(),
+                "-acodec",
+                "pcm_s16le",
+                out_path.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .with_context(|| format!("Failed to run ffmpeg for {}", in_path.display()))?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "ffmpeg clip extraction failed for {} (status {})",
+                in_path.display(),
+                status
+            );
+        }
+        return Ok(());
+    }
+
     let mut raw = std::fs::read(in_path)
         .with_context(|| format!("Cannot read {}", in_path.display()))?;
     fix_wav_data_chunk(&mut raw);

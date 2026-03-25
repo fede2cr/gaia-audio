@@ -1,4 +1,4 @@
-//! HTTP client that polls capture servers for new WAV recordings.
+//! HTTP client that polls capture servers for new recordings (WAV/Opus).
 //!
 //! When mDNS discovery is available the processing node automatically
 //! finds all capture nodes on the network.  Otherwise it falls back to

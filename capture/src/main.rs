@@ -1,11 +1,12 @@
-//! Gaia Capture Server – records audio and serves WAV files over HTTP.
+//! Gaia Capture Server – records audio and serves recording files over HTTP.
 //!
 //! This binary:
 //! 1. Reads configuration from `gaia.conf`
 //! 2. Starts audio capture (arecord / ffmpeg)
-//! 3. Monitors disk usage — pauses capture when usage exceeds the
-//!    configured threshold (`DISK_USAGE_MAX`, default 95 %) and
-//!    resumes automatically once space is freed.
+//! 3. Monitors disk usage — when usage exceeds the configured threshold
+//!    (`DISK_USAGE_MAX`, default 95 %), it first recodes settled WAV
+//!    files to Opus to free space, and only pauses capture if that is
+//!    insufficient. Capture resumes automatically once space is freed.
 //! 4. Runs an axum HTTP server that exposes the recordings to the
 //!    processing server over the network.
 
@@ -184,10 +185,39 @@ async fn main() -> Result<()> {
                     let is_paused = disk_state_health.capture_paused.load(Ordering::Relaxed);
 
                     if pct >= disk_max && !is_paused {
-                        // ── PAUSE: kill capture ──────────────────────
+                        // ── disk pressure: try emergency recode first ──
                         tracing::warn!(
                             "Disk usage {pct:.1}% >= threshold {disk_max}% — \
-                             pausing audio capture to prevent filling the disk"
+                             recoding settled WAV files to Opus before pausing capture"
+                        );
+
+                        let recode = disk::recode_wav_to_opus(
+                            &guard_dir,
+                            std::time::Duration::from_secs(5),
+                        );
+
+                        if recode.converted > 0 {
+                            tracing::warn!(
+                                "Emergency recode: converted {} WAV file(s), freed {:.1} MB",
+                                recode.converted,
+                                recode.freed_bytes as f64 / 1_048_576.0
+                            );
+                            if let Some(after_pct) = disk::usage_pct(&guard_dir) {
+                                disk_state_health
+                                    .usage_centipct
+                                    .store((after_pct * 100.0) as u32, Ordering::Relaxed);
+                                if after_pct < disk_max {
+                                    tracing::info!(
+                                        "Disk usage dropped to {after_pct:.1}% (< {disk_max}%) after recode — capture continues"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // ── PAUSE: recode insufficient, kill capture ───
+                        tracing::warn!(
+                            "Disk still above threshold after recode — pausing audio capture to prevent filling the disk"
                         );
                         if let Some(ref mut h) = capture_handle {
                             if let Err(e) = h.kill() {
