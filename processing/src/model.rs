@@ -1023,9 +1023,9 @@ fn load_labels(
         text.lines()
             .map(|line| {
                 let line = line.trim();
-                if line.matches('_').count() == 1 {
-                    let sci = normalize_sci_name(line.split('_').next().unwrap_or(line));
-                    let com = line.split('_').nth(1).unwrap_or("");
+                if let Some((sci_part, com_part)) = line.split_once('_') {
+                    let sci = normalize_sci_name(sci_part);
+                    let com = com_part.trim();
                     if !com.is_empty() {
                         common_names.insert(sci.clone(), com.to_string());
                     }
