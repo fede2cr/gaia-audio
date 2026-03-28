@@ -13,24 +13,18 @@ use leptos::prelude::{
 
 use crate::components::detection_card::DetectionCard;
 use crate::model::{ExcludedSpecies, WebDetection};
+use crate::pages::species_list::get_stats_cache_status;
 
 // ─── Server functions ────────────────────────────────────────────────────────
 
 #[server(prefix = "/api")]
 pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnError> {
-    use crate::server::{detections_duckdb as ddb, inaturalist};
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let mut species = ddb::excluded_species(&state.db_path)
+    let species = ddb::excluded_species(&state.db_path)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-
-    // Enrich with iNaturalist images
-    for sp in species.iter_mut() {
-        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
-            sp.image_url = Some(photo.medium_url);
-        }
-    }
     Ok(species)
 }
 
@@ -79,6 +73,10 @@ pub async fn get_excluded_detections(
 #[component]
 pub fn ExcludedPage() -> impl IntoView {
     let (version, set_version) = signal(0u32);
+    let cache_status = Resource::new(
+        || (),
+        |_| async { get_stats_cache_status().await },
+    );
     let species = Resource::new(
         move || version.get(),
         |_| async { get_excluded_species().await },
@@ -87,6 +85,23 @@ pub fn ExcludedPage() -> impl IntoView {
     view! {
         <div class="excluded-page">
             <h1>"Excluded Species"</h1>
+            <Suspense fallback=|| view! { <p class="meta">"Cache: loading…"</p> }>
+                {move || cache_status.get().map(|res| match res {
+                    Ok(s) => view! {
+                        <p class="meta">
+                            "Cache: "
+                            {if s.populated { "ready" } else { "building" }}
+                            " · species=" {s.species_rows}
+                            " · excluded=" {s.excluded_rows}
+                            " · parquet=" {s.parquet_files}
+                            " · refreshed=" {if s.refreshed_at_utc.is_empty() { "n/a".to_string() } else { s.refreshed_at_utc }}
+                        </p>
+                    }.into_any(),
+                    Err(e) => view! {
+                        <p class="meta">"Cache: unavailable (" {e.to_string()} ")"</p>
+                    }.into_any(),
+                })}
+            </Suspense>
             <p class="page-desc">
                 "These species were detected with sufficient confidence but excluded by the "
                 "species-range model (occurrence threshold). Audio and spectrograms are preserved. "

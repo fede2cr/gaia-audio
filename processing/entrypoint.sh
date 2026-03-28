@@ -59,19 +59,40 @@ if [ -d "$BUNDLED_DIR" ]; then
         target="$MODELS_DIR/$slug"
         mkdir -p "$target"
 
-        # Always overwrite every bundled file.  These are small assets
-        # baked into the container image (manifests, metadata models,
-        # label files).  Large downloaded artefacts (e.g. birdnet3.onnx)
-        # are NOT in this directory — they are fetched at runtime and
-        # stored directly in the volume, so they are unaffected.
+        # Always overwrite every bundled file except taxonomy overrides.
+        # Taxonomy equivalence files are user-editable and should persist
+        # across restarts.
         for src_file in "$model_dir"*; do
             [ -f "$src_file" ] || continue
             fname=$(basename "$src_file")
             dest="$target/$fname"
+            if [ "$slug" = "_taxonomy" ] && [ -f "$dest" ]; then
+                echo "[entrypoint] Keeping user taxonomy file $dest"
+                continue
+            fi
             cp "$src_file" "$dest"
             echo "[entrypoint] Updated $dest"
         done
     done
+fi
+
+# ── Taxonomy review + merge (scientific-name aliases / class aliases) ─
+# Models can use different scientific names for the same species
+# (taxonomy updates / synonyms), and different class strings
+# (AVES/BIRDS/WILDLIFE).  Build a merged canonical table at startup so
+# runtime detection, filtering, and cross-model agreement use the same
+# names and classes.
+TAXONOMY_TABLE="${GAIA_TAXONOMY_TABLE:-/data/_taxonomy/taxonomy_equivalences.toml}"
+if [ ! -f "$TAXONOMY_TABLE" ] && [ -f "/models/_taxonomy/taxonomy_equivalences.toml" ]; then
+    TAXONOMY_TABLE="/models/_taxonomy/taxonomy_equivalences.toml"
+fi
+TAXONOMY_MERGED="$(dirname "$TAXONOMY_TABLE")/taxonomy_merged.toml"
+if [ -f "$TAXONOMY_TABLE" ]; then
+    if gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"; then
+        echo "[entrypoint] Taxonomy table reviewed and merged: $TAXONOMY_MERGED"
+    else
+        echo "[entrypoint] WARNING: taxonomy review failed; continuing with built-in normalization"
+    fi
 fi
 
 exec gaia-processing "$@"

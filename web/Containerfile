@@ -71,6 +71,7 @@ ENV LEPTOS_SITE_ROOT=/srv/site
 ENV LEPTOS_SITE_ADDR=0.0.0.0:3000
 ENV GAIA_DB_PATH=/data/detections.db
 ENV GAIA_EXTRACTED_DIR=/data/extracted
+ENV GAIA_TAXONOMY_TABLE=/data/_taxonomy/taxonomy_equivalences.toml
 
 EXPOSE 3000
 

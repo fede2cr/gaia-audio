@@ -399,6 +399,19 @@ pub struct SpeciesSummary {
     pub female_image_url: Option<String>,
 }
 
+/// Health/status snapshot for the in-memory DuckDB summary cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheSummaryStatus {
+    pub populated: bool,
+    pub species_rows: u64,
+    pub excluded_rows: u64,
+    pub model_species_rows: u64,
+    pub parquet_files: u64,
+    /// RFC3339 UTC timestamp of the most recent cache refresh.
+    #[serde(default)]
+    pub refreshed_at_utc: String,
+}
+
 // ─── Model info (for filter dropdowns) ───────────────────────────────────────
 
 /// A detection model available in the database.
@@ -544,6 +557,17 @@ pub struct DetectionSettings {
     /// Used to convert UTC timestamps for display in the web UI.
     #[serde(default)]
     pub tz_offset: i32,
+}
+
+/// Taxonomy admin status for the editable equivalence table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxonomyAdminStatus {
+    pub path: String,
+    pub exists: bool,
+    pub writable: bool,
+    pub species_count: u32,
+    pub alias_count: u32,
+    pub class_alias_count: u32,
 }
 
 fn default_colormap() -> String {

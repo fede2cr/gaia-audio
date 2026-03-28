@@ -386,6 +386,7 @@ COPY examples/birds_manifest.toml    /usr/local/share/gaia/manifests/birdnet/man
 COPY examples/perch_manifest.toml    /usr/local/share/gaia/manifests/perch/manifest.toml
 COPY examples/bats_manifest.toml     /usr/local/share/gaia/manifests/batdetect2/manifest.toml
 COPY examples/birdnet3_manifest.toml /usr/local/share/gaia/manifests/birdnet3/manifest.toml
+COPY examples/taxonomy_equivalences.toml /usr/local/share/gaia/manifests/_taxonomy/taxonomy_equivalences.toml
 # Reuse BirdNET V2.4 metadata model + labels for species-range filtering in V3.
 COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/manifests/birdnet3/meta-model.onnx
 # The V2.4 meta-model uses V2.4 labels (en_us.txt); bundle them separately

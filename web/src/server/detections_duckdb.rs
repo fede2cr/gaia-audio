@@ -25,7 +25,7 @@ use duckdb::params;
 use tracing::info;
 
 use crate::model::{
-    CalendarDay, DayDetectionGroup, ExcludedSpecies, HourlyCount, ModelInfo,
+    CacheSummaryStatus, CalendarDay, DayDetectionGroup, ExcludedSpecies, HourlyCount, ModelInfo,
     QuizItem, SpeciesHourlyCounts, SpeciesInfo, SpeciesSummary, TopRecording,
     WebDetection,
 };
@@ -52,6 +52,10 @@ const VIEW_REFRESH_INTERVAL_SECS: u64 = 30;
 /// Whether the in-memory stats cache tables have been populated.
 static STATS_POPULATED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Epoch-second of the latest successful stats cache refresh.
+static STATS_REFRESHED_AT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Number of `.parquet` files at the last stats cache build.
 /// Used to auto-detect new detections and invalidate the cache.
@@ -143,6 +147,32 @@ pub fn invalidate_view() {
 /// Check whether the in-memory stats cache is currently populated.
 pub fn stats_populated() -> bool {
     STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn table_row_count(duck: &duckdb::Connection, table: &str) -> u64 {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    duck.query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// Snapshot of the summary cache health/size for UI diagnostics.
+pub async fn stats_cache_status(_db_path: &Path) -> Res<CacheSummaryStatus> {
+    let duck = conn_raw()?;
+    let refreshed_epoch = STATS_REFRESHED_AT.load(std::sync::atomic::Ordering::Relaxed);
+    let refreshed_at_utc = chrono::DateTime::from_timestamp(refreshed_epoch as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+
+    Ok(CacheSummaryStatus {
+        populated: STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed),
+        species_rows: table_row_count(&duck, "species_stats"),
+        excluded_rows: table_row_count(&duck, "excluded_species_stats"),
+        model_species_rows: table_row_count(&duck, "model_species_stats"),
+        parquet_files: DET_DIR.get().map(|d| count_parquet_files(d)).unwrap_or(0),
+        refreshed_at_utc,
+    })
 }
 
 fn refresh_view_inner(conn: &duckdb::Connection, dir: &Path) -> Result<(), duckdb::Error> {
@@ -652,13 +682,17 @@ pub async fn top_species_filtered(
     limit: u32,
     model_slug: Option<&str>,
 ) -> Res<Vec<SpeciesSummary>> {
+    if !STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
+        refresh_species_stats(db_path).await?;
+    }
+
     let has_model_filter = matches!(model_slug, Some(s) if !s.is_empty());
 
     // ── Fast path: read from in-memory cache tables ──────────────────
     if STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
         if has_model_filter {
             let safe = model_slug.unwrap().replace('\'', "''");
-            let duck = conn_raw()?;
+            let duck = conn()?;
             let sql = format!(
                 "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
                  FROM model_species_stats \
@@ -667,7 +701,7 @@ pub async fn top_species_filtered(
             );
             return read_species_summaries(&duck, &sql);
         }
-        let duck = conn_raw()?;
+        let duck = conn()?;
         let sql = format!(
             "SELECT Sci_Name, Com_Name, Domain, detection_count, last_seen \
              FROM species_stats ORDER BY detection_count DESC LIMIT {limit}"
@@ -675,27 +709,7 @@ pub async fn top_species_filtered(
         return read_species_summaries(&duck, &sql);
     }
 
-    // ── Slow path: full scan (cache not yet populated) ───────────────
-    let overrides = read_overrides(db_path).await;
-    let excl = exclusion_clause(&overrides);
-    let slug_filter = match model_slug {
-        Some(s) if !s.is_empty() => format!("AND COALESCE(d.Model_Slug, '') = '{}'", s.replace('\'', "''")),
-        _ => String::new(),
-    };
-    let duck = conn()?;
-    let sql = format!(
-        "SELECT d.Sci_Name, \
-         COALESCE( \
-             MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
-             MAX(d.Com_Name) \
-         ) AS Com_Name, \
-         d.Domain, COUNT(*) AS cnt, \
-         MAX(d.Date || ' ' || d.Time) AS last \
-         FROM detections d \
-         WHERE {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
-    );
-    read_species_summaries(&duck, &sql)
+    Ok(vec![])
 }
 
 /// Helper: execute a query returning (Sci_Name, Com_Name, Domain, count, last_seen)
@@ -820,11 +834,15 @@ pub async fn species_detections_by_model(
 
 /// Excluded species summary.
 pub async fn excluded_species(db_path: &Path) -> Res<Vec<ExcludedSpecies>> {
+    if !STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
+        refresh_species_stats(db_path).await?;
+    }
+
     let overrides = read_overrides(db_path).await;
 
     // ── Fast path: use in-memory cache table ─────────────────────────
     if STATS_POPULATED.load(std::sync::atomic::Ordering::Relaxed) {
-        let duck = conn_raw()?;
+        let duck = conn()?;
         let sql = "SELECT Sci_Name, Com_Name, Domain, detection_count, \
                    last_seen, max_confidence \
                    FROM excluded_species_stats \
@@ -850,35 +868,7 @@ pub async fn excluded_species(db_path: &Path) -> Res<Vec<ExcludedSpecies>> {
         return Ok(results);
     }
 
-    // ── Slow path: full scan ─────────────────────────────────────────
-    let duck = conn()?;
-    let sql = "SELECT Sci_Name, Com_Name, Domain, \
-               COUNT(*) AS cnt, \
-               MAX(Date || ' ' || Time) AS last, \
-               MAX(Confidence) AS max_conf \
-               FROM detections \
-               WHERE COALESCE(Excluded, 0) = 1 \
-               GROUP BY Sci_Name, Com_Name, Domain \
-               ORDER BY cnt DESC";
-    let mut stmt = duck.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
-        let sci: String = row.get(0)?;
-        Ok(ExcludedSpecies {
-            scientific_name: sci.clone(),
-            common_name: row.get(1)?,
-            domain: row.get(2)?,
-            detection_count: row.get(3)?,
-            last_seen: row.get(4)?,
-            max_confidence: row.get(5)?,
-            image_url: None,
-            overridden: false,
-        })
-    })?;
-    let mut results: Vec<ExcludedSpecies> = rows.filter_map(|r| r.ok()).collect();
-    for es in &mut results {
-        es.overridden = overrides.contains(&es.scientific_name);
-    }
-    Ok(results)
+    Ok(vec![])
 }
 
 /// Excluded detections for a specific species.
@@ -988,6 +978,13 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
     ))?;
 
     STATS_POPULATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    STATS_REFRESHED_AT.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Record current file count so the view-refresh auto-detect
     // doesn't immediately re-invalidate.
     if let Some(dir) = DET_DIR.get() {

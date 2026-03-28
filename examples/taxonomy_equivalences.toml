@@ -1,0 +1,46 @@
+# Cross-model scientific-name equivalences and class aliases.
+#
+# Seeded to /models/_taxonomy/taxonomy_equivalences.toml by the
+# processing container entrypoint.  At startup, gaia-processing runs:
+#
+#   gaia-processing review-taxonomy \
+#     /models/_taxonomy/taxonomy_equivalences.toml \
+#     /models/_taxonomy/taxonomy_merged.toml
+#
+# Runtime canonicalization then uses taxonomy_merged.toml (if present),
+# otherwise this file.
+#
+# In containers, edit this path to add aliases without touching model
+# manifests:
+#   /models/_taxonomy/taxonomy_equivalences.toml
+#
+# The entrypoint keeps existing /models/_taxonomy files (no overwrite)
+# so your edits persist across container restarts.
+#
+# Add one [[species]] entry per canonical species when models disagree
+# on scientific names.
+
+[[species]]
+canonical = "Cyanocorax morio"
+aliases = ["Psilorhinus morio"]
+class = "birds"
+
+# Add more entries as model differences are discovered.
+# [[species]]
+# canonical = "New canonical name"
+# aliases = ["Old name 1", "Old name 2"]
+# class = "birds"
+
+[class_aliases]
+# Bird / wildlife label variants seen across models.
+"AVES" = "birds"
+"Aves" = "birds"
+"BIRDS" = "birds"
+"Bird" = "birds"
+"WILDLIFE" = "wildlife"
+"Wildlife" = "wildlife"
+"MAMMALIA" = "mammals"
+"INSECTA" = "insects"
+"AMPHIBIA" = "amphibians"
+"REPTILIA" = "reptiles"
+"CHIROPTERA" = "bats"

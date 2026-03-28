@@ -34,6 +34,8 @@ use std::collections::HashMap;
 
 use gaia_common::detection::Detection;
 
+use crate::taxonomy;
+
 /// Per-model trust weight, extracted from manifests before scoring.
 #[derive(Debug, Clone)]
 pub struct ModelWeight {
@@ -90,8 +92,9 @@ pub fn score_agreement(
     // key: normalized sci_name → Vec<(index, model_slug, start, stop)>
     let mut species_index: HashMap<String, Vec<(usize, &str, f64, f64)>> = HashMap::new();
     for (i, d) in detections.iter().enumerate() {
+        let canonical = taxonomy::canonical_species_name(&d.scientific_name);
         species_index
-            .entry(d.scientific_name.clone())
+            .entry(canonical)
             .or_default()
             .push((i, &d.model_slug, d.start, d.stop));
     }
@@ -106,7 +109,8 @@ pub fn score_agreement(
         let mut matched_weight = own_weight;
         let mut matched_slugs: Vec<&str> = vec![&d.model_slug];
 
-        if let Some(same_species) = species_index.get(&d.scientific_name) {
+        let canonical = taxonomy::canonical_species_name(&d.scientific_name);
+        if let Some(same_species) = species_index.get(&canonical) {
             for &(j, other_slug, other_start, other_stop) in same_species {
                 if j == i || other_slug == d.model_slug {
                     continue;

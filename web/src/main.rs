@@ -89,24 +89,21 @@ async fn main() {
     }
 
     // Spawn a background task that refreshes the species stats cache every
-    // 5 minutes when new Parquet files have been detected (the view-refresh
-    // auto-invalidates STATS_POPULATED when the file count changes).
+    // 5 minutes so newly archived daily recordings are folded into the
+    // summary tables even if Parquet file count does not change.
     {
         let db = db_path.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
-                // Only rebuild if the cache was invalidated (new files detected).
-                if !gaia_web::server::detections_duckdb::stats_populated() {
-                    tracing::info!("New detections detected — refreshing species-stats cache…");
-                    let res = {
-                        let db2 = db.clone();
-                        gaia_web::server::detections_duckdb::refresh_species_stats(&db2).await
-                    };
-                    match res {
-                        Ok(()) => tracing::info!("Species-stats cache refresh complete"),
-                        Err(e) => tracing::warn!("Species-stats cache refresh failed: {e}"),
-                    }
+                tracing::debug!("Scheduled species-stats cache refresh…");
+                let res = {
+                    let db2 = db.clone();
+                    gaia_web::server::detections_duckdb::refresh_species_stats(&db2).await
+                };
+                match res {
+                    Ok(()) => tracing::debug!("Species-stats cache refresh complete"),
+                    Err(e) => tracing::warn!("Species-stats cache refresh failed: {e}"),
                 }
             }
         });

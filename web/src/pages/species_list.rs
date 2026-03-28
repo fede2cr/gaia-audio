@@ -9,7 +9,7 @@ use leptos::either::Either;
 
 use crate::components::model_filter::ModelFilter;
 use crate::components::species_card::SpeciesCard;
-use crate::model::SpeciesSummary;
+use crate::model::{CacheSummaryStatus, SpeciesSummary};
 
 /// Sort criteria for the species list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,31 +53,35 @@ pub async fn get_all_species(
     limit: u32,
     model_slug: String,
 ) -> Result<Vec<SpeciesSummary>, ServerFnError> {
-    use crate::server::{detections_duckdb as ddb, inaturalist};
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut species = ddb::top_species_filtered(&state.db_path, limit, slug_opt)
+    let species = ddb::top_species_filtered(&state.db_path, limit, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
-
-    // Enrich with iNaturalist images, conservation status, and sex photos
-    for sp in species.iter_mut() {
-        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
-            sp.image_url = Some(photo.medium_url);
-            sp.conservation_status = photo.conservation_status;
-            sp.male_image_url = photo.male_image_url;
-            sp.female_image_url = photo.female_image_url;
-        }
-    }
     Ok(species)
+}
+
+#[server(prefix = "/api")]
+pub async fn get_stats_cache_status() -> Result<CacheSummaryStatus, ServerFnError> {
+    use crate::server::detections_duckdb as ddb;
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    ddb::stats_cache_status(&state.db_path)
+        .await
+        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
 /// Browse all detected species with sort controls.
 #[component]
 pub fn SpeciesListPage() -> impl IntoView {
     let (model_slug, set_model_slug) = signal(String::new());
+    let cache_status = Resource::new(
+        || (),
+        |_| async { get_stats_cache_status().await },
+    );
     let species = Resource::new(
         move || model_slug.get(),
         |slug| async move { get_all_species(500, slug).await },
@@ -87,6 +91,24 @@ pub fn SpeciesListPage() -> impl IntoView {
     view! {
         <div class="species-list-page">
             <h1>"All Species"</h1>
+
+            <Suspense fallback=|| view! { <p class="meta">"Cache: loading…"</p> }>
+                {move || cache_status.get().map(|res| match res {
+                    Ok(s) => view! {
+                        <p class="meta">
+                            "Cache: "
+                            {if s.populated { "ready" } else { "building" }}
+                            " · species=" {s.species_rows}
+                            " · excluded=" {s.excluded_rows}
+                            " · parquet=" {s.parquet_files}
+                            " · refreshed=" {if s.refreshed_at_utc.is_empty() { "n/a".to_string() } else { s.refreshed_at_utc }}
+                        </p>
+                    }.into_any(),
+                    Err(e) => view! {
+                        <p class="meta">"Cache: unavailable (" {e.to_string()} ")"</p>
+                    }.into_any(),
+                })}
+            </Suspense>
 
             <ModelFilter selected=model_slug set_selected=set_model_slug />
 

@@ -6,7 +6,7 @@ use leptos::prelude::{
     ServerFnError, Suspense,
 };
 
-use crate::model::DetectionSettings;
+use crate::model::{DetectionSettings, TaxonomyAdminStatus};
 
 // ─── Default values (match gaia_common::config defaults) ─────────────────────
 
@@ -66,6 +66,57 @@ pub async fn save_settings(settings: DetectionSettings) -> Result<(), ServerFnEr
     Ok(())
 }
 
+#[server(prefix = "/api")]
+pub async fn get_taxonomy_status() -> Result<TaxonomyAdminStatus, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        crate::server::taxonomy_admin::taxonomy_status()
+            .map_err(ServerFnError::new)
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        Err(ServerFnError::new("SSR only"))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn add_taxonomy_alias(
+    canonical: String,
+    alias: String,
+    class_name: String,
+) -> Result<String, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        let class_opt = if class_name.trim().is_empty() {
+            None
+        } else {
+            Some(class_name.trim())
+        };
+        crate::server::taxonomy_admin::upsert_species_alias(&canonical, &alias, class_opt)
+            .map_err(ServerFnError::new)
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        Err(ServerFnError::new("SSR only"))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn add_class_alias(
+    alias: String,
+    canonical_class: String,
+) -> Result<String, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        crate::server::taxonomy_admin::upsert_class_alias(&alias, &canonical_class)
+            .map_err(ServerFnError::new)
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        Err(ServerFnError::new("SSR only"))
+    }
+}
+
 // ─── Page component ──────────────────────────────────────────────────────────
 
 /// Detection settings page.
@@ -74,9 +125,23 @@ pub fn SettingsPage() -> impl IntoView {
     let (saving, set_saving) = signal(false);
     let (saved_msg, set_saved_msg) = signal::<Option<String>>(None);
     let (error_msg, set_error_msg) = signal::<Option<String>>(None);
+    let (tax_msg, set_tax_msg) = signal::<Option<String>>(None);
+    let (tax_err, set_tax_err) = signal::<Option<String>>(None);
+    let (tax_busy, set_tax_busy) = signal(false);
+    let (tax_version, set_tax_version) = signal(0u32);
+
+    let (tax_canonical, set_tax_canonical) = signal(String::new());
+    let (tax_alias, set_tax_alias) = signal(String::new());
+    let (tax_class, set_tax_class) = signal("birds".to_string());
+    let (class_alias_src, set_class_alias_src) = signal(String::new());
+    let (class_alias_dst, set_class_alias_dst) = signal("birds".to_string());
 
     // Fetch current settings on mount.
     let settings_resource = Resource::new(|| (), |_| get_settings());
+    let taxonomy_status = Resource::new(
+        move || tax_version.get(),
+        |_| async { get_taxonomy_status().await },
+    );
 
     // Local signals for each field – initialised from the resource.
     let (sensitivity, set_sensitivity) = signal(DEFAULT_SENSITIVITY);
@@ -118,6 +183,50 @@ pub fn SettingsPage() -> impl IntoView {
                 Err(e) => set_error_msg.set(Some(format!("Failed to save: {e}"))),
             }
             set_saving.set(false);
+        });
+    };
+
+    let on_add_alias = move |_| {
+        set_tax_busy.set(true);
+        set_tax_msg.set(None);
+        set_tax_err.set(None);
+
+        let canonical = tax_canonical.get();
+        let alias = tax_alias.get();
+        let class_name = tax_class.get();
+
+        leptos::task::spawn_local(async move {
+            match add_taxonomy_alias(canonical, alias, class_name).await {
+                Ok(msg) => {
+                    set_tax_msg.set(Some(msg));
+                    set_tax_canonical.set(String::new());
+                    set_tax_alias.set(String::new());
+                    set_tax_version.update(|v| *v += 1);
+                }
+                Err(e) => set_tax_err.set(Some(format!("Failed to save alias: {e}"))),
+            }
+            set_tax_busy.set(false);
+        });
+    };
+
+    let on_add_class_alias = move |_| {
+        set_tax_busy.set(true);
+        set_tax_msg.set(None);
+        set_tax_err.set(None);
+
+        let alias = class_alias_src.get();
+        let canonical_class = class_alias_dst.get();
+
+        leptos::task::spawn_local(async move {
+            match add_class_alias(alias, canonical_class).await {
+                Ok(msg) => {
+                    set_tax_msg.set(Some(msg));
+                    set_class_alias_src.set(String::new());
+                    set_tax_version.update(|v| *v += 1);
+                }
+                Err(e) => set_tax_err.set(Some(format!("Failed to save class alias: {e}"))),
+            }
+            set_tax_busy.set(false);
         });
     };
 
@@ -348,6 +457,96 @@ pub fn SettingsPage() -> impl IntoView {
                     {move || error_msg.get().map(|msg| view! {
                         <div class="settings-error">{msg}</div>
                     })}
+
+                    // ── Taxonomy Admin ─────────────────────────
+                    <div class="setting-group">
+                        <label class="setting-label">"Taxonomy Admin"</label>
+                        <p class="setting-help">
+                            "Add scientific-name aliases and class aliases without editing TOML manually. "
+                            "This updates the shared taxonomy table used by processing startup."
+                        </p>
+
+                        <Suspense fallback=|| view! { <p class="text-muted">"Loading taxonomy status…"</p> }>
+                            {move || taxonomy_status.get().map(|res| match res {
+                                Ok(s) => view! {
+                                    <p class="setting-help">
+                                        "Table: " <code>{s.path.clone()}</code>
+                                        " · exists=" {s.exists.to_string()}
+                                        " · writable=" {s.writable.to_string()}
+                                        " · species=" {s.species_count}
+                                        " · aliases=" {s.alias_count}
+                                        " · class aliases=" {s.class_alias_count}
+                                    </p>
+                                }.into_any(),
+                                Err(e) => view! {
+                                    <p class="settings-error">"Taxonomy status error: " {e.to_string()}</p>
+                                }.into_any(),
+                            })}
+                        </Suspense>
+
+                        <div class="taxonomy-admin-row">
+                            <input
+                                class="setting-input"
+                                placeholder="Canonical scientific name (e.g. Cyanocorax morio)"
+                                prop:value=move || tax_canonical.get()
+                                on:input=move |ev| set_tax_canonical.set(event_target_value(&ev))
+                            />
+                            <input
+                                class="setting-input"
+                                placeholder="Equivalent alias (e.g. Psilorhinus morio)"
+                                prop:value=move || tax_alias.get()
+                                on:input=move |ev| set_tax_alias.set(event_target_value(&ev))
+                            />
+                            <input
+                                class="setting-input"
+                                placeholder="Class (optional, e.g. birds)"
+                                prop:value=move || tax_class.get()
+                                on:input=move |ev| set_tax_class.set(event_target_value(&ev))
+                            />
+                            <button
+                                class="btn btn-primary"
+                                on:click=on_add_alias
+                                disabled=move || tax_busy.get()
+                            >
+                                {move || if tax_busy.get() { "Saving…" } else { "Add Species Alias" }}
+                            </button>
+                        </div>
+
+                        <div class="taxonomy-admin-row">
+                            <input
+                                class="setting-input"
+                                placeholder="Class alias (e.g. AVES)"
+                                prop:value=move || class_alias_src.get()
+                                on:input=move |ev| set_class_alias_src.set(event_target_value(&ev))
+                            />
+                            <input
+                                class="setting-input"
+                                placeholder="Canonical class (e.g. birds)"
+                                prop:value=move || class_alias_dst.get()
+                                on:input=move |ev| set_class_alias_dst.set(event_target_value(&ev))
+                            />
+                            <button
+                                class="btn btn-primary"
+                                on:click=on_add_class_alias
+                                disabled=move || tax_busy.get()
+                            >
+                                {move || if tax_busy.get() { "Saving…" } else { "Add Class Alias" }}
+                            </button>
+                        </div>
+
+                        <p class="setting-help">
+                            "Note: changes affect new processing runs after processing services reload taxonomy at startup. "
+                            "Use the same GAIA_TAXONOMY_TABLE path in web + processing for shared edits."
+                        </p>
+
+                        {move || tax_msg.get().map(|msg| view! {
+                            <div class="settings-success">{msg}</div>
+                        })}
+
+                        {move || tax_err.get().map(|msg| view! {
+                            <div class="settings-error">{msg}</div>
+                        })}
+                    </div>
 
                 </div>
             </Suspense>

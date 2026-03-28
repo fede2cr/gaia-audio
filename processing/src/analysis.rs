@@ -17,6 +17,7 @@ use gaia_common::detection::{normalize_sci_name, Detection, ParsedFileName};
 use crate::live_status::{self, LivePrediction};
 use crate::model::{self, LoadedModel, Prediction};
 use crate::agreement::{self, ModelWeight};
+use crate::taxonomy;
 use crate::ReportPayload;
 
 /// Process a single WAV file through all loaded models.
@@ -74,12 +75,12 @@ pub fn process_file(
             &model.manifest.language_dir(), &config.database_lang,
         ).unwrap_or_default();
         for (sci, com) in &model_names {
-            let norm = gaia_common::detection::normalize_sci_name(sci);
+            let norm = taxonomy::canonical_species_name(&gaia_common::detection::normalize_sci_name(sci));
             shared_common_names.entry(norm).or_insert_with(|| com.clone());
         }
         // Also include CSV-parsed common names.
         for (sci, com) in model.csv_common_names() {
-            let norm = gaia_common::detection::normalize_sci_name(sci);
+            let norm = taxonomy::canonical_species_name(&gaia_common::detection::normalize_sci_name(sci));
             shared_common_names.entry(norm).or_insert_with(|| com.clone());
         }
         if model.has_species_range_model() {
@@ -96,7 +97,7 @@ pub fn process_file(
             for label in model.labels() {
                 // BirdNET labels: "Sci Name_Common Name" or just "Sci Name".
                 let sci = label.split('_').next().unwrap_or(label);
-                known_bird_labels.insert(normalize_sci_name(sci));
+                known_bird_labels.insert(taxonomy::canonical_species_name(&normalize_sci_name(sci)));
             }
         }
     }
@@ -311,23 +312,28 @@ fn run_analysis(
     };
     let predicted_species_set: HashSet<String> = predicted_species_list
         .iter()
-        .map(|s| normalize_sci_name(s))
+        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
         .collect();
     let include_set: HashSet<String> = include_list
         .iter()
-        .map(|s| normalize_sci_name(s))
+        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
         .collect();
     let exclude_set: HashSet<String> = exclude_list
         .iter()
-        .map(|s| normalize_sci_name(s))
+        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
         .collect();
     let whitelist_set: HashSet<String> = whitelist
         .iter()
-        .map(|s| normalize_sci_name(s))
+        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
         .collect();
     let class_map_norm: HashMap<String, String> = class_map
         .iter()
-        .map(|(k, v)| (normalize_sci_name(k), v.clone()))
+        .map(|(k, v)| {
+            (
+                taxonomy::canonical_species_name(&normalize_sci_name(k)),
+                taxonomy::normalize_classification(v),
+            )
+        })
         .collect();
     let using_shared = own_species_list.is_empty() && !shared_species_range.is_empty();
 
@@ -386,18 +392,20 @@ fn run_analysis(
             }
 
             let sci_norm = normalize_sci_name(sci_name);
+            let sci_canonical = taxonomy::canonical_species_name(&sci_norm);
 
             let com_name = names
                 .get(sci_name.as_str())
                 .or_else(|| names.get(sci_norm.as_str()))
+                .or_else(|| names.get(sci_canonical.as_str()))
                 .cloned()
                 .unwrap_or_else(|| sci_name.clone());
 
-            if !include_set.is_empty() && !include_set.contains(sci_norm.as_str()) {
+            if !include_set.is_empty() && !include_set.contains(sci_canonical.as_str()) {
                 warn!("[{tag}] Excluded (not in include list): {sci_name}");
                 continue;
             }
-            if !exclude_set.is_empty() && exclude_set.contains(sci_norm.as_str()) {
+            if !exclude_set.is_empty() && exclude_set.contains(sci_canonical.as_str()) {
                 warn!("[{tag}] Excluded (in exclude list): {sci_name}");
                 continue;
             }
@@ -420,9 +428,9 @@ fn run_analysis(
             // says otherwise.
             let class_is_bird = class_map
                 .get(sci_name.as_str())
-                .or_else(|| class_map_norm.get(sci_norm.as_str()))
-                .map(|cls| is_bird_class(cls));
-            let known_bird = known_bird_labels.contains(sci_norm.as_str());
+                .or_else(|| class_map_norm.get(sci_canonical.as_str()))
+                .map(|cls| taxonomy::is_bird_class(cls));
+            let known_bird = known_bird_labels.contains(sci_canonical.as_str());
 
             let is_bird = match class_is_bird {
                 // If class says bird, trust it. If class is ambiguous or
@@ -444,14 +452,14 @@ fn run_analysis(
             // Check the neural species-range model (birds).
             let excluded_by_range_model = is_bird
                 && !predicted_species_set.is_empty()
-                && !predicted_species_set.contains(sci_norm.as_str())
-                && !whitelist_set.contains(sci_norm.as_str());
+                && !predicted_species_set.contains(sci_canonical.as_str())
+                && !whitelist_set.contains(sci_canonical.as_str());
 
             // Check the static CSV range file (non-birds: insects, frogs, bats, etc.).
             let static_ranges = crate::species_range::global();
             let excluded_by_static = if !is_bird && !static_ranges.is_empty() {
-                match static_ranges.check(sci_norm.as_str(), config.latitude, config.longitude, file.file_date.month()) {
-                    Some(false) => !whitelist_set.contains(sci_norm.as_str()),
+                match static_ranges.check(sci_canonical.as_str(), config.latitude, config.longitude, file.file_date.month()) {
+                    Some(false) => !whitelist_set.contains(sci_canonical.as_str()),
                     _ => false, // in range, or not in file → accept
                 }
             } else {
@@ -475,17 +483,19 @@ fn run_analysis(
             // Use per-species taxonomic class when the labels CSV
             // provides one (e.g. BirdNET+ V3.0: Aves, Mammalia, …),
             // otherwise fall back to the model-wide domain.
-            let det_domain = class_map
+            let det_domain = taxonomy::class_for_species(sci_canonical.as_str()).or_else(|| {
+                class_map
                 .get(sci_name.as_str())
-                .or_else(|| class_map_norm.get(sci_norm.as_str()))
-                .map_or(&domain, |c| c);
+                .or_else(|| class_map_norm.get(sci_canonical.as_str()))
+                .map(|c| taxonomy::normalize_classification(c))
+            }).unwrap_or_else(|| taxonomy::normalize_classification(&domain));
 
             let mut det = Detection::new(
-                det_domain,
+                &det_domain,
                 file.file_date,
                 *start,
                 *end,
-                sci_name,
+                &sci_canonical,
                 &com_name,
                 *confidence,
             );
@@ -566,9 +576,4 @@ fn filter_humans(predictions: &[Vec<Prediction>], config: &Config) -> Vec<Vec<Pr
             }
         })
         .collect()
-}
-
-fn is_bird_class(class_name: &str) -> bool {
-    let c = class_name.trim().to_ascii_lowercase();
-    c == "aves" || c == "bird" || c == "birds"
 }

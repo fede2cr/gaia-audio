@@ -18,6 +18,7 @@ mod reporting;
 mod smoke_test;
 mod species_range;
 mod spectrogram;
+mod taxonomy;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,6 +177,42 @@ fn main() -> Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 error!("Smoke test failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // ── review-taxonomy subcommand (startup normalization check) ─────
+    // Usage: gaia-processing review-taxonomy <table.toml> [merged.toml]
+    //
+    // Validates scientific-name equivalences and class aliases, then
+    // writes a merged canonical table used by runtime normalization.
+    if args.get(1).map(|s| s.as_str()) == Some("review-taxonomy") {
+        let table = args.get(2).unwrap_or_else(|| {
+            eprintln!(
+                "Usage: gaia-processing review-taxonomy <taxonomy_table.toml> [merged_output.toml]"
+            );
+            std::process::exit(2);
+        });
+        let merged = args.get(3).map(std::path::PathBuf::from);
+        let merged_ref = merged.as_deref();
+        match taxonomy::review_and_merge(Path::new(table), merged_ref) {
+            Ok(report) => {
+                info!(
+                    "taxonomy review OK: species={}, aliases={}, class_aliases={}, class_overrides={}, table={}",
+                    report.species_count,
+                    report.alias_count,
+                    report.class_alias_count,
+                    report.class_override_count,
+                    report.table_path.display(),
+                );
+                if let Some(out) = report.merged_path {
+                    info!("taxonomy merged table written: {}", out.display());
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                error!("taxonomy review failed: {e:#}");
                 std::process::exit(1);
             }
         }
