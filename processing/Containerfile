@@ -128,7 +128,7 @@ RUN python3 convert_keras_to_onnx.py /convert/keras -o meta-model.onnx --meta-on
 # Uses a separate stage with PyTorch to keep the runtime image lean.
 FROM python:3.11-slim AS batconverter
 
-RUN pip install --no-cache-dir batdetect2 onnx onnxruntime
+RUN pip install --no-cache-dir batdetect2 onnx onnxruntime onnxscript
 
 WORKDIR /convert
 COPY scripts/convert_batdetect2_to_onnx.py .
