@@ -363,21 +363,21 @@ RUN ldconfig
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory
 # if the manifest requests audio-model.onnx and it is absent.
-COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/audio-model.onnx
+COPY --from=converter /convert/audio-model.onnx* /usr/local/share/gaia/models/
 
 # Pre-converted BirdNET V2.4 metadata ONNX model (~28 MB).
 # Location-based species filtering without tract-tflite STRIDED_SLICE issues.
-COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta-model.onnx
+COPY --from=converter /convert/meta-model.onnx* /usr/local/share/gaia/models/
 
 # Pre-converted BatDetect2 ONNX model (~7.6 MB) + species labels.
 # The PyTorch checkpoint is exported to ONNX at build time in the
 # batconverter stage, so no Python/PyTorch is needed at runtime.
-COPY --from=batconverter /convert/batdetect2.onnx  /usr/local/share/gaia/models/batdetect2.onnx
+COPY --from=batconverter /convert/batdetect2.onnx* /usr/local/share/gaia/models/
 COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models/batdetect2-labels.csv
 
 # Original BirdNET+ V3.0 ONNX model (~541 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory.
-COPY --from=birdnet3converter /convert/birdnet3.onnx /usr/local/share/gaia/models/birdnet3.onnx
+COPY --from=birdnet3converter /convert/birdnet3.onnx* /usr/local/share/gaia/models/
 
 # Bundle all model manifests so the entrypoint can seed them into the
 # models volume automatically.  Each manifest goes into its own
@@ -388,7 +388,7 @@ COPY examples/bats_manifest.toml     /usr/local/share/gaia/manifests/batdetect2/
 COPY examples/birdnet3_manifest.toml /usr/local/share/gaia/manifests/birdnet3/manifest.toml
 COPY examples/taxonomy_equivalences.toml /usr/local/share/gaia/manifests/_taxonomy/taxonomy_equivalences.toml
 # Reuse BirdNET V2.4 metadata model + labels for species-range filtering in V3.
-COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/manifests/birdnet3/meta-model.onnx
+COPY --from=converter /convert/meta-model.onnx* /usr/local/share/gaia/manifests/birdnet3/
 # The V2.4 meta-model uses V2.4 labels (en_us.txt); bundle them separately
 # so the meta-model output maps to the correct species names.
 COPY --from=converter /convert/en_us.txt /usr/local/share/gaia/manifests/birdnet3/meta-labels.txt
