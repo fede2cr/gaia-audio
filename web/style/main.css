@@ -281,6 +281,16 @@ button {
     white-space: nowrap;
 }
 
+.pred-verified {
+    padding: .05rem .35rem;
+    border-radius: 3px;
+    font-size: .68rem;
+    font-weight: 600;
+    background: rgba(34,197,94,.14);
+    color: #86efac;
+    white-space: nowrap;
+}
+
 /* ── Detection Card ─────────────────────────────────────────────────────── */
 
 .detection-card {
@@ -417,6 +427,17 @@ button {
     letter-spacing: .04em;
     background: rgba(78,205,196,.12);
     color: var(--accent);
+}
+
+.verification-badge {
+    padding: .1rem .45rem;
+    border-radius: 4px;
+    font-size: .72rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    background: rgba(34,197,94,.14);
+    color: #86efac;
+    white-space: nowrap;
 }
 
 /* Model badge */

@@ -397,6 +397,9 @@ pub struct SpeciesSummary {
     /// Female specimen photo URL (from iNaturalist sex-annotated observations).
     #[serde(default)]
     pub female_image_url: Option<String>,
+    /// Verification record (ornithologist or iNaturalist observation).
+    #[serde(default)]
+    pub verification: Option<SpeciesVerification>,
 }
 
 /// Health/status snapshot for the in-memory DuckDB summary cache.
@@ -511,6 +514,9 @@ pub struct LivePrediction {
     /// Human-readable model name.
     #[serde(default)]
     pub model_name: String,
+    /// Verification record for this species (loaded separately by web).
+    #[serde(default)]
+    pub verification: Option<SpeciesVerification>,
 }
 
 // ─── Urban noise ─────────────────────────────────────────────────────────────

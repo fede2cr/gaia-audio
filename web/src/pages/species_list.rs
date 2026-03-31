@@ -16,6 +16,8 @@ use crate::model::{CacheSummaryStatus, SpeciesSummary};
 pub enum SpeciesSort {
     /// Most detections first (default).
     Detections,
+    /// Verified species first.
+    Verified,
     /// Most threatened first (IUCN Red List order).
     ConservationStatus,
     /// Alphabetical by common name.
@@ -27,6 +29,13 @@ impl SpeciesSort {
     pub fn apply(self, list: &mut [SpeciesSummary]) {
         match self {
             Self::Detections => list.sort_by(|a, b| b.detection_count.cmp(&a.detection_count)),
+            Self::Verified => list.sort_by(|a, b| {
+                let va = a.verification.is_some();
+                let vb = b.verification.is_some();
+                vb.cmp(&va)
+                    .then_with(|| b.detection_count.cmp(&a.detection_count))
+                    .then_with(|| a.common_name.to_lowercase().cmp(&b.common_name.to_lowercase()))
+            }),
             Self::ConservationStatus => list.sort_by(|a, b| {
                 // Most threatened first. Unknown/missing status should be last.
                 let ta = a
@@ -72,6 +81,17 @@ pub async fn get_all_species(
             sp.female_image_url = photo.female_image_url;
             sp.conservation_status = photo.conservation_status;
         }
+    }
+
+    let names: Vec<String> = species
+        .iter()
+        .map(|s| s.scientific_name.clone())
+        .collect();
+    let verifications = crate::server::kv::get_species_verifications(&names)
+        .await
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))?;
+    for sp in species.iter_mut() {
+        sp.verification = verifications.get(&sp.scientific_name).cloned();
     }
 
     Ok(species)
@@ -146,6 +166,12 @@ pub fn SpeciesListPage() -> impl IntoView {
                     on:click=move |_| set_sort.set(SpeciesSort::Detections)
                 >
                     "Detections"
+                </button>
+                <button
+                    class=move || if sort.get() == SpeciesSort::Verified { "sort-btn active" } else { "sort-btn" }
+                    on:click=move |_| set_sort.set(SpeciesSort::Verified)
+                >
+                    "Verified"
                 </button>
                 <button
                     class=move || if sort.get() == SpeciesSort::ConservationStatus { "sort-btn active" } else { "sort-btn" }

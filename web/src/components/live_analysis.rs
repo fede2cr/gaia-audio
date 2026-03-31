@@ -13,8 +13,9 @@ use leptos::prelude::{
     ServerFnError, StoredValue,
 };
 use leptos::either::Either;
+use std::collections::HashMap;
 
-use crate::model::{LivePrediction, LiveStatus};
+use crate::model::{LivePrediction, LiveStatus, SpeciesVerification};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -139,6 +140,15 @@ pub async fn get_tz_offset() -> Result<i32, ServerFnError> {
     Ok(map.get("tz_offset").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0))
 }
 
+#[server(prefix = "/api")]
+pub async fn get_live_species_verifications(
+    scientific_names: Vec<String>,
+) -> Result<HashMap<String, SpeciesVerification>, ServerFnError> {
+    crate::server::kv::get_species_verifications(&scientific_names)
+        .await
+        .map_err(|e| ServerFnError::new(format!("KV error: {e}")))
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 /// Live analysis panel that polls the processing server's current state.
@@ -151,6 +161,26 @@ pub fn LiveAnalysis() -> impl IntoView {
     let (status, set_status) = signal::<Option<LiveStatus>>(None);
     let (img_url, set_img_url) = signal(String::new());
     let (tz_offset, set_tz_offset) = signal(0_i32);
+    let verification_map = Resource::new(
+        move || {
+            status
+                .get()
+                .map(|s| {
+                    s.predictions
+                        .iter()
+                        .map(|p| p.scientific_name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        },
+        |names| async move {
+            if names.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                get_live_species_verifications(names).await
+            }
+        },
+    );
 
     // Track the last-seen timestamp so we can skip no-op updates.
     let last_ts = StoredValue::new(String::new());
@@ -226,6 +256,10 @@ pub fn LiveAnalysis() -> impl IntoView {
                         let url = img_url.get();
                         let has_det = st.has_detections;
                         let preds = st.predictions.clone();
+                        let verifications = verification_map
+                            .get()
+                            .and_then(|res| res.ok())
+                            .unwrap_or_default();
                         let node = node_label(&st.source_node);
                         let cap_time = format_capture_time(&st.captured_at, tz_offset.get());
 
@@ -255,7 +289,7 @@ pub fn LiveAnalysis() -> impl IntoView {
                                         }}
                                     </p>
                                     <div class="live-predictions">
-                                        <LivePredictionList predictions=preds/>
+                                        <LivePredictionList predictions=preds verifications=verifications/>
                                     </div>
                                 </div>
                             </div>
@@ -269,7 +303,10 @@ pub fn LiveAnalysis() -> impl IntoView {
 
 /// List of predictions with inline confidence bars.
 #[component]
-fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
+fn LivePredictionList(
+    predictions: Vec<LivePrediction>,
+    verifications: HashMap<String, SpeciesVerification>,
+) -> impl IntoView {
     if predictions.is_empty() {
         return Either::Left(view! { <p class="text-muted">"No predictions"</p> });
     }
@@ -293,6 +330,17 @@ fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
                 } else {
                     String::new()
                 };
+                let verification = p
+                    .verification
+                    .clone()
+                    .or_else(|| verifications.get(&p.scientific_name).cloned());
+                let verification_label = verification.as_ref().map(|v| {
+                    if v.method.eq_ignore_ascii_case("inaturalist") {
+                        "iNat"
+                    } else {
+                        "Ornithologist"
+                    }
+                });
 
                 view! {
                     <li class="prediction-item">
@@ -304,6 +352,9 @@ fn LivePredictionList(predictions: Vec<LivePrediction>) -> impl IntoView {
                         } else {
                             Either::Right(())
                         }}
+                        {verification_label.map(|label| view! {
+                            <span class="pred-verified" title="Species verification available">{label}</span>
+                        })}
                         <div class="pred-bar-track">
                             <div class={bar_class} style={format!("width: {width}")}></div>
                         </div>

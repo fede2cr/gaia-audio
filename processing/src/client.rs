@@ -98,11 +98,11 @@ pub fn poll_and_dispatch(
         // The container stays running but does not download or
         // process files until at least one model is activated in
         // Settings.  The set is checked every poll interval.
-        let enabled_models = crate::kv::get_enabled_models();
+        let enabled_models = crate::kv::get_enabled_models_state();
         {
             static IDLE_LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if enabled_models.is_empty() {
+            if matches!(enabled_models.as_ref(), Some(v) if v.is_empty()) {
                 if !IDLE_LOGGED.load(Ordering::Relaxed) {
                     info!("No models enabled — idling (container stays running)");
                     IDLE_LOGGED.store(true, Ordering::Relaxed);
@@ -112,7 +112,7 @@ pub fn poll_and_dispatch(
             } else if IDLE_LOGGED.swap(false, Ordering::Relaxed) {
                 info!(
                     "Models re-enabled ({} active) — resuming polling",
-                    enabled_models.len()
+                    enabled_models.as_ref().map_or(0, |v| v.len())
                 );
             }
         }

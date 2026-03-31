@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::Datelike;
@@ -28,6 +29,8 @@ pub fn process_file(
     report_tx: &std::sync::mpsc::SyncSender<ReportPayload>,
     source_node: &str,
 ) -> Result<()> {
+    let started = Instant::now();
+
     // Skip empty files
     let meta = std::fs::metadata(file_path)?;
     if meta.len() == 0 {
@@ -47,8 +50,9 @@ pub fn process_file(
     // Read the set of enabled models from Redis (managed in Settings).
     // An empty set means the Redis key is missing — treat as "all models
     // are enabled" (backward-compat with deployments not yet seeded).
-    let enabled = crate::kv::get_enabled_models();
-    let all_enabled = enabled.is_empty();
+    let enabled_state = crate::kv::get_enabled_models_state();
+    let all_enabled = enabled_state.is_none();
+    let enabled: Vec<String> = enabled_state.unwrap_or_default();
 
     // ── shared species-range data ────────────────────────────────────
     // Pre-compute the species-range list from models that have a
@@ -160,6 +164,8 @@ pub fn process_file(
         }
     }
 
+    let detection_count = all_detections.len();
+
     report_tx
         .send(ReportPayload {
             file,
@@ -167,6 +173,14 @@ pub fn process_file(
             source_node: source_node.to_string(),
         })
         .map_err(|_| anyhow::anyhow!("Reporting channel closed"))?;
+
+    let elapsed = started.elapsed();
+    info!(
+        "Analysis complete: {} (detections={}, elapsed={:.2}s)",
+        file_path.display(),
+        detection_count,
+        elapsed.as_secs_f64()
+    );
 
     Ok(())
 }

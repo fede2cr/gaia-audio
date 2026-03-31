@@ -101,6 +101,15 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
         .map(|s| s.to_string())
         .collect();
 
+    let verification_badge = species.verification.as_ref().map(|v| {
+        let (label, title) = if v.method.eq_ignore_ascii_case("inaturalist") {
+            ("iNat Verified", "Verified with iNaturalist observation")
+        } else {
+            ("Ornithologist", "Verified by ornithologist")
+        };
+        (label.to_string(), title.to_string())
+    });
+
     view! {
         <a href={href} class="species-card">
             {if has_sex_photos() {
@@ -145,6 +154,9 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                     {domains.iter().map(|d| view! {
                         <span class="domain-badge">{d.clone()}</span>
                     }).collect::<Vec<_>>()}
+                    {verification_badge.as_ref().map(|(label, title)| view! {
+                        <span class="verification-badge" title={title.clone()}>{label.clone()}</span>
+                    })}
                     {badge().map(|(class, title, code)| view! {
                         <span class={class} title={title}>{code}</span>
                     })}

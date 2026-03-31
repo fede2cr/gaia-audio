@@ -88,18 +88,31 @@ if [ ! -f "$TAXONOMY_TABLE" ] && [ -f "/models/_taxonomy/taxonomy_equivalences.t
 fi
 TAXONOMY_MERGED="$(dirname "$TAXONOMY_TABLE")/taxonomy_merged.toml"
 if [ -f "$TAXONOMY_TABLE" ]; then
-    if timeout 20 gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"; then
-        _tax_rc=0
-    else
-        _tax_rc=$?
-    fi
-    if [ "$_tax_rc" -eq 0 ]; then
-        echo "[entrypoint] Taxonomy table reviewed and merged: $TAXONOMY_MERGED"
-    elif [ "$_tax_rc" -eq 124 ]; then
-        echo "[entrypoint] WARNING: taxonomy review timed out after 20 s; continuing with built-in normalization"
-    else
-        echo "[entrypoint] WARNING: taxonomy review exited with code $_tax_rc; continuing with built-in normalization"
-    fi
+    TAXONOMY_REVIEW_TIMEOUT_SECS="${GAIA_TAXONOMY_REVIEW_TIMEOUT_SECS:-0}"
+    echo "[entrypoint] Starting taxonomy review in background (timeout=${TAXONOMY_REVIEW_TIMEOUT_SECS}s)"
+    (
+        if [ "$TAXONOMY_REVIEW_TIMEOUT_SECS" -gt 0 ] 2>/dev/null; then
+            if timeout "$TAXONOMY_REVIEW_TIMEOUT_SECS" gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"; then
+                _tax_rc=0
+            else
+                _tax_rc=$?
+            fi
+            if [ "$_tax_rc" -eq 0 ]; then
+                echo "[entrypoint] Taxonomy table reviewed and merged: $TAXONOMY_MERGED"
+            elif [ "$_tax_rc" -eq 124 ]; then
+                echo "[entrypoint] WARNING: taxonomy review timed out after ${TAXONOMY_REVIEW_TIMEOUT_SECS}s; continuing with built-in normalization"
+            else
+                echo "[entrypoint] WARNING: taxonomy review exited with code $_tax_rc; continuing with built-in normalization"
+            fi
+        else
+            if gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"; then
+                echo "[entrypoint] Taxonomy table reviewed and merged: $TAXONOMY_MERGED"
+            else
+                _tax_rc=$?
+                echo "[entrypoint] WARNING: taxonomy review exited with code $_tax_rc; continuing with built-in normalization"
+            fi
+        fi
+    ) &
 fi
 
 exec gaia-processing "$@"

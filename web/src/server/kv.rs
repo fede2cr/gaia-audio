@@ -7,7 +7,7 @@
 //!
 //! See `processing/src/kv.rs` for the canonical key-pattern reference.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use redis::AsyncCommands;
@@ -236,6 +236,56 @@ pub async fn remove_species_verification(sci_name: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("Redis error: {e}"))?;
     Ok(())
+}
+
+/// Bulk-read verification records for a set of species names.
+///
+/// Uses the `verification:*` key namespace and returns only species that
+/// currently have a saved verification entry.
+pub async fn get_species_verifications(
+    sci_names: &[String],
+) -> Result<HashMap<String, SpeciesVerification>, String> {
+    if sci_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let wanted: HashSet<String> = sci_names.iter().cloned().collect();
+    let mut c = conn();
+
+    let keys: Vec<String> = c
+        .keys("verification:*")
+        .await
+        .map_err(|e| format!("Redis error: {e}"))?;
+
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut out = HashMap::new();
+    for key in keys {
+        let Some(sci_name) = key.strip_prefix("verification:") else {
+            continue;
+        };
+        if !wanted.contains(sci_name) {
+            continue;
+        }
+
+        let map: HashMap<String, String> = c.hgetall(&key).await.unwrap_or_default();
+        if map.is_empty() {
+            continue;
+        }
+
+        out.insert(
+            sci_name.to_string(),
+            SpeciesVerification {
+                method: map.get("method").cloned().unwrap_or_default(),
+                inaturalist_obs: map.get("inaturalist_obs").cloned().unwrap_or_default(),
+                verified_at: map.get("verified_at").cloned().unwrap_or_default(),
+            },
+        );
+    }
+
+    Ok(out)
 }
 
 // ── SQLite → Redis migration ─────────────────────────────────────────────────

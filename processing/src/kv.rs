@@ -224,11 +224,23 @@ pub fn increment_urban_noise(date: &str, _hour: u32, category: &str) -> Result<(
 // ── Settings ─────────────────────────────────────────────────────────────────
 /// Read the set of enabled audio model slugs from Redis.
 ///
-/// Returns an empty vec when the key does not exist, which the caller
-/// should treat as "all loaded models are enabled" (backward-compat
-/// with deployments that haven't been seeded yet).
-pub fn get_enabled_models() -> Vec<String> {
-    with_retry(|c| c.smembers("audio:enabled_models")).unwrap_or_default()
+/// Returns:
+/// - `None` when the key does not exist (legacy behavior: treat as
+///   "all loaded models are enabled")
+/// - `Some(vec![])` when the key exists but is empty (explicitly all
+///   models disabled)
+/// - `Some(slugs)` when one or more models are enabled
+pub fn get_enabled_models_state() -> Option<Vec<String>> {
+    with_retry(|c| {
+        let exists: bool = c.exists("audio:enabled_models")?;
+        if !exists {
+            return Ok(None);
+        }
+        let members: Vec<String> = c.smembers("audio:enabled_models")?;
+        Ok(Some(members))
+    })
+    .ok()
+    .flatten()
 }
 /// Read a single setting from the `settings` hash.
 pub fn get_setting(key: &str) -> Option<String> {

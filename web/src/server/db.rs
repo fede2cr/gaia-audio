@@ -536,6 +536,7 @@ pub async fn top_species_for_date(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         });
     }
     Ok(results)
@@ -610,6 +611,7 @@ async fn top_species_from_cache(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         });
     }
     Ok(results)
@@ -644,6 +646,7 @@ async fn top_species_live(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         });
     }
     Ok(results)
@@ -1019,6 +1022,7 @@ pub async fn top_species_filtered(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         });
     }
     Ok(results)
@@ -1062,6 +1066,7 @@ pub async fn top_species_for_date_filtered(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         });
     }
     Ok(results)

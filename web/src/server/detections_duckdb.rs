@@ -662,6 +662,7 @@ pub async fn top_species_for_date_filtered(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -732,6 +733,7 @@ fn read_species_summaries(
             conservation_status: None,
             male_image_url: None,
             female_image_url: None,
+            verification: None,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
