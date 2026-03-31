@@ -34,6 +34,17 @@ pub fn new_cache() -> PhotoCache {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Read a species photo from cache without performing any network call.
+///
+/// Returns `None` when absent or stale (cache version mismatch).
+pub fn lookup_cached(cache: &PhotoCache, scientific_name: &str) -> Option<SpeciesPhoto> {
+    let guard = cache.lock().unwrap();
+    guard
+        .get(scientific_name)
+        .filter(|entry| entry.version == CACHE_VERSION)
+        .and_then(|entry| entry.photo.clone())
+}
+
 /// Look up a species photo.  Returns a cached result if available and
 /// up-to-date, otherwise queries the iNaturalist API (and caches the
 /// answer).

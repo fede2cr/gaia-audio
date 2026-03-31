@@ -63,9 +63,10 @@ pub async fn get_all_species(
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
-    // Cached stats rows don't include images; enrich from iNaturalist.
+    // Fast path for initial page render: enrich only from in-memory cache,
+    // never perform outbound iNaturalist requests here.
     for sp in species.iter_mut() {
-        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+        if let Some(photo) = inaturalist::lookup_cached(&state.photo_cache, &sp.scientific_name) {
             sp.image_url = Some(photo.medium_url);
             sp.male_image_url = photo.male_image_url;
             sp.female_image_url = photo.female_image_url;
@@ -74,6 +75,20 @@ pub async fn get_all_species(
     }
 
     Ok(species)
+}
+
+/// Fetch iNaturalist photo metadata for a single species on demand.
+///
+/// Intended for client-side lazy image hydration so the species list can
+/// render quickly before external API lookups complete.
+#[server(prefix = "/api")]
+pub async fn get_species_photo(
+    scientific_name: String,
+) -> Result<Option<crate::model::SpeciesPhoto>, ServerFnError> {
+    use crate::server::inaturalist;
+    let state = use_context::<crate::app::AppState>()
+        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
+    Ok(inaturalist::lookup(&state.photo_cache, &scientific_name).await)
 }
 
 #[server(prefix = "/api")]

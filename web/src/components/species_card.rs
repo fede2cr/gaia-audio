@@ -7,6 +7,8 @@ use leptos::prelude::*;
 use leptos::prelude::{ElementChild, IntoView};
 
 use crate::model::SpeciesSummary;
+#[cfg(target_arch = "wasm32")]
+use crate::pages::species_list::get_species_photo;
 
 /// A compact card showing species photo, name, and detection count.
 ///
@@ -15,29 +17,81 @@ use crate::model::SpeciesSummary;
 #[component]
 pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
     let href = format!("/species/{}", urlencoded(&species.scientific_name));
+    let fallback_img = "/pkg/placeholder.svg".to_string();
     let default_img = species
         .image_url
         .clone()
-        .unwrap_or_else(|| "/pkg/placeholder.svg".to_string());
+        .unwrap_or_else(|| fallback_img.clone());
 
-    let has_sex_photos =
-        species.male_image_url.is_some() || species.female_image_url.is_some();
-    let male_src = species
-        .male_image_url
-        .clone()
-        .unwrap_or_else(|| default_img.clone());
-    let female_src = species
-        .female_image_url
-        .clone()
-        .unwrap_or_else(|| default_img.clone());
+    #[cfg(target_arch = "wasm32")]
+    let (image_url, set_image_url) = signal(default_img.clone());
+    #[cfg(not(target_arch = "wasm32"))]
+    let (image_url, _set_image_url) = signal(default_img.clone());
+
+    #[cfg(target_arch = "wasm32")]
+    let (male_image_url, set_male_image_url) = signal(species.male_image_url.clone());
+    #[cfg(not(target_arch = "wasm32"))]
+    let (male_image_url, _set_male_image_url) = signal(species.male_image_url.clone());
+
+    #[cfg(target_arch = "wasm32")]
+    let (female_image_url, set_female_image_url) = signal(species.female_image_url.clone());
+    #[cfg(not(target_arch = "wasm32"))]
+    let (female_image_url, _set_female_image_url) = signal(species.female_image_url.clone());
+
+    #[cfg(target_arch = "wasm32")]
+    let (conservation_status, set_conservation_status) = signal(species.conservation_status);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (conservation_status, _set_conservation_status) = signal(species.conservation_status);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let scientific_name = species.scientific_name.clone();
+        let current_image = image_url;
+        Effect::new(move |_| {
+            // Skip request when this card already has a non-placeholder image.
+            if current_image.get() != "/pkg/placeholder.svg" {
+                return;
+            }
+
+            let scientific_name = scientific_name.clone();
+            let set_image_url = set_image_url;
+            let set_male_image_url = set_male_image_url;
+            let set_female_image_url = set_female_image_url;
+            let set_conservation_status = set_conservation_status;
+            leptos::task::spawn_local(async move {
+                if let Ok(Some(photo)) = get_species_photo(scientific_name).await {
+                    set_image_url.set(photo.medium_url.clone());
+                    set_male_image_url.set(photo.male_image_url);
+                    set_female_image_url.set(photo.female_image_url);
+                    set_conservation_status.set(photo.conservation_status);
+                }
+            });
+        });
+    }
+
+    let has_sex_photos = move || {
+        male_image_url.get().is_some() || female_image_url.get().is_some()
+    };
+    let male_src = move || {
+        male_image_url
+            .get()
+            .unwrap_or_else(|| image_url.get())
+    };
+    let female_src = move || {
+        female_image_url
+            .get()
+            .unwrap_or_else(|| image_url.get())
+    };
 
     // Conservation badge (if status is known).
-    let badge = species.conservation_status.map(|cs| {
-        let class = format!("conservation-badge {}", cs.css_class());
-        let title = cs.label().to_string();
-        let code = cs.code().to_string();
-        (class, title, code)
-    });
+    let badge = move || {
+        conservation_status.get().map(|cs| {
+            let class = format!("conservation-badge {}", cs.css_class());
+            let title = cs.label().to_string();
+            let code = cs.code().to_string();
+            (class, title, code)
+        })
+    };
 
     let domains: Vec<String> = species
         .domain
@@ -49,7 +103,7 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
 
     view! {
         <a href={href} class="species-card">
-            {if has_sex_photos {
+            {if has_sex_photos() {
                 leptos::either::Either::Left(view! {
                     <div class="species-img-wrap sex-split">
                         <div class="sex-half">
@@ -76,7 +130,7 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                 leptos::either::Either::Right(view! {
                     <div class="species-img-wrap">
                         <img
-                            src={default_img}
+                            src={image_url}
                             alt={species.common_name.clone()}
                             class="species-img"
                             loading="lazy"
@@ -91,7 +145,7 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                     {domains.iter().map(|d| view! {
                         <span class="domain-badge">{d.clone()}</span>
                     }).collect::<Vec<_>>()}
-                    {badge.map(|(class, title, code)| view! {
+                    {badge().map(|(class, title, code)| view! {
                         <span class={class} title={title}>{code}</span>
                     })}
                     <span class="detection-count">
