@@ -124,7 +124,12 @@ def main():
         # Resize (upsample) ops whose output-shape inference in tract
         # fails when dimensions are symbolic.  The processing pipeline
         # tiles audio into fixed-length chunks anyway.
-        opset_version=17,
+        #
+        # Newer PyTorch ONNX export paths implement BatDetect2's Resize
+        # graph at opset 18 and emit noisy downgrade failures if asked
+        # for opset 17. Export at 18 directly to avoid that conversion
+        # path.
+        opset_version=18,
         do_constant_folding=True,
     )
     raw_size = os.path.getsize(onnx_path)

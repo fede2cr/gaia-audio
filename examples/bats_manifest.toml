@@ -30,6 +30,10 @@ apply_softmax = true
 # BatDetect2 is a detection model that expects a spectrogram input,
 # not a classifier that accepts raw audio.
 onnx_is_classifier = false
+# BatDetect2 exports Resize with `coordinate_transformation_mode =
+# pytorch_half_pixel`, which tract-onnx cannot load reliably.
+# Prefer ONNX Runtime directly.
+prefer_ort = true
 
 # No metadata model for bats
 # [metadata_model]
