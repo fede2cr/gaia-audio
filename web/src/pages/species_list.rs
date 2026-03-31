@@ -28,16 +28,17 @@ impl SpeciesSort {
         match self {
             Self::Detections => list.sort_by(|a, b| b.detection_count.cmp(&a.detection_count)),
             Self::ConservationStatus => list.sort_by(|a, b| {
+                // Most threatened first. Unknown/missing status should be last.
                 let ta = a
                     .conservation_status
                     .map(|s| s.threat_level())
-                    .unwrap_or(0);
+                    .unwrap_or(u8::MIN);
                 let tb = b
                     .conservation_status
                     .map(|s| s.threat_level())
-                    .unwrap_or(0);
-                // Most threatened first, then by detection count.
-                tb.cmp(&ta).then_with(|| b.detection_count.cmp(&a.detection_count))
+                    .unwrap_or(u8::MIN);
+                tb.cmp(&ta)
+                    .then_with(|| b.detection_count.cmp(&a.detection_count))
             }),
             Self::Name => list.sort_by(|a, b| a.common_name.to_lowercase().cmp(&b.common_name.to_lowercase())),
         }
@@ -53,14 +54,25 @@ pub async fn get_all_species(
     limit: u32,
     model_slug: String,
 ) -> Result<Vec<SpeciesSummary>, ServerFnError> {
-    use crate::server::detections_duckdb as ddb;
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
 
     let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let species = ddb::top_species_filtered(&state.db_path, limit, slug_opt)
+    let mut species = ddb::top_species_filtered(&state.db_path, limit, slug_opt)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    // Cached stats rows don't include images; enrich from iNaturalist.
+    for sp in species.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+            sp.image_url = Some(photo.medium_url);
+            sp.male_image_url = photo.male_image_url;
+            sp.female_image_url = photo.female_image_url;
+            sp.conservation_status = photo.conservation_status;
+        }
+    }
+
     Ok(species)
 }
 

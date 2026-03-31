@@ -642,11 +642,11 @@ pub async fn top_species_for_date_filtered(
              MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
              MAX(d.Com_Name) \
          ) AS Com_Name, \
-         d.Domain, COUNT(*) AS cnt, \
+         string_agg(DISTINCT d.Domain, ',') AS Domain, COUNT(*) AS cnt, \
          MAX(d.Date || ' ' || d.Time) AS last \
          FROM detections d \
          WHERE d.Date = '{safe_date}' AND {excl} {slug_filter} \
-         GROUP BY d.Sci_Name, d.Domain ORDER BY cnt DESC LIMIT {limit}"
+         GROUP BY d.Sci_Name ORDER BY cnt DESC LIMIT {limit}"
     );
     let mut stmt = duck.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -920,11 +920,11 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
              MAX(CASE WHEN Com_Name != Sci_Name THEN Com_Name ELSE NULL END), \
              MAX(Com_Name) \
          ) AS Com_Name, \
-         Domain, COUNT(*) AS detection_count, \
+         string_agg(DISTINCT Domain, ',') AS Domain, COUNT(*) AS detection_count, \
          MAX(Date || ' ' || Time) AS last_seen \
          FROM detections d \
          WHERE {excl} \
-         GROUP BY Sci_Name, Domain",
+         GROUP BY Sci_Name",
     ))?;
 
     // model_species_stats — used by the species list page (model filter).
@@ -936,12 +936,12 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
                     MAX(CASE WHEN d.Com_Name != d.Sci_Name THEN d.Com_Name ELSE NULL END), \
                     MAX(d.Com_Name) \
                 ) AS Com_Name, \
-                d.Domain, \
+                string_agg(DISTINCT d.Domain, ',') AS Domain, \
                 COUNT(*) AS detection_count, \
                 MAX(d.Date || ' ' || d.Time) AS last_seen \
          FROM detections d \
          WHERE {excl} AND COALESCE(d.Model_Slug, '') != '' \
-         GROUP BY d.Model_Slug, d.Sci_Name, d.Domain",
+         GROUP BY d.Model_Slug, d.Sci_Name",
     ))?;
 
     // excluded_species_stats — used by the excluded species page.
@@ -952,13 +952,13 @@ pub async fn refresh_species_stats(db_path: &Path) -> Res<()> {
                     MAX(CASE WHEN Com_Name != Sci_Name THEN Com_Name ELSE NULL END), \
                     MAX(Com_Name) \
                 ) AS Com_Name, \
-                Domain, \
+                string_agg(DISTINCT Domain, ',') AS Domain, \
                 COUNT(*) AS detection_count, \
                 MAX(Date || ' ' || Time) AS last_seen, \
                 MAX(Confidence) AS max_confidence \
          FROM detections \
          WHERE COALESCE(Excluded, 0) = 1 \
-         GROUP BY Sci_Name, Domain",
+         GROUP BY Sci_Name",
     )?;
 
     // species_top_recordings (top 10 per species by confidence)

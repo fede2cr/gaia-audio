@@ -39,6 +39,14 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
         (class, title, code)
     });
 
+    let domains: Vec<String> = species
+        .domain
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
     view! {
         <a href={href} class="species-card">
             {if has_sex_photos {
@@ -80,7 +88,9 @@ pub fn SpeciesCard(species: SpeciesSummary) -> impl IntoView {
                 <h3 class="species-common">{species.common_name.clone()}</h3>
                 <p class="species-sci">{species.scientific_name.clone()}</p>
                 <div class="species-stats">
-                    <span class="domain-badge">{species.domain.clone()}</span>
+                    {domains.iter().map(|d| view! {
+                        <span class="domain-badge">{d.clone()}</span>
+                    }).collect::<Vec<_>>()}
                     {badge.map(|(class, title, code)| view! {
                         <span class={class} title={title}>{code}</span>
                     })}

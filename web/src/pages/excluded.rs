@@ -19,12 +19,19 @@ use crate::pages::species_list::get_stats_cache_status;
 
 #[server(prefix = "/api")]
 pub async fn get_excluded_species() -> Result<Vec<ExcludedSpecies>, ServerFnError> {
-    use crate::server::detections_duckdb as ddb;
+    use crate::server::{detections_duckdb as ddb, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let species = ddb::excluded_species(&state.db_path)
+    let mut species = ddb::excluded_species(&state.db_path)
         .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
+
+    for sp in species.iter_mut() {
+        if let Some(photo) = inaturalist::lookup(&state.photo_cache, &sp.scientific_name).await {
+            sp.image_url = Some(photo.medium_url);
+        }
+    }
+
     Ok(species)
 }
 
