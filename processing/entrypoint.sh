@@ -88,10 +88,14 @@ if [ ! -f "$TAXONOMY_TABLE" ] && [ -f "/models/_taxonomy/taxonomy_equivalences.t
 fi
 TAXONOMY_MERGED="$(dirname "$TAXONOMY_TABLE")/taxonomy_merged.toml"
 if [ -f "$TAXONOMY_TABLE" ]; then
-    if timeout 20 gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"; then
+    timeout 20 gaia-processing review-taxonomy "$TAXONOMY_TABLE" "$TAXONOMY_MERGED"
+    _tax_rc=$?
+    if [ "$_tax_rc" -eq 0 ]; then
         echo "[entrypoint] Taxonomy table reviewed and merged: $TAXONOMY_MERGED"
+    elif [ "$_tax_rc" -eq 124 ]; then
+        echo "[entrypoint] WARNING: taxonomy review timed out after 20 s; continuing with built-in normalization"
     else
-        echo "[entrypoint] WARNING: taxonomy review failed or timed out; continuing with built-in normalization"
+        echo "[entrypoint] WARNING: taxonomy review exited with code $_tax_rc; continuing with built-in normalization"
     fi
 fi
 

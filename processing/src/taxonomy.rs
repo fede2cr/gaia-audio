@@ -254,14 +254,52 @@ pub fn review_and_merge(table_path: &Path, merged_out: Option<&Path>) -> Result<
     };
 
     if let Some(path) = merged_out {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Cannot create directory {}", parent.display()))?;
-        }
+        // Serialize first so we catch any serialization error before touching disk.
         let text = toml::to_string_pretty(&merged)
             .context("Cannot serialize merged taxonomy table")?;
-        std::fs::write(path, text)
-            .with_context(|| format!("Cannot write merged taxonomy table: {}", path.display()))?;
+
+        // Create the output directory; warn and skip if it isn't writable
+        // (e.g. the /data volume is read-only at entrypoint time).
+        let can_write = if let Some(parent) = path.parent() {
+            match std::fs::create_dir_all(parent) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "taxonomy: cannot create output directory {}: {e}; \
+                         merged table will not be written",
+                        parent.display()
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if can_write {
+            // Write atomically via a temp file so a crash mid-write
+            // leaves the previous merged table intact.
+            let tmp = path.with_extension("toml.tmp");
+            match std::fs::write(&tmp, &text) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::rename(&tmp, path) {
+                        let _ = std::fs::remove_file(&tmp);
+                        tracing::warn!(
+                            "taxonomy: cannot rename temp file to {}: {e}; \
+                             merged table will not be written",
+                            path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "taxonomy: cannot write merged table to {}: {e}; \
+                         merged table will not be written",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     let report = ReviewReport {

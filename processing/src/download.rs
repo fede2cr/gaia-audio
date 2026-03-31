@@ -200,6 +200,27 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
                         onnx_path.display()
                     )
                 })?;
+
+                // Also copy the external-data sidecar (.onnx.data) if present.
+                // Large ONNX models (e.g. BatDetect2 exported with
+                // `use_external_data_format=True`) split weights into a
+                // separate <model>.onnx.data file that ORT reads at load time.
+                let baked_data = baked.with_extension("onnx.data");
+                if baked_data.exists() {
+                    let dest_data = onnx_path.with_extension("onnx.data");
+                    info!(
+                        "Copying baked-in ONNX external data: {} → {}",
+                        baked_data.display(),
+                        dest_data.display()
+                    );
+                    std::fs::copy(&baked_data, &dest_data).with_context(|| {
+                        format!(
+                            "Failed to copy baked ONNX data sidecar {} → {}",
+                            baked_data.display(),
+                            dest_data.display()
+                        )
+                    })?;
+                }
             }
 
             let size = std::fs::metadata(&onnx_path)
