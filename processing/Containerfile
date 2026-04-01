@@ -191,14 +191,22 @@ PY
 # handles DFT/STFT models correctly, while the tarball build hangs
 # indefinitely in CreateSession for those same models.
 #
-# VERSION PIN: ort-sys 2.0.0-rc.12 targets ORT C API v24.  Pin the
-# pip package to 1.24.2 for matching ABI.  The perch-smoke-test stage
-# and the runtime both use the same ORT version.
+# VERSION PIN: ort-sys 2.0.0-rc.12 targets ORT C API v24.  Prefer a
+# ROCm-enabled ORT wheel at the same version to keep GPU inference
+# active on AMD hosts; fall back to CPU ORT only when the ROCm wheel is
+# unavailable for the current build platform.
 FROM python:3.11-slim AS ort-download
-RUN pip install --no-cache-dir 'onnxruntime==1.24.2' && \
+ARG TARGETARCH
+RUN set -eux; \
+        if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+            pip install --no-cache-dir 'onnxruntime-rocm==1.24.2' || \
+            pip install --no-cache-dir 'onnxruntime==1.24.2'; \
+        else \
+            pip install --no-cache-dir 'onnxruntime==1.24.2'; \
+        fi && \
     ORT_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))") && \
-    cp "${ORT_LIB}"/libonnxruntime.so* /usr/lib/ && \
-    ls -lh /usr/lib/libonnxruntime.so* && \
+    cp "${ORT_LIB}"/libonnxruntime*.so* /usr/lib/ && \
+    ls -lh /usr/lib/libonnxruntime*.so* && \
     ldconfig
 
 
@@ -210,7 +218,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder      /build/target/release/validate_onnx   /usr/local/bin/validate_onnx
-COPY --from=ort-download /usr/lib/libonnxruntime.so*           /usr/lib/
+COPY --from=ort-download /usr/lib/libonnxruntime*.so*          /usr/lib/
 RUN ldconfig
 
 COPY --from=converter          /convert/audio-model.onnx* /validate/
@@ -359,7 +367,7 @@ COPY --from=smoke-test-runner  /test/.smoke-ok        /tmp/.smoke-ok
 
 # ONNX Runtime shared library for native Rust inference.
 # Extracted from the pip onnxruntime package in the ort-download stage.
-COPY --from=ort-download /usr/lib/libonnxruntime.so* /usr/lib/
+COPY --from=ort-download /usr/lib/libonnxruntime*.so* /usr/lib/
 RUN ldconfig
 
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).

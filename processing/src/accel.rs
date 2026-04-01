@@ -104,6 +104,30 @@ fn ort_intra_threads(default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Returns true when an ORT provider shared library appears to be present.
+///
+/// Example stems: `rocm`, `migraphx`, `cuda`, `tensorrt`.
+fn has_provider_library(stem: &str) -> bool {
+    let prefix = format!("libonnxruntime_providers_{stem}.so");
+    for dir in ["/usr/lib", "/usr/local/lib"] {
+        let direct = PathBuf::from(dir).join(&prefix);
+        if direct.is_file() {
+            return true;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with(&prefix) && p.is_file() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 // ── Runtime check ────────────────────────────────────────────────────────
 
 /// Detected acceleration backend from the `GAIA_ACCEL` env var.
@@ -183,7 +207,28 @@ impl OrtSession {
     #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         init_ort_environment();
-        let kind = accel_kind();
+        let requested_kind = accel_kind();
+
+        let has_migraphx = has_provider_library("migraphx");
+        let has_rocm = has_provider_library("rocm");
+        let has_tensorrt = has_provider_library("tensorrt");
+        let has_cuda = has_provider_library("cuda");
+
+        let kind = match requested_kind {
+            AccelKind::Rocm if !has_migraphx && !has_rocm => {
+                warn!(
+                    "GAIA_ACCEL=rocm requested but ORT ROCm/MIGraphX provider libraries are not present; using CPU EP"
+                );
+                AccelKind::None
+            }
+            AccelKind::Cuda if !has_tensorrt && !has_cuda => {
+                warn!(
+                    "GAIA_ACCEL=cuda requested but ORT CUDA/TensorRT provider libraries are not present; using CPU EP"
+                );
+                AccelKind::None
+            }
+            k => k,
+        };
 
         match kind {
             AccelKind::Rocm => info!(
@@ -238,13 +283,31 @@ impl OrtSession {
                     migraphx = migraphx.with_load_model(&cache_str);
                 }
 
-                builder
-                    .with_execution_providers([
-                        migraphx.build(),
-                        ort::ep::ROCm::default().with_device_id(0).build(),
-                        ort::ep::CPU::default().build(),
-                    ])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                if has_migraphx && has_rocm {
+                    builder
+                        .with_execution_providers([
+                            migraphx.build(),
+                            ort::ep::ROCm::default().with_device_id(0).build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                } else if has_migraphx {
+                    warn!("ROCm EP library not found; trying MIGraphX + CPU");
+                    builder
+                        .with_execution_providers([
+                            migraphx.build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                } else {
+                    warn!("MIGraphX EP library not found; trying ROCm + CPU");
+                    builder
+                        .with_execution_providers([
+                            ort::ep::ROCm::default().with_device_id(0).build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                }
             }
             AccelKind::Cuda => {
                 // Ensure the TensorRT engine cache directory exists.
@@ -266,16 +329,33 @@ impl OrtSession {
                     .with_timing_cache(true)
                     .with_timing_cache_path(&cache_str);
 
-                let cuda = ort::ep::CUDA::default()
-                    .with_device_id(0);
+                let cuda = ort::ep::CUDA::default().with_device_id(0);
 
-                builder
-                    .with_execution_providers([
-                        tensorrt.build(),
-                        cuda.build(),
-                        ort::ep::CPU::default().build(),
-                    ])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                if has_tensorrt && has_cuda {
+                    builder
+                        .with_execution_providers([
+                            tensorrt.build(),
+                            cuda.build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                } else if has_tensorrt {
+                    warn!("CUDA EP library not found; trying TensorRT + CPU");
+                    builder
+                        .with_execution_providers([
+                            tensorrt.build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                } else {
+                    warn!("TensorRT EP library not found; trying CUDA + CPU");
+                    builder
+                        .with_execution_providers([
+                            cuda.build(),
+                            ort::ep::CPU::default().build(),
+                        ])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                }
             }
             AccelKind::None => {
                 builder
