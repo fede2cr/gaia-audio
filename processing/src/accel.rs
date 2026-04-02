@@ -28,8 +28,10 @@ fn init_ort_environment() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         if let Some(lib_path) = resolve_ort_dylib_path() {
+            info!("ORT: loading library from {} …", lib_path.display());
             match ort::init_from(&lib_path) {
                 Ok(builder) => {
+                    info!("ORT: library loaded, committing environment …");
                     builder.commit();
                     if let Ok(env) = ort::environment::Environment::current() {
                         env.set_log_level(ort::logging::LogLevel::Warning);
@@ -46,6 +48,7 @@ fn init_ort_environment() {
             }
         }
 
+        info!("ORT: using default loader …");
         ort::init().commit();
         if let Ok(env) = ort::environment::Environment::current() {
             env.set_log_level(ort::logging::LogLevel::Warning);
@@ -358,9 +361,10 @@ impl OrtSession {
                 }
             }
             AccelKind::None => {
+                // Don't explicitly register CPU EP — ORT 1.22.x's CPU EP
+                // may not implement the api-22 OrtEpDevice list, causing
+                // an abort.  ORT defaults to CPU automatically.
                 builder
-                    .with_execution_providers([ort::ep::CPU::default().build()])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
             }
         };
 
@@ -410,14 +414,30 @@ impl OrtSession {
         // Ensure ORT environment is initialized before creating sessions.
         init_ort_environment();
 
+        let intra = ort_intra_threads(4);
+        info!("  ORT CPU session: intra_threads={intra}, inter_threads=1, opt_level=Level1");
+
         let start = std::time::Instant::now();
         info!("  Calling CreateSession for {}...", onnx_path.display());
 
-        // ORT 1.22.x can assert inside CreateSession when no execution
-        // provider is explicitly registered by the caller. Force CPU EP.
+        // Thread limits prevent deadlocks during CreateSession for
+        // DFT/STFT models (Perch, BirdNET V3).  Level1 optimization
+        // avoids the expensive Level2+ fusions that can hang on
+        // complex subgraphs in large models (500+ MB).
+        //
+        // Do NOT call with_execution_providers([CPU]) — ORT 1.22.1's
+        // CPU EP does not populate the OrtEpDevice list required by
+        // the api-22 EP registration path, causing an abort:
+        //   "Assertion '!this->empty()' failed" in stl_vector.h.
+        // Omitting it lets ORT default to CPU automatically.
+        use ort::session::builder::GraphOptimizationLevel;
         let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
-            .with_execution_providers([ort::ep::CPU::default().build()])
+            .with_intra_threads(intra)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level1)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(onnx_path)
             .with_context(|| format!("ORT: failed to load {}", onnx_path.display()))?;

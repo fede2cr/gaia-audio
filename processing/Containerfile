@@ -291,14 +291,12 @@ RUN gaia-processing validate-model \
 # To skip during rapid iteration: podman build --target runtime …
 FROM debian:trixie-slim AS smoke-test-runner
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates ffmpeg curl python3 python3-pip && rm -rf /var/lib/apt/lists/*
-RUN pip3 install --no-cache-dir --break-system-packages onnxruntime numpy
+    ca-certificates ffmpeg curl && rm -rf /var/lib/apt/lists/*
 
 # Binary + ORT library
 COPY --from=builder      /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so*      /usr/lib/
 RUN ldconfig
-COPY scripts/smoke_test_ort.py /usr/local/bin/smoke_test_ort.py
 
 # ── Convert baked-in test audio to WAV ────────────────────────────
 # Source: Keel-billed Toucan (Ramphastos sulfuratus) from a live
@@ -340,11 +338,13 @@ RUN curl -fsSL -o /test/models/perch/labels.csv \
 RUN gaia-processing validate-manifests /test/models
 
 # ── Run smoke tests ──────────────────────────────────────────────
-# We split smoke tests by runtime path:
-#   1. Rust smoke test for BirdNET V2.4 (tract-based path)
-#   2. Python onnxruntime smoke test for prefer_ort models
-#      (BirdNET+ V3.0 and Perch), matching the proven onnxruntime
-#      behavior used by existing conversion/validation scripts.
+# A single Rust smoke test exercises ALL models through the same
+# code path used at runtime — including prefer_ort models (BirdNET+
+# V3.0 and Perch) that go through the ort crate's CPU session.
+#
+# This replaces the previous split approach (Rust for tract models +
+# Python for ORT models) which failed to catch ORT session-creation
+# hangs in the actual Rust binary.
 #
 # NOTE: ORT_DYLIB_PATH is intentionally NOT set here.  The runtime
 # stage relies on ldconfig to find libonnxruntime.so, so the smoke
@@ -357,21 +357,9 @@ RUN RUST_LOG=info \
     timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
-        --models /test/models/birdnet \
+        --models /test/models \
         --species "Ramphastos sulfuratus" \
-        --expect-models 1 && \
-    timeout 300 \
-    python3 /usr/local/bin/smoke_test_ort.py \
-        --audio /test/bird.wav \
-        --species "Ramphastos sulfuratus" \
-        --model /test/models/perch/model.onnx \
-            --labels /test/models/perch/labels.csv \
-            --sr 32000 --chunk 5.0 --output-index 3 \
-            --transform softmax --name "Google Perch 2.0" \
-        --model /test/models/birdnet3/birdnet3.onnx \
-            --labels /test/models/birdnet3/labels.csv \
-            --sr 32000 --chunk 3.0 --output-index 1 \
-            --transform sigmoid --name "BirdNET+ V3.0" && \
+        --expect-models 3 && \
     touch /test/.smoke-ok
 
 # ── Runtime stage ──────────────────────────────────────────────────

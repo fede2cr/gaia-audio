@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Build-stage smoke test for models that require ONNX Runtime.
+"""Standalone ORT smoke test for debugging (Python onnxruntime).
 
-The Rust `ort` crate's CPU execution provider hangs indefinitely
-during session creation for models with DFT/STFT ops (Perch, BirdNET
-V3.0).  Python's `onnxruntime` pip package bundles a different ORT
-build that handles these models without issue.
-
-This script mirrors the Rust smoke test assertions:
-  1. Each model detects the expected species in its top-5.
-  2. Top confidence is above a transform-aware minimum.
+NOTE: The container build now uses the Rust smoke test for ALL models
+(including prefer_ort models like BirdNET+ V3.0 and Perch).  This
+script is kept for manual debugging and comparison but is no longer
+invoked during `docker build`.
 
 Usage (from the Containerfile smoke-test-runner stage)::
 

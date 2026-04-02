@@ -57,7 +57,14 @@ md5.workspace = true
 # default-features = false avoids pulling in `download-binaries`
 # (wasteful with `load-dynamic`).  `tracing` gives us the ORT →
 # tracing bridge for structured logging.
+#
+# NOTE: do NOT enable `api-22`.  The api-22 feature adds
+# SessionOptionsSetEpSelectionPolicy(MaxEfficiency) at session builder
+# creation time, which requires EPs to populate an OrtEpDevice list.
+# CPU-only ORT 1.22.x does not implement this, causing:
+#   "Assertion '!this->empty()' failed" → abort.
+# GPU EPs (ROCm/CUDA) register correctly without api-22.
 [dependencies.ort]
 version = "2.0.0-rc.12"
 default-features = false
-features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-22"]
+features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-21"]
