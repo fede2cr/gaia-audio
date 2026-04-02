@@ -204,59 +204,29 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
             //    → input-independent predictions).
             //
-            //    Use ONNX Runtime CPU-only with explicit thread limits:
-            //    without them, ORT deadlocks in CreateSession for models
-            //    with DFT/STFT ops.
+            //    Always use CPU-only ORT for prefer_ort models: these
+            //    models have exotic ops (DFT, STFT) that MIGraphX /
+            //    TensorRT cannot compile — attempting GPU compilation
+            //    hangs indefinitely with no benefit.  CPU inference is
+            //    fast enough (~66 ms per chunk).
             if prefer_ort {
                 let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
-                if crate::accel::is_gpu_requested() {
-                    match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
-                        Ok(sess) => {
-                            info!("ORT active (prefer_ort) for {}", onnx_path.display());
-                            (None, Some(sess), is_classifier)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "prefer_ort ORT session failed ({e:#}); retrying CPU-only"
-                            );
-                            match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
-                                Ok(sess) => {
-                                    info!(
-                                        "ORT active (prefer_ort, CPU-only fallback) for {}",
-                                        onnx_path.display()
-                                    );
-                                    (None, Some(sess), is_classifier)
-                                }
-                                Err(cpu_e) => {
-                                    tracing::error!(
-                                        "prefer_ort is set but ORT session failed: {cpu_e:#}"
-                                    );
-                                    return Err(cpu_e.context(
-                                        "prefer_ort is set but ORT session creation failed \
-                                         (is libonnxruntime.so installed?)"
-                                    ));
-                                }
-                            }
-                        }
+                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                    Ok(sess) => {
+                        info!(
+                            "ORT active (prefer_ort, CPU-only) for {}",
+                            onnx_path.display()
+                        );
+                        (None, Some(sess), is_classifier)
                     }
-                } else {
-                    match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
-                        Ok(sess) => {
-                            info!(
-                                "ORT active (prefer_ort, CPU-only) for {}",
-                                onnx_path.display()
-                            );
-                            (None, Some(sess), is_classifier)
-                        }
-                        Err(cpu_e) => {
-                            tracing::error!(
-                                "prefer_ort is set but ORT session failed: {cpu_e:#}"
-                            );
-                            return Err(cpu_e.context(
-                                "prefer_ort is set but ORT session creation failed \
-                                 (is libonnxruntime.so installed?)"
-                            ));
-                        }
+                    Err(cpu_e) => {
+                        tracing::error!(
+                            "prefer_ort is set but ORT session failed: {cpu_e:#}"
+                        );
+                        return Err(cpu_e.context(
+                            "prefer_ort is set but ORT session creation failed \
+                             (is libonnxruntime.so installed?)"
+                        ));
                     }
                 }
             } else {
