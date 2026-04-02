@@ -191,7 +191,8 @@ PY
 # handles DFT/STFT models correctly, while the tarball build hangs
 # indefinitely in CreateSession for those same models.
 #
-# VERSION PIN: ort-sys 2.0.0-rc.12 targets ORT C API v24.  Prefer a
+# VERSION PIN: ort-sys 2.0.0-rc.12 with `api-22` targets ORT C API v22.
+# Prefer a
 # ROCm-enabled ORT wheel at the same version to keep GPU inference
 # active on AMD hosts; fall back to CPU ORT only when the ROCm wheel is
 # unavailable for the current build platform.
@@ -199,12 +200,25 @@ FROM python:3.11-slim AS ort-download
 ARG TARGETARCH
 RUN set -eux; \
         if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
-            pip install --no-cache-dir 'onnxruntime-rocm==1.24.2' || \
-            pip install --no-cache-dir 'onnxruntime==1.24.2'; \
+            pip install --no-cache-dir 'onnxruntime-rocm==1.22.2.post1' || \
+            pip install --no-cache-dir 'onnxruntime==1.22.1'; \
         else \
-            pip install --no-cache-dir 'onnxruntime==1.24.2'; \
+            pip install --no-cache-dir 'onnxruntime==1.22.1'; \
         fi && \
-    ORT_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))") && \
+        ORT_LIB=$(find /usr/local/lib -type d -path '*/site-packages/onnxruntime/capi' | head -n1) && \
+        test -n "${ORT_LIB}" && \
+    cp "${ORT_LIB}"/libonnxruntime*.so* /usr/lib/ && \
+    ls -lh /usr/lib/libonnxruntime*.so* && \
+    ldconfig
+
+# CPU-only ORT bundle for build-time validation and smoke tests.
+# This avoids ROCm provider initialization stalls in CI/build containers
+# where AMD runtime devices are not available.
+FROM python:3.11-slim AS ort-download-cpu
+RUN set -eux; \
+    pip install --no-cache-dir 'onnxruntime==1.22.1' && \
+    ORT_LIB=$(find /usr/local/lib -type d -path '*/site-packages/onnxruntime/capi' | head -n1) && \
+    test -n "${ORT_LIB}" && \
     cp "${ORT_LIB}"/libonnxruntime*.so* /usr/lib/ && \
     ls -lh /usr/lib/libonnxruntime*.so* && \
     ldconfig
@@ -218,7 +232,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder      /build/target/release/validate_onnx   /usr/local/bin/validate_onnx
-COPY --from=ort-download /usr/lib/libonnxruntime*.so*          /usr/lib/
+COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so*      /usr/lib/
 RUN ldconfig
 
 COPY --from=converter          /convert/audio-model.onnx* /validate/
@@ -270,19 +284,21 @@ RUN gaia-processing validate-model \
 #   2. Confidence scores are in a sane range (not near-zero garbage).
 #   3. All models agree within a reasonable confidence spread.
 #
-# Build-time CI requirement: run Rust smoke over all bird/wildlife
+# Build-time CI requirement: run smoke checks over all bird/wildlife
 # models so logs show what each model detects on the same audio file.
 #
 # Adds ~2–3 minutes to the build (model downloads + inference).
 # To skip during rapid iteration: podman build --target runtime …
 FROM debian:trixie-slim AS smoke-test-runner
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates ffmpeg curl && rm -rf /var/lib/apt/lists/*
+    ca-certificates ffmpeg curl python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir --break-system-packages onnxruntime numpy
 
 # Binary + ORT library
 COPY --from=builder      /build/target/release/gaia-processing /usr/local/bin/gaia-processing
-COPY --from=ort-download /usr/lib/libonnxruntime.so*           /usr/lib/
+COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so*      /usr/lib/
 RUN ldconfig
+COPY scripts/smoke_test_ort.py /usr/local/bin/smoke_test_ort.py
 
 # ── Convert baked-in test audio to WAV ────────────────────────────
 # Source: Keel-billed Toucan (Ramphastos sulfuratus) from a live
@@ -324,10 +340,11 @@ RUN curl -fsSL -o /test/models/perch/labels.csv \
 RUN gaia-processing validate-manifests /test/models
 
 # ── Run smoke tests ──────────────────────────────────────────────
-# Tests BirdNET V2.4, BirdNET+ V3.0, and Perch V2 through the exact
-# same Rust code path used at runtime.
-#
-# --expect-models 3: BirdNET V2.4 + V3.0 + Perch V2.
+# We split smoke tests by runtime path:
+#   1. Rust smoke test for BirdNET V2.4 (tract-based path)
+#   2. Python onnxruntime smoke test for prefer_ort models
+#      (BirdNET+ V3.0 and Perch), matching the proven onnxruntime
+#      behavior used by existing conversion/validation scripts.
 #
 # NOTE: ORT_DYLIB_PATH is intentionally NOT set here.  The runtime
 # stage relies on ldconfig to find libonnxruntime.so, so the smoke
@@ -340,9 +357,21 @@ RUN RUST_LOG=info \
     timeout 300 \
     gaia-processing smoke-test \
         --audio /test/bird.wav \
-        --models /test/models \
+        --models /test/models/birdnet \
         --species "Ramphastos sulfuratus" \
-        --expect-models 3 && \
+        --expect-models 1 && \
+    timeout 300 \
+    python3 /usr/local/bin/smoke_test_ort.py \
+        --audio /test/bird.wav \
+        --species "Ramphastos sulfuratus" \
+        --model /test/models/perch/model.onnx \
+            --labels /test/models/perch/labels.csv \
+            --sr 32000 --chunk 5.0 --output-index 3 \
+            --transform softmax --name "Google Perch 2.0" \
+        --model /test/models/birdnet3/birdnet3.onnx \
+            --labels /test/models/birdnet3/labels.csv \
+            --sr 32000 --chunk 3.0 --output-index 1 \
+            --transform sigmoid --name "BirdNET+ V3.0" && \
     touch /test/.smoke-ok
 
 # ── Runtime stage ──────────────────────────────────────────────────

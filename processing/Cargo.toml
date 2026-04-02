@@ -60,4 +60,4 @@ md5.workspace = true
 [dependencies.ort]
 version = "2.0.0-rc.12"
 default-features = false
-features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-24"]
+features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-22"]

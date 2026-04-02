@@ -232,8 +232,8 @@ pub fn increment_urban_noise(date: &str, _hour: u32, category: &str) -> Result<(
 /// - `Some(slugs)` when one or more models are enabled
 pub fn get_enabled_models_state() -> Option<Vec<String>> {
     with_retry(|c| {
-        let exists: bool = c.exists("audio:enabled_models")?;
-        if !exists {
+        let seeded: bool = c.exists("audio:enabled_models:seeded")?;
+        if !seeded {
             return Ok(None);
         }
         let members: Vec<String> = c.smembers("audio:enabled_models")?;

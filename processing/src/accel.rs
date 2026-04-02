@@ -413,10 +413,12 @@ impl OrtSession {
         let start = std::time::Instant::now();
         info!("  Calling CreateSession for {}...", onnx_path.display());
 
-        // Match birda/rust-birdnet-onnx defaults: no explicit thread,
-        // optimisation, or EP overrides in CPU fallback mode.
+        // ORT 1.22.x can assert inside CreateSession when no execution
+        // provider is explicitly registered by the caller. Force CPU EP.
         let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
+            .with_execution_providers([ort::ep::CPU::default().build()])
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             .commit_from_file(onnx_path)
             .with_context(|| format!("ORT: failed to load {}", onnx_path.display()))?;
 

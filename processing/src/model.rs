@@ -209,32 +209,53 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             //    with DFT/STFT ops.
             if prefer_ort {
                 let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
-                match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
-                    Ok(sess) => {
-                        info!("ORT active (prefer_ort) for {}", onnx_path.display());
-                        (None, Some(sess), is_classifier)
+                if crate::accel::is_gpu_requested() {
+                    match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                        Ok(sess) => {
+                            info!("ORT active (prefer_ort) for {}", onnx_path.display());
+                            (None, Some(sess), is_classifier)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "prefer_ort ORT session failed ({e:#}); retrying CPU-only"
+                            );
+                            match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                                Ok(sess) => {
+                                    info!(
+                                        "ORT active (prefer_ort, CPU-only fallback) for {}",
+                                        onnx_path.display()
+                                    );
+                                    (None, Some(sess), is_classifier)
+                                }
+                                Err(cpu_e) => {
+                                    tracing::error!(
+                                        "prefer_ort is set but ORT session failed: {cpu_e:#}"
+                                    );
+                                    return Err(cpu_e.context(
+                                        "prefer_ort is set but ORT session creation failed \
+                                         (is libonnxruntime.so installed?)"
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "prefer_ort ORT session failed ({e:#}); retrying CPU-only"
-                        );
-                        match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
-                            Ok(sess) => {
-                                info!(
-                                    "ORT active (prefer_ort, CPU-only fallback) for {}",
-                                    onnx_path.display()
-                                );
-                                (None, Some(sess), is_classifier)
-                            }
-                            Err(cpu_e) => {
-                                tracing::error!(
-                                    "prefer_ort is set but ORT session failed: {cpu_e:#}"
-                                );
-                                return Err(cpu_e.context(
-                                    "prefer_ort is set but ORT session creation failed \
-                                     (is libonnxruntime.so installed?)"
-                                ));
-                            }
+                } else {
+                    match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                        Ok(sess) => {
+                            info!(
+                                "ORT active (prefer_ort, CPU-only) for {}",
+                                onnx_path.display()
+                            );
+                            (None, Some(sess), is_classifier)
+                        }
+                        Err(cpu_e) => {
+                            tracing::error!(
+                                "prefer_ort is set but ORT session failed: {cpu_e:#}"
+                            );
+                            return Err(cpu_e.context(
+                                "prefer_ort is set but ORT session creation failed \
+                                 (is libonnxruntime.so installed?)"
+                            ));
                         }
                     }
                 }
@@ -285,35 +306,56 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                         onnx_path.display()
                     );
                     let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
-                    match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
-                        Ok(sess) => {
-                            info!(
-                                "ONNX Runtime fallback active for {}",
-                                onnx_path.display()
-                            );
-                            (None, Some(sess), is_classifier)
+                    if crate::accel::is_gpu_requested() {
+                        match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                            Ok(sess) => {
+                                info!(
+                                    "ONNX Runtime fallback active for {}",
+                                    onnx_path.display()
+                                );
+                                (None, Some(sess), is_classifier)
+                            }
+                            Err(ort_err) => {
+                                tracing::warn!(
+                                    "ONNX Runtime accelerated fallback failed ({ort_err:#}); retrying CPU-only"
+                                );
+                                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                                    Ok(sess) => {
+                                        info!(
+                                            "ONNX Runtime CPU fallback active for {}",
+                                            onnx_path.display()
+                                        );
+                                        (None, Some(sess), is_classifier)
+                                    }
+                                    Err(cpu_err) => {
+                                        tracing::error!(
+                                            "ONNX Runtime fallback also failed: {cpu_err:#}"
+                                        );
+                                        return Err(tract_err.context(
+                                            "tract-onnx failed and ONNX Runtime fallback \
+                                             is unavailable (is libonnxruntime.so installed?)"
+                                        ));
+                                    }
+                                }
+                            }
                         }
-                        Err(ort_err) => {
-                            tracing::warn!(
-                                "ONNX Runtime accelerated fallback failed ({ort_err:#}); retrying CPU-only"
-                            );
-                            match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
-                                Ok(sess) => {
-                                    info!(
-                                        "ONNX Runtime CPU fallback active for {}",
-                                        onnx_path.display()
-                                    );
-                                    (None, Some(sess), is_classifier)
-                                }
-                                Err(cpu_err) => {
-                                    tracing::error!(
-                                        "ONNX Runtime fallback also failed: {cpu_err:#}"
-                                    );
-                                    return Err(tract_err.context(
-                                        "tract-onnx failed and ONNX Runtime fallback \
-                                         is unavailable (is libonnxruntime.so installed?)"
-                                    ));
-                                }
+                    } else {
+                        match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                            Ok(sess) => {
+                                info!(
+                                    "ONNX Runtime CPU fallback active for {}",
+                                    onnx_path.display()
+                                );
+                                (None, Some(sess), is_classifier)
+                            }
+                            Err(cpu_err) => {
+                                tracing::error!(
+                                    "ONNX Runtime fallback also failed: {cpu_err:#}"
+                                );
+                                return Err(tract_err.context(
+                                    "tract-onnx failed and ONNX Runtime fallback \
+                                     is unavailable (is libonnxruntime.so installed?)"
+                                ));
                             }
                         }
                     }
