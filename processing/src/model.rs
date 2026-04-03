@@ -209,6 +209,10 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
             //    TensorRT cannot compile — attempting GPU compilation
             //    hangs indefinitely with no benefit.  CPU inference is
             //    fast enough (~66 ms per chunk).
+            //
+            //    If ORT fails (missing library, init hang, etc.), fall
+            //    through to tract as a last resort so the pipeline keeps
+            //    running with the remaining models.
             if prefer_ort {
                 let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
                 match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
@@ -220,13 +224,30 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
                         (None, Some(sess), is_classifier)
                     }
                     Err(cpu_e) => {
-                        tracing::error!(
-                            "prefer_ort is set but ORT session failed: {cpu_e:#}"
+                        tracing::warn!(
+                            "prefer_ort ORT session failed ({cpu_e:#}); \
+                             falling back to tract-onnx (inference may be degraded)"
                         );
-                        return Err(cpu_e.context(
-                            "prefer_ort is set but ORT session creation failed \
-                             (is libonnxruntime.so installed?)"
-                        ));
+                        // Try tract as last resort — some models produce
+                        // degraded output but still provide value.
+                        match load_onnx_runner(&onnx_path) {
+                            Ok(r) => {
+                                tracing::warn!(
+                                    "tract-onnx loaded {} as fallback (prefer_ort failed)",
+                                    onnx_path.display()
+                                );
+                                (Some(r), None, is_classifier)
+                            }
+                            Err(tract_e) => {
+                                tracing::error!(
+                                    "Both ORT and tract failed for {}: ORT={cpu_e:#}, tract={tract_e:#}",
+                                    onnx_path.display()
+                                );
+                                return Err(cpu_e.context(
+                                    "prefer_ort is set but both ORT and tract-onnx failed"
+                                ));
+                            }
+                        }
                     }
                 }
             } else {

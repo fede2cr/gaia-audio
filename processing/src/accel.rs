@@ -24,9 +24,36 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 /// Initialise the ORT global environment exactly once.
+///
+/// If library loading hangs (e.g. ROCm HSA init stalling), the
+/// watchdog thread will abort after `ORT_INIT_TIMEOUT` seconds
+/// (default 30) so the processing pipeline can continue with
+/// tract-only models.
 fn init_ort_environment() {
     static INIT: Once = Once::new();
+    static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     INIT.call_once(|| {
+        let timeout_secs: u64 = std::env::var("ORT_INIT_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        // Watchdog: if ORT init hasn't completed in timeout_secs,
+        // log an error but do NOT abort — let the caller see the
+        // failure when it tries to create a session.
+        let _watchdog = std::thread::Builder::new()
+            .name("ort-init-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+                if !READY.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::error!(
+                        "ORT environment init has not completed after {timeout_secs}s — \
+                         possible HSA/GPU runtime hang.  Models requiring ORT will be skipped."
+                    );
+                }
+            });
+
         if let Some(lib_path) = resolve_ort_dylib_path() {
             info!("ORT: loading library from {} …", lib_path.display());
             match ort::init_from(&lib_path) {
@@ -37,6 +64,7 @@ fn init_ort_environment() {
                         env.set_log_level(ort::logging::LogLevel::Warning);
                     }
                     info!("ORT environment initialised from {}", lib_path.display());
+                    READY.store(true, std::sync::atomic::Ordering::Release);
                     return;
                 }
                 Err(e) => {
@@ -54,6 +82,7 @@ fn init_ort_environment() {
             env.set_log_level(ort::logging::LogLevel::Warning);
         }
         info!("ORT environment initialised");
+        READY.store(true, std::sync::atomic::Ordering::Release);
     });
 }
 
@@ -81,17 +110,20 @@ fn resolve_ort_dylib_path() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir("/usr/lib") {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("libonnxruntime.so") && p.is_file() {
-                    return Some(p);
-                }
+    find_ort_in_dir("/usr/lib")
+}
+
+/// Find the first `libonnxruntime.so*` file in `dir`.
+fn find_ort_in_dir(dir: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("libonnxruntime.so") && p.is_file() {
+                return Some(p);
             }
         }
     }
-
     None
 }
 
@@ -361,9 +393,7 @@ impl OrtSession {
                 }
             }
             AccelKind::None => {
-                // Don't explicitly register CPU EP — ORT 1.22.x's CPU EP
-                // may not implement the api-22 OrtEpDevice list, causing
-                // an abort.  ORT defaults to CPU automatically.
+                // No GPU EPs requested — ORT defaults to CPU automatically.
                 builder
             }
         };
@@ -424,12 +454,6 @@ impl OrtSession {
         // DFT/STFT models (Perch, BirdNET V3).  Level1 optimization
         // avoids the expensive Level2+ fusions that can hang on
         // complex subgraphs in large models (500+ MB).
-        //
-        // Do NOT call with_execution_providers([CPU]) — ORT 1.22.1's
-        // CPU EP does not populate the OrtEpDevice list required by
-        // the api-22 EP registration path, causing an abort:
-        //   "Assertion '!this->empty()' failed" in stl_vector.h.
-        // Omitting it lets ORT default to CPU automatically.
         use ort::session::builder::GraphOptimizationLevel;
         let session = ort::session::Session::builder()
             .context("Failed to create ORT session builder (is libonnxruntime.so installed?)")?
