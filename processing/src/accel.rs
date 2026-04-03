@@ -43,6 +43,10 @@ pub fn ort_is_available() -> bool {
 /// `call_once` still finishes and `ORT_AVAILABLE` stays `false`.
 /// Subsequent callers see the failure immediately instead of
 /// blocking forever on `Once::call_once`.
+///
+/// When the primary library (which may be ROCm-enabled) times out,
+/// a second attempt is made with the CPU-only library at
+/// `/usr/lib/ort-cpu/` (if present).
 fn init_ort_environment() {
     static INIT: Once = Once::new();
 
@@ -52,7 +56,9 @@ fn init_ort_environment() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
 
-        // Channel lets us wait-with-timeout for the init thread.
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        // ── Attempt 1: primary library ────────────────────────────
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
 
         let _init_thread = std::thread::Builder::new()
@@ -62,49 +68,126 @@ fn init_ort_environment() {
                 let _ = tx.send(ok);
             });
 
-        match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+        match rx.recv_timeout(timeout) {
             Ok(true) => {
                 ORT_AVAILABLE.store(true, Ordering::Release);
+                return;
             }
             Ok(false) => {
                 tracing::error!(
-                    "ORT environment init failed — models requiring ORT will be skipped."
+                    "ORT primary init failed — trying CPU-only fallback."
                 );
             }
             Err(_) => {
                 tracing::error!(
                     "ORT environment init has not completed after {timeout_secs}s — \
-                     possible HSA/GPU runtime hang.  Models requiring ORT will be skipped."
+                     possible HSA/GPU runtime hang.  Trying CPU-only fallback."
                 );
                 // The init thread may still be alive (hung in HSA),
-                // but call_once can now return and the rest of the
-                // pipeline continues without ORT.
+                // but we can continue — the CPU-only library has no
+                // ROCm dependencies and should load cleanly.
             }
         }
+
+        // ── Attempt 2: CPU-only fallback library ──────────────────
+        if let Some(cpu_path) = find_ort_in_dir("/usr/lib/ort-cpu") {
+            tracing::info!(
+                "ORT: retrying with CPU-only library: {}",
+                cpu_path.display()
+            );
+            let (tx2, rx2) = std::sync::mpsc::sync_channel::<bool>(1);
+            let _fallback_thread = std::thread::Builder::new()
+                .name("ort-init-cpu".into())
+                .spawn(move || {
+                    apply_hsa_mitigations();
+                    let ok = do_ort_init_from(&cpu_path);
+                    let _ = tx2.send(ok);
+                });
+
+            match rx2.recv_timeout(timeout) {
+                Ok(true) => {
+                    ORT_AVAILABLE.store(true, Ordering::Release);
+                    tracing::info!("ORT CPU-only fallback init succeeded.");
+                    return;
+                }
+                Ok(false) => {
+                    tracing::error!("ORT CPU-only fallback init also failed.");
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "ORT CPU-only fallback init also timed out after {timeout_secs}s."
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "No CPU-only ORT library found at /usr/lib/ort-cpu/; \
+                 cannot fall back.  Models requiring ORT will be skipped."
+            );
+        }
+
+        tracing::error!(
+            "All ORT init attempts failed — models requiring ORT will be skipped."
+        );
     });
+}
+
+/// Apply HSA / ROCm environment mitigations before loading ORT.
+///
+/// The ROCm-enabled `libonnxruntime.so` triggers HSA runtime
+/// initialisation during `dlopen`.  On some AMD GPU configurations
+/// (particularly when the GPU is passed through to a container or
+/// the SDMA engine is unresponsive), HSA init hangs indefinitely.
+///
+/// Setting `HSA_ENABLE_SDMA=0` is the standard workaround.
+/// These variables **must** be set before the library is loaded.
+fn apply_hsa_mitigations() {
+    // Safety: called from a dedicated init thread before any other
+    // thread reads these variables.
+    unsafe {
+        if std::env::var_os("HSA_ENABLE_SDMA").is_none() {
+            info!("ORT: setting HSA_ENABLE_SDMA=0 to mitigate HSA init hangs");
+            std::env::set_var("HSA_ENABLE_SDMA", "0");
+        }
+        // Suppress noisy AMD log spam during init.
+        if std::env::var_os("AMD_LOG_LEVEL").is_none() {
+            std::env::set_var("AMD_LOG_LEVEL", "0");
+        }
+    }
+}
+
+/// Perform the actual ORT init from a specific library path.
+fn do_ort_init_from(lib_path: &Path) -> bool {
+    info!("ORT: loading library from {} …", lib_path.display());
+    match ort::init_from(lib_path) {
+        Ok(builder) => {
+            info!("ORT: library loaded, committing environment …");
+            builder.commit();
+            if let Ok(env) = ort::environment::Environment::current() {
+                env.set_log_level(ort::logging::LogLevel::Warning);
+            }
+            info!("ORT environment initialised from {}", lib_path.display());
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Failed to init ORT from {}: {e}",
+                lib_path.display()
+            );
+            false
+        }
+    }
 }
 
 /// Perform the actual ORT init (runs on a dedicated thread).
 fn do_ort_init() -> bool {
+    apply_hsa_mitigations();
+
     if let Some(lib_path) = resolve_ort_dylib_path() {
-        info!("ORT: loading library from {} …", lib_path.display());
-        match ort::init_from(&lib_path) {
-            Ok(builder) => {
-                info!("ORT: library loaded, committing environment …");
-                builder.commit();
-                if let Ok(env) = ort::environment::Environment::current() {
-                    env.set_log_level(ort::logging::LogLevel::Warning);
-                }
-                info!("ORT environment initialised from {}", lib_path.display());
-                return true;
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to init ORT from {}: {e}; falling back to default loader",
-                    lib_path.display()
-                );
-            }
+        if do_ort_init_from(&lib_path) {
+            return true;
         }
+        warn!("ORT: explicit library failed; falling back to default loader");
     }
 
     info!("ORT: using default loader …");
@@ -120,12 +203,29 @@ fn do_ort_init() -> bool {
 ///
 /// Priority:
 /// 1. `ORT_DYLIB_PATH` environment variable (if it points to a file)
-/// 2. Common system locations used by the container image
+/// 2. CPU-only library at `/usr/lib/ort-cpu/` (when GPU not requested)
+/// 3. Common system locations used by the container image
+///
+/// When GPU acceleration is not requested, we prefer the CPU-only
+/// build to completely avoid loading ROCm/HSA runtime libraries that
+/// may hang during `dlopen` global constructors.
 fn resolve_ort_dylib_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
         let p = PathBuf::from(path);
         if p.is_file() {
             return Some(p);
+        }
+    }
+
+    // When GPU is NOT requested, prefer a CPU-only ORT build to
+    // completely avoid ROCm/HSA runtime initialisation.
+    if accel_kind() == AccelKind::None {
+        if let Some(cpu_lib) = find_ort_in_dir("/usr/lib/ort-cpu") {
+            info!(
+                "ORT: using CPU-only library (no GPU requested): {}",
+                cpu_lib.display()
+            );
+            return Some(cpu_lib);
         }
     }
 

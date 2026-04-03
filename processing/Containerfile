@@ -387,6 +387,14 @@ COPY --from=smoke-test-runner  /test/.smoke-ok        /tmp/.smoke-ok
 COPY --from=ort-download /usr/lib/libonnxruntime*.so* /usr/lib/
 RUN ldconfig
 
+# CPU-only ORT fallback — avoids ROCm/HSA runtime init hangs when
+# GPU providers are not needed or when the ROCm-enabled library
+# stalls during dlopen.  resolve_ort_dylib_path() prefers this
+# library when GAIA_ACCEL is unset; init_ort_environment() retries
+# with it if the primary (ROCm) library times out.
+RUN mkdir -p /usr/lib/ort-cpu
+COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so* /usr/lib/ort-cpu/
+
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory
 # if the manifest requests audio-model.onnx and it is absent.
