@@ -129,6 +129,7 @@ fn main() -> Result<()> {
         let mut models_dir: Option<String> = None;
         let mut species: Option<String> = None;
         let mut expect_models: Option<usize> = None;
+        let mut pipeline = false;
 
         let mut i = 2;
         while i < args.len() {
@@ -149,6 +150,10 @@ fn main() -> Result<()> {
                     expect_models = args.get(i + 1).and_then(|s| s.parse().ok());
                     i += 2;
                 }
+                "--pipeline" => {
+                    pipeline = true;
+                    i += 1;
+                }
                 _ => {
                     eprintln!("Unknown argument: {}", args[i]);
                     i += 1;
@@ -160,7 +165,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "Usage: gaia-processing smoke-test \
                  --audio <path.wav> --models <dir> --species \"Turdus merula\" \
-                 [--expect-models N]"
+                 [--expect-models N] [--pipeline]"
             );
             std::process::exit(2);
         });
@@ -173,7 +178,13 @@ fn main() -> Result<()> {
             std::process::exit(2);
         });
 
-        match smoke_test::run(Path::new(&audio), Path::new(&models), &species, expect_models) {
+        let result = if pipeline {
+            smoke_test::run_pipeline(Path::new(&audio), Path::new(&models), &species)
+        } else {
+            smoke_test::run(Path::new(&audio), Path::new(&models), &species, expect_models)
+        };
+
+        match result {
             Ok(()) => {
                 // Hard-exit to avoid segfault during ORT cleanup.
                 // std::process::exit() calls libc exit() which still

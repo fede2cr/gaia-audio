@@ -72,12 +72,14 @@ pub fn initialize() -> Result<()> {
     Ok(())
 }
 
-/// Get the cached connection.
-fn conn() -> std::sync::MutexGuard<'static, redis::Connection> {
-    CONN.get()
-        .expect("kv: Redis not initialized — call kv::initialize() first")
-        .lock()
-        .unwrap()
+/// Get the cached connection, if initialized.
+fn try_conn() -> Option<std::sync::MutexGuard<'static, redis::Connection>> {
+    CONN.get().map(|m| m.lock().unwrap())
+}
+
+/// Returns `true` when `initialize()` has been called successfully.
+pub fn is_initialized() -> bool {
+    CONN.get().is_some()
 }
 
 /// Reconnect if the connection was lost.
@@ -93,19 +95,39 @@ fn reconnect() {
 }
 
 /// Execute a closure with one auto-reconnect attempt on failure.
+///
+/// Returns `Err` with a `NotConnected` error when Redis has not been
+/// initialized — callers already handle `Err` gracefully, so this
+/// avoids panicking in environments without Redis (smoke tests, CI).
 fn with_retry<T, F>(f: F) -> redis::RedisResult<T>
 where
     F: Fn(&mut redis::Connection) -> redis::RedisResult<T>,
 {
     let result = {
-        let mut c = conn();
+        let mut c = match try_conn() {
+            Some(c) => c,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "Redis not initialized",
+                ).into());
+            }
+        };
         f(&mut c)
     };
     match result {
         Ok(v) => Ok(v),
         Err(_) => {
             reconnect();
-            let mut c = conn();
+            let mut c = match try_conn() {
+                Some(c) => c,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Redis not initialized",
+                    ).into());
+                }
+            };
             f(&mut c)
         }
     }
@@ -211,12 +233,16 @@ pub fn cleanup_processing_log() {
 /// Writes both an all-time total and a per-day counter (with 30-day TTL)
 /// so the web dashboard can aggregate by timeframe.
 pub fn increment_urban_noise(date: &str, _hour: u32, category: &str) -> Result<()> {
+    let mut c = match try_conn() {
+        Some(c) => c,
+        None => return Ok(()), // no Redis — skip silently
+    };
     let day_key = format!("urban_noise:day:{date}");
     redis::pipe()
         .hincr("urban_noise:total", category, 1i64)
         .hincr(&day_key, category, 1i64)
         .expire(&day_key, URBAN_NOISE_DAY_TTL_SECS)
-        .exec(&mut *conn())
+        .exec(&mut *c)
         .context("increment_urban_noise")?;
     Ok(())
 }

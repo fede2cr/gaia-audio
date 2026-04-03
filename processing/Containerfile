@@ -362,6 +362,23 @@ RUN RUST_LOG=info \
         --expect-models 3 && \
     touch /test/.smoke-ok
 
+# ── Pipeline smoke test ──────────────────────────────────────────
+# Simulates the full main-loop: spins up a mock capture HTTP
+# server, registers it on mDNS, discovers it, downloads the test
+# recording through the real HTTP client, runs the full analysis
+# pipeline, and asserts detections were produced.
+#
+# This catches integration failures (mDNS, HTTP download, analysis
+# pipeline wiring) that the unit-level smoke test cannot.
+RUN RUST_LOG=info \
+    timeout 300 \
+    gaia-processing smoke-test \
+        --audio /test/bird.wav \
+        --models /test/models \
+        --species "Ramphastos sulfuratus" \
+        --pipeline && \
+    touch /test/.pipeline-ok
+
 # ── Runtime stage ──────────────────────────────────────────────────
 # Rust binary + pre-converted ONNX models.  No Python at runtime —
 # all inference (including DFT/STFT models like BirdNET V3 and Perch)
@@ -381,6 +398,7 @@ COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-pr
 COPY --from=onnx-validator    /validate/.onnx-ok    /tmp/.onnx-ok
 COPY --from=tract-validator    /validate/.tract-ok    /tmp/.tract-ok
 COPY --from=smoke-test-runner  /test/.smoke-ok        /tmp/.smoke-ok
+COPY --from=smoke-test-runner  /test/.pipeline-ok     /tmp/.pipeline-ok
 
 # ONNX Runtime shared library for native Rust inference.
 # Extracted from the pip onnxruntime package in the ort-download stage.
