@@ -174,7 +174,14 @@ fn main() -> Result<()> {
         });
 
         match smoke_test::run(Path::new(&audio), Path::new(&models), &species, expect_models) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Hard-exit to avoid segfault during ORT cleanup.
+                // std::process::exit() calls libc exit() which still
+                // runs atexit/static-destructor handlers — ORT's C++
+                // destructors race with the dynamic library unload,
+                // causing SIGSEGV.  _exit() skips all of that.
+                unsafe { libc::_exit(0) };
+            }
             Err(e) => {
                 error!("Smoke test failed: {e:#}");
                 std::process::exit(1);

@@ -44,6 +44,7 @@ reqwest.workspace = true
 # Archive & checksum (Zenodo model download)
 zip.workspace = true
 md5.workspace = true
+libc = "0.2.184"
 
 # Inference via ONNX Runtime — used as a fallback when tract-onnx
 # cannot load a model (e.g. DFT/STFT ops in BirdNET V3), and as the
