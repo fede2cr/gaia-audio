@@ -18,20 +18,33 @@
 //! subsequent starts skip the slow compilation step.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// `true` once ORT has been successfully initialised.
+static ORT_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` when ORT init completed successfully.
+///
+/// After `init_ort_environment()` returns, callers should check
+/// this before attempting to create sessions.
+pub fn ort_is_available() -> bool {
+    ORT_AVAILABLE.load(Ordering::Acquire)
+}
+
 /// Initialise the ORT global environment exactly once.
 ///
-/// If library loading hangs (e.g. ROCm HSA init stalling), the
-/// watchdog thread will abort after `ORT_INIT_TIMEOUT` seconds
-/// (default 30) so the processing pipeline can continue with
-/// tract-only models.
+/// The actual initialisation runs in a **spawned thread** so that
+/// this function can apply a hard timeout.  If the ORT library
+/// triggers a blocking HSA / GPU runtime init that never completes,
+/// `call_once` still finishes and `ORT_AVAILABLE` stays `false`.
+/// Subsequent callers see the failure immediately instead of
+/// blocking forever on `Once::call_once`.
 fn init_ort_environment() {
     static INIT: Once = Once::new();
-    static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     INIT.call_once(|| {
         let timeout_secs: u64 = std::env::var("ORT_INIT_TIMEOUT")
@@ -39,51 +52,68 @@ fn init_ort_environment() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
 
-        // Watchdog: if ORT init hasn't completed in timeout_secs,
-        // log an error but do NOT abort — let the caller see the
-        // failure when it tries to create a session.
-        let _watchdog = std::thread::Builder::new()
-            .name("ort-init-watchdog".into())
+        // Channel lets us wait-with-timeout for the init thread.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+
+        let _init_thread = std::thread::Builder::new()
+            .name("ort-init".into())
             .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-                if !READY.load(std::sync::atomic::Ordering::Acquire) {
-                    tracing::error!(
-                        "ORT environment init has not completed after {timeout_secs}s — \
-                         possible HSA/GPU runtime hang.  Models requiring ORT will be skipped."
-                    );
-                }
+                let ok = do_ort_init();
+                let _ = tx.send(ok);
             });
 
-        if let Some(lib_path) = resolve_ort_dylib_path() {
-            info!("ORT: loading library from {} …", lib_path.display());
-            match ort::init_from(&lib_path) {
-                Ok(builder) => {
-                    info!("ORT: library loaded, committing environment …");
-                    builder.commit();
-                    if let Ok(env) = ort::environment::Environment::current() {
-                        env.set_log_level(ort::logging::LogLevel::Warning);
-                    }
-                    info!("ORT environment initialised from {}", lib_path.display());
-                    READY.store(true, std::sync::atomic::Ordering::Release);
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to init ORT from {}: {e}; falling back to default loader",
-                        lib_path.display()
-                    );
-                }
+        match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+            Ok(true) => {
+                ORT_AVAILABLE.store(true, Ordering::Release);
+            }
+            Ok(false) => {
+                tracing::error!(
+                    "ORT environment init failed — models requiring ORT will be skipped."
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    "ORT environment init has not completed after {timeout_secs}s — \
+                     possible HSA/GPU runtime hang.  Models requiring ORT will be skipped."
+                );
+                // The init thread may still be alive (hung in HSA),
+                // but call_once can now return and the rest of the
+                // pipeline continues without ORT.
             }
         }
-
-        info!("ORT: using default loader …");
-        ort::init().commit();
-        if let Ok(env) = ort::environment::Environment::current() {
-            env.set_log_level(ort::logging::LogLevel::Warning);
-        }
-        info!("ORT environment initialised");
-        READY.store(true, std::sync::atomic::Ordering::Release);
     });
+}
+
+/// Perform the actual ORT init (runs on a dedicated thread).
+fn do_ort_init() -> bool {
+    if let Some(lib_path) = resolve_ort_dylib_path() {
+        info!("ORT: loading library from {} …", lib_path.display());
+        match ort::init_from(&lib_path) {
+            Ok(builder) => {
+                info!("ORT: library loaded, committing environment …");
+                builder.commit();
+                if let Ok(env) = ort::environment::Environment::current() {
+                    env.set_log_level(ort::logging::LogLevel::Warning);
+                }
+                info!("ORT environment initialised from {}", lib_path.display());
+                return true;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to init ORT from {}: {e}; falling back to default loader",
+                    lib_path.display()
+                );
+            }
+        }
+    }
+
+    info!("ORT: using default loader …");
+    ort::init().commit();
+    if let Ok(env) = ort::environment::Environment::current() {
+        env.set_log_level(ort::logging::LogLevel::Warning);
+    }
+    info!("ORT environment initialised");
+    true
 }
 
 /// Resolve the ONNX Runtime shared library path for `ort::init_from`.
@@ -242,6 +272,10 @@ impl OrtSession {
     #[allow(dead_code)]
     pub fn new(onnx_path: &Path, cache_dir: &Path) -> Result<Self> {
         init_ort_environment();
+        anyhow::ensure!(
+            ort_is_available(),
+            "ORT environment is not available (init timed out or failed)"
+        );
         let requested_kind = accel_kind();
 
         let has_migraphx = has_provider_library("migraphx");
@@ -443,6 +477,10 @@ impl OrtSession {
 
         // Ensure ORT environment is initialized before creating sessions.
         init_ort_environment();
+        anyhow::ensure!(
+            ort_is_available(),
+            "ORT environment is not available (init timed out or failed)"
+        );
 
         let intra = ort_intra_threads(4);
         info!("  ORT CPU session: intra_threads={intra}, inter_threads=1, opt_level=Level1");
