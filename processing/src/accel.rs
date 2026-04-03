@@ -37,99 +37,184 @@ pub fn ort_is_available() -> bool {
 
 /// Initialise the ORT global environment exactly once.
 ///
-/// The actual initialisation runs in a **spawned thread** so that
-/// this function can apply a hard timeout.  If the ORT library
-/// triggers a blocking HSA / GPU runtime init that never completes,
-/// `call_once` still finishes and `ORT_AVAILABLE` stays `false`.
-/// Subsequent callers see the failure immediately instead of
-/// blocking forever on `Once::call_once`.
-///
-/// When the primary library (which may be ROCm-enabled) times out,
-/// a second attempt is made with the CPU-only library at
-/// `/usr/lib/ort-cpu/` (if present).
+/// **Why subprocess probing?**  The ROCm-enabled `libonnxruntime.so`
+/// triggers HSA runtime initialisation during `dlopen`.  If HSA
+/// hangs, it holds the **glibc dynamic-linker global lock**, which
+/// blocks every subsequent `dlopen` in the same process — including
+/// attempts to load the CPU-only library.  We therefore `fork()` a
+/// short-lived child that tests each candidate library.  Only the
+/// library that loads cleanly is then loaded in the parent process.
 fn init_ort_environment() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
+        apply_hsa_mitigations();
+
         let timeout_secs: u64 = std::env::var("ORT_INIT_TIMEOUT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
 
-        let timeout = std::time::Duration::from_secs(timeout_secs);
+        // Probe timeout: how long the fork() probe waits before
+        // declaring a library hung.  Short enough to fail fast,
+        // long enough for legitimate slow GPU enumeration.
+        let probe_secs: u64 = std::env::var("ORT_PROBE_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
 
-        // ── Attempt 1: primary library ────────────────────────────
+        // ── Build candidate list ──────────────────────────────────
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        // Primary candidate from resolve_ort_dylib_path()
+        if let Some(primary) = resolve_ort_dylib_path() {
+            candidates.push(primary);
+        }
+
+        // CPU-only fallback (always a candidate, even when GPU is
+        // requested — it's the safety net when the GPU library hangs).
+        if let Some(cpu_lib) = find_ort_in_dir("/usr/lib/ort-cpu") {
+            if !candidates.contains(&cpu_lib) {
+                candidates.push(cpu_lib);
+            }
+        }
+
+        if candidates.is_empty() {
+            tracing::error!(
+                "No ORT library found — models requiring ORT will be skipped."
+            );
+            return;
+        }
+
+        // ── Probe each candidate via fork() ───────────────────────
+        let mut good_path: Option<PathBuf> = None;
+        for candidate in &candidates {
+            info!("ORT: probing {} (timeout {probe_secs}s) …", candidate.display());
+            if probe_ort_library(candidate, probe_secs) {
+                info!("ORT: probe OK — {}", candidate.display());
+                good_path = Some(candidate.clone());
+                break;
+            } else {
+                warn!(
+                    "ORT: probe failed/timed out for {} — skipping",
+                    candidate.display()
+                );
+            }
+        }
+
+        let lib_path = match good_path {
+            Some(p) => p,
+            None => {
+                tracing::error!(
+                    "All ORT library candidates failed the dlopen probe — \
+                     models requiring ORT will be skipped.  \
+                     Candidates tested: {:?}",
+                    candidates
+                );
+                return;
+            }
+        };
+
+        // ── Load the probed library for real ──────────────────────
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let path = lib_path.clone();
 
         let _init_thread = std::thread::Builder::new()
             .name("ort-init".into())
             .spawn(move || {
-                let ok = do_ort_init();
+                let ok = do_ort_init_from(&path);
                 let _ = tx.send(ok);
             });
 
+        let timeout = std::time::Duration::from_secs(timeout_secs);
         match rx.recv_timeout(timeout) {
             Ok(true) => {
                 ORT_AVAILABLE.store(true, Ordering::Release);
-                return;
+                info!("ORT environment ready ({})", lib_path.display());
             }
             Ok(false) => {
                 tracing::error!(
-                    "ORT primary init failed — trying CPU-only fallback."
+                    "ORT init failed for {} (probe passed but init failed)",
+                    lib_path.display()
                 );
             }
             Err(_) => {
                 tracing::error!(
-                    "ORT environment init has not completed after {timeout_secs}s — \
-                     possible HSA/GPU runtime hang.  Trying CPU-only fallback."
+                    "ORT init timed out after {timeout_secs}s for {} \
+                     (probe passed but init hung — unexpected)",
+                    lib_path.display()
                 );
-                // The init thread may still be alive (hung in HSA),
-                // but we can continue — the CPU-only library has no
-                // ROCm dependencies and should load cleanly.
             }
         }
-
-        // ── Attempt 2: CPU-only fallback library ──────────────────
-        if let Some(cpu_path) = find_ort_in_dir("/usr/lib/ort-cpu") {
-            tracing::info!(
-                "ORT: retrying with CPU-only library: {}",
-                cpu_path.display()
-            );
-            let (tx2, rx2) = std::sync::mpsc::sync_channel::<bool>(1);
-            let _fallback_thread = std::thread::Builder::new()
-                .name("ort-init-cpu".into())
-                .spawn(move || {
-                    apply_hsa_mitigations();
-                    let ok = do_ort_init_from(&cpu_path);
-                    let _ = tx2.send(ok);
-                });
-
-            match rx2.recv_timeout(timeout) {
-                Ok(true) => {
-                    ORT_AVAILABLE.store(true, Ordering::Release);
-                    tracing::info!("ORT CPU-only fallback init succeeded.");
-                    return;
-                }
-                Ok(false) => {
-                    tracing::error!("ORT CPU-only fallback init also failed.");
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "ORT CPU-only fallback init also timed out after {timeout_secs}s."
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                "No CPU-only ORT library found at /usr/lib/ort-cpu/; \
-                 cannot fall back.  Models requiring ORT will be skipped."
-            );
-        }
-
-        tracing::error!(
-            "All ORT init attempts failed — models requiring ORT will be skipped."
-        );
     });
+}
+
+/// Test whether a shared library can be `dlopen`'d without hanging.
+///
+/// Forks a child process that calls `dlopen` on the given path.
+/// If the child exits successfully within `timeout_secs`, the library
+/// loads cleanly.  If the child hangs (e.g. HSA global constructor
+/// stall), it is killed after the timeout.
+///
+/// Using `fork()` isolates the test completely: a hung `dlopen` in
+/// the child does not affect the parent's dynamic-linker state.
+fn probe_ort_library(path: &Path, timeout_secs: u64) -> bool {
+    let c_path = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    unsafe {
+        let pid = libc::fork();
+
+        if pid < 0 {
+            warn!("fork() failed — cannot probe ORT library");
+            return false;
+        }
+
+        if pid == 0 {
+            // ── Child process ─────────────────────────────────────
+            // Only call async-signal-safe / C functions here.
+            // No Rust allocator, no stdlib, no logging.
+            let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if handle.is_null() {
+                libc::_exit(1);
+            }
+            libc::dlclose(handle);
+            libc::_exit(0);
+        }
+
+        // ── Parent process ────────────────────────────────────────
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            let mut status: i32 = 0;
+            let ret = libc::waitpid(pid, &mut status, libc::WNOHANG);
+
+            if ret == pid {
+                // Child exited.
+                return libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+            }
+            if ret < 0 {
+                // waitpid error — assume failure.
+                return false;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                // Timeout — library is hanging.  Kill the child.
+                info!(
+                    "ORT probe: child {} still running after {timeout_secs}s — killing",
+                    pid
+                );
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0); // reap
+                return false;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 /// Apply HSA / ROCm environment mitigations before loading ORT.
@@ -177,26 +262,6 @@ fn do_ort_init_from(lib_path: &Path) -> bool {
             false
         }
     }
-}
-
-/// Perform the actual ORT init (runs on a dedicated thread).
-fn do_ort_init() -> bool {
-    apply_hsa_mitigations();
-
-    if let Some(lib_path) = resolve_ort_dylib_path() {
-        if do_ort_init_from(&lib_path) {
-            return true;
-        }
-        warn!("ORT: explicit library failed; falling back to default loader");
-    }
-
-    info!("ORT: using default loader …");
-    ort::init().commit();
-    if let Ok(env) = ort::environment::Environment::current() {
-        env.set_log_level(ort::logging::LogLevel::Warning);
-    }
-    info!("ORT environment initialised");
-    true
 }
 
 /// Resolve the ONNX Runtime shared library path for `ort::init_from`.
