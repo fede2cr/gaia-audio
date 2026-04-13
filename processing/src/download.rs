@@ -16,7 +16,7 @@ const ZENODO_FILES_URL: &str = "https://zenodo.org/api/records";
 
 /// Directory where pre-converted ONNX models are baked into the container
 /// image at build time (see `processing/Containerfile`, converter stage).
-const BAKED_MODELS_DIR: &str = "/usr/local/share/gaia/models";
+pub const BAKED_MODELS_DIR: &str = "/usr/local/share/gaia/models";
 
 /// Name of the marker file used to implement exponential backoff across
 /// container restarts.  The file contains the next retry timestamp.
@@ -43,14 +43,19 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
         None => return Ok(()),
     };
 
-    let variant_info = &download.variants[variant];
-
-    // Check if the primary model file already exists
+    // Check if a usable model file already exists (ONNX or TFLite).
+    // For ONNX-only models (e.g. Perch), the TFLite file won't exist
+    // but that's fine — the ONNX file is sufficient.
     let tflite_path = manifest.tflite_path();
-    if tflite_path.exists() {
+    let onnx_ready = manifest.onnx_path().map_or(false, |p| p.exists());
+    if tflite_path.exists() || onnx_ready {
         info!(
             "Model file already present: {} (variant={})",
-            tflite_path.display(),
+            if onnx_ready {
+                manifest.onnx_path().unwrap().display().to_string()
+            } else {
+                tflite_path.display().to_string()
+            },
             variant
         );
         // Clear any leftover backoff marker on success
@@ -58,19 +63,32 @@ pub fn ensure_model_files(manifest: &mut ResolvedManifest, variant: &str) -> Res
         return Ok(());
     }
 
+    // Models with only direct_files (no Zenodo variants) have already
+    // been handled by `ensure_direct_files()`.  Nothing more to do.
+    let variant_info = match download.variants.get(variant) {
+        Some(vi) => vi,
+        None => return Ok(()),
+    };
+
     // ── honour backoff from a previous failed attempt ────────────────
     wait_for_backoff(&manifest.base_dir);
+
+    // Zenodo download requires a record ID
+    let record_id = match &download.zenodo_record_id {
+        Some(id) => id.as_str(),
+        None => return Ok(()),
+    };
 
     info!(
         "Model file not found at {}, downloading variant '{}' from Zenodo record {}…",
         tflite_path.display(),
         variant,
-        download.zenodo_record_id
+        record_id
     );
 
     let url = format!(
         "{}/{}/files/{}/content",
-        ZENODO_FILES_URL, download.zenodo_record_id, variant_info.zenodo_file
+        ZENODO_FILES_URL, record_id, variant_info.zenodo_file
     );
 
     if let Err(e) = download_and_extract(&url, &manifest.base_dir, variant_info.md5.as_deref()) {
@@ -143,27 +161,68 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         None => return Ok(()), // no onnx_file configured
     };
 
-    if onnx_path.exists() {
-        info!("ONNX model already present: {}", onnx_path.display());
-        return Ok(());
-    }
-
     // ── 1. Baked-in model from container image ───────────────────────
+    // Always prefer the baked version: it may contain build-time
+    // patches (e.g. Resize node fixes for tract-onnx) that a
+    // previously-downloaded copy on the volume does not have.
     if let Some(filename) = onnx_path.file_name() {
         let baked = Path::new(BAKED_MODELS_DIR).join(filename);
         if baked.exists() {
-            info!(
-                "Copying baked-in ONNX model: {} → {}",
-                baked.display(),
-                onnx_path.display()
-            );
-            std::fs::copy(&baked, &onnx_path).with_context(|| {
-                format!(
-                    "Failed to copy baked ONNX model {} → {}",
+            // Always overwrite: the baked model contains build-time patches
+            // (e.g. DFT onesided fix, Resize node rewrite) that a previously
+            // downloaded or copied file on the volume may lack.  A simple
+            // size comparison is insufficient because patched and unpatched
+            // models can have the same byte length.
+            let needs_copy = if onnx_path.exists() {
+                let baked_len = std::fs::metadata(&baked).map(|m| m.len()).unwrap_or(0);
+                let local_len = std::fs::metadata(&onnx_path).map(|m| m.len()).unwrap_or(0);
+                if baked_len != local_len {
+                    info!(
+                        "Baked ONNX model size ({baked_len}) differs from local \
+                         copy ({local_len}) — replacing with baked version"
+                    );
+                }
+                true
+            } else {
+                true
+            };
+
+            if needs_copy {
+                info!(
+                    "Copying baked-in ONNX model: {} → {}",
                     baked.display(),
                     onnx_path.display()
-                )
-            })?;
+                );
+                std::fs::copy(&baked, &onnx_path).with_context(|| {
+                    format!(
+                        "Failed to copy baked ONNX model {} → {}",
+                        baked.display(),
+                        onnx_path.display()
+                    )
+                })?;
+
+                // Also copy the external-data sidecar (.onnx.data) if present.
+                // Large ONNX models (e.g. BatDetect2 exported with
+                // `use_external_data_format=True`) split weights into a
+                // separate <model>.onnx.data file that ORT reads at load time.
+                let baked_data = baked.with_extension("onnx.data");
+                if baked_data.exists() {
+                    let dest_data = onnx_path.with_extension("onnx.data");
+                    info!(
+                        "Copying baked-in ONNX external data: {} → {}",
+                        baked_data.display(),
+                        dest_data.display()
+                    );
+                    std::fs::copy(&baked_data, &dest_data).with_context(|| {
+                        format!(
+                            "Failed to copy baked ONNX data sidecar {} → {}",
+                            baked_data.display(),
+                            dest_data.display()
+                        )
+                    })?;
+                }
+            }
+
             let size = std::fs::metadata(&onnx_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -176,12 +235,17 @@ pub fn ensure_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
         }
     }
 
+    if onnx_path.exists() {
+        info!("ONNX model already present: {}", onnx_path.display());
+        return Ok(());
+    }
+
     // ── 2. Keras-based conversion (preferred on hosts with Python) ───
     if let Some(download) = &manifest.manifest.download {
-        if let Some(keras_file) = &download.keras_zenodo_file {
+        if let (Some(record_id), Some(keras_file)) = (&download.zenodo_record_id, &download.keras_zenodo_file) {
             return convert_keras_to_onnx(
                 manifest,
-                &download.zenodo_record_id,
+                record_id,
                 keras_file,
                 download.keras_md5.as_deref(),
                 &onnx_path,
@@ -239,10 +303,10 @@ pub fn ensure_meta_onnx_file(manifest: &ResolvedManifest) -> Result<()> {
 
     // ── 2. Convert via Python if Keras zip is available ──────────────
     if let Some(download) = &manifest.manifest.download {
-        if let Some(keras_file) = &download.keras_zenodo_file {
+        if let (Some(record_id), Some(keras_file)) = (&download.zenodo_record_id, &download.keras_zenodo_file) {
             return convert_meta_keras_to_onnx(
                 manifest,
-                &download.zenodo_record_id,
+                record_id,
                 keras_file,
                 download.keras_md5.as_deref(),
                 &onnx_path,
@@ -887,6 +951,79 @@ fn extract_zip(bytes: &[u8], dest_dir: &Path) -> Result<()> {
     }
 
     info!("Extracted {} file(s) into {}", extracted, dest_dir.display());
+    Ok(())
+}
+
+// ── direct file downloads ─────────────────────────────────────────────────
+
+/// Download individual files listed in `[download.direct_files]`.
+///
+/// This handles models hosted on HuggingFace or other direct-download
+/// sources where the artefacts are individual files rather than a Zenodo
+/// zip archive.  Each entry maps a local filename to a remote URL.
+///
+/// Already-present files are skipped.  This function is idempotent and
+/// safe to call unconditionally.
+pub fn ensure_direct_files(manifest: &ResolvedManifest) -> Result<()> {
+    let direct_files = match &manifest.manifest.download {
+        Some(d) if !d.direct_files.is_empty() => &d.direct_files,
+        _ => return Ok(()),
+    };
+
+    std::fs::create_dir_all(&manifest.base_dir)
+        .with_context(|| format!("Cannot create model directory: {}", manifest.base_dir.display()))?;
+
+    for (filename, url) in direct_files {
+        let target = manifest.base_dir.join(filename);
+        if target.exists() {
+            info!("Direct file already present: {}", target.display());
+            continue;
+        }
+
+        // Honour backoff from a previous failed attempt
+        wait_for_backoff(&manifest.base_dir);
+
+        info!("Downloading {} → {}", url, target.display());
+        if let Err(e) = download_single_file(url, &target) {
+            write_backoff_marker(&manifest.base_dir);
+            return Err(e).with_context(|| {
+                format!("Failed to download {} from {}", filename, url)
+            });
+        }
+    }
+
+    clear_backoff_marker(&manifest.base_dir);
+    Ok(())
+}
+
+/// Download a single file from `url` to `dest` with resume support.
+///
+/// Uses the same retry / exponential-backoff logic as Zenodo downloads.
+fn download_single_file(url: &str, dest: &Path) -> Result<()> {
+    let part_path = dest.with_extension(
+        dest.extension()
+            .map(|e| format!("{}.part", e.to_string_lossy()))
+            .unwrap_or_else(|| "part".to_string()),
+    );
+
+    let client = build_client()?;
+    download_with_resume(&client, url, &part_path)?;
+
+    // Move completed download to final path
+    std::fs::rename(&part_path, dest).with_context(|| {
+        format!(
+            "Cannot move downloaded file {} → {}",
+            part_path.display(),
+            dest.display()
+        )
+    })?;
+
+    let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    info!(
+        "Download complete: {} ({:.1} MB)",
+        dest.display(),
+        size as f64 / 1_048_576.0
+    );
     Ok(())
 }
 

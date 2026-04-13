@@ -1,4 +1,4 @@
-//! Audio capture – spawns `arecord` or `ffmpeg` as child processes.
+//! Audio capture – spawns `ffmpeg` as child processes.
 //!
 //! Reused from `birdnet-server/src/capture.rs`.
 
@@ -119,161 +119,85 @@ fn start_rtsp(config: &Config) -> Result<CaptureHandle> {
     Ok(CaptureHandle { children })
 }
 
-// ── ALSA card-name resolution ────────────────────────────────────────────
-
-/// If `device` contains `CARD=<name>` (e.g. `plughw:CARD=iCE,DEV=0`),
-/// resolve the symbolic name to a numeric card index so that
-/// `plughw:CARD=iCE,DEV=0` becomes `plughw:4,0`.
-///
-/// Inside containers ALSA cannot read `/proc/asound` for name→number
-/// mapping, so we do it ourselves.  We check two locations:
-///   1. `/proc/asound/cards` – works on bare metal / Docker
-///   2. `/run/asound/cards`  – explicit bind-mount for Podman
-fn resolve_card_name(device: &str) -> String {
-    // Extract card name from patterns like  CARD=iCE  or  CARD=Light
-    let card_pos = match device.find("CARD=") {
-        Some(p) => p,
-        None => return device.to_string(), // nothing to resolve
-    };
-    let rest = &device[card_pos + 5..];
-    let card_name = match rest.find(',') {
-        Some(comma) => &rest[..comma],
-        None => rest,
-    };
-
-    debug!("Resolving ALSA card name '{card_name}' to numeric index");
-
-    // Try both locations for the card list
-    let content = ["/proc/asound/cards", "/run/asound/cards"]
-        .iter()
-        .find_map(|path| {
-            let c = std::fs::read_to_string(path).ok();
-            if c.is_some() {
-                debug!("Read card list from {path}");
-            }
-            c
-        });
-
-    let content = match content {
-        Some(c) => c,
-        None => {
-            warn!(
-                "Cannot read /proc/asound/cards or /run/asound/cards — \
-                 card name '{card_name}' will be passed as-is to ALSA"
-            );
-            return device.to_string();
-        }
-    };
-
-    // Lines look like:  " 4 [iCE            ]: USB-Audio - Blue Snowball iCE"
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let bracket_start = match trimmed.find('[') {
-            Some(p) => p,
-            None => continue,
-        };
-        let bracket_end = match trimmed.find(']') {
-            Some(p) => p,
-            None => continue,
-        };
-        let name_in_brackets = trimmed[bracket_start + 1..bracket_end].trim();
-        if name_in_brackets == card_name {
-            let num_str = trimmed[..bracket_start].trim();
-            if let Ok(card_num) = num_str.parse::<u32>() {
-                let resolved = device
-                    .replace(&format!("CARD={card_name}"), &card_num.to_string());
-                info!(
-                    "Resolved ALSA card name: {device} → {resolved} (card {card_num})"
-                );
-                return resolved;
-            }
-        }
-    }
-
-    warn!(
-        "Card name '{card_name}' not found in /proc/asound/cards — \
-         passing device string as-is to ALSA"
-    );
-    device.to_string()
-}
-
-// ── Local microphone via arecord ─────────────────────────────────────────
+// ── Local microphone via ffmpeg (ALSA input) ────────────────────────────
 
 fn start_microphone(config: &Config) -> Result<CaptureHandle> {
     let output_pattern = config
         .stream_data_dir()
         .join("%F-birdnet-%H:%M:%S.wav");
 
-    // Resolve symbolic ALSA card name → numeric index for container compat
-    let resolved_card = config.rec_card.as_deref().map(resolve_card_name);
+    // Symbolic ALSA card name (e.g. "hw:CARD=iCE,DEV=0") resolved via
+    // /proc/asound which is bind-mounted into the container.
+    let card = config.rec_card.as_deref().unwrap_or("default");
 
-    let mut cmd = Command::new("arecord");
+    let channels = config.channels.to_string();
+    let seg_time = config.recording_length.to_string();
+
+    let mut cmd = Command::new("ffmpeg");
     cmd.args([
-        "-f",
-        "S16_LE",
-        &format!("-c{}", config.channels),
-        "-r48000",
-        "-t",
-        "wav",
-        "--max-file-time",
-        &config.recording_length.to_string(),
-        "--use-strftime",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        // ALSA input — use `-channels` (ALSA demuxer option), not `-ac`
+        "-f", "alsa",
+        "-channels", &channels,
+        "-sample_rate", "48000",
+        "-i", card,
+        // Output codec
+        "-acodec", "pcm_s16le",
+        // Segment muxer – identical to the RTSP path
+        "-f", "segment",
+        "-segment_format", "wav",
+        "-segment_time", &seg_time,
+        "-strftime", "1",
     ]);
-
-    if let Some(card) = &resolved_card {
-        cmd.args(["-D", card.as_str()]);
-    }
-
     cmd.arg(output_pattern.to_str().unwrap());
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
     info!(
-        "Spawning: arecord -f S16_LE -c{} -r48000 -t wav --max-file-time {} --use-strftime {} → {}",
-        config.channels,
-        config.recording_length,
-        resolved_card.as_deref().unwrap_or("(default)"),
-        output_pattern.display(),
+        "Spawning: ffmpeg -f alsa -ac {} -ar 48000 -i {} … -segment_time {} → {}",
+        config.channels, card, config.recording_length, output_pattern.display(),
     );
 
-    let mut child = cmd.spawn().context("Failed to spawn arecord")?;
+    let mut child = cmd.spawn().context("Failed to spawn ffmpeg for local mic")?;
 
-    // Drain stderr in a background thread so we see any ALSA errors
-    // and the pipe buffer doesn't fill up and block arecord.
+    // Drain stderr in a background thread so we see any errors
+    // and the pipe buffer doesn't fill up and block ffmpeg.
     if let Some(stderr) = child.stderr.take() {
         std::thread::Builder::new()
-            .name("arecord-stderr".into())
+            .name("ffmpeg-mic-stderr".into())
             .spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     match line {
                         Ok(l) if l.is_empty() => {}
-                        Ok(l) => warn!("[arecord] {l}"),
+                        Ok(l) => warn!("[ffmpeg-mic] {l}"),
                         Err(_) => break,
                     }
                 }
-                debug!("arecord stderr stream ended");
+                debug!("ffmpeg-mic stderr stream ended");
             })
             .ok();
     }
 
-    // Give arecord a moment to fail on bad config before declaring success.
+    // Give ffmpeg a moment to fail on bad config before declaring success.
     std::thread::sleep(std::time::Duration::from_millis(500));
     match child.try_wait() {
         Ok(Some(status)) => {
             anyhow::bail!(
-                "arecord exited immediately with {status} — check REC_CARD in gaia.conf \
-                 (run 'arecord -l' on the host to list capture devices)"
+                "ffmpeg exited immediately with {status} — check REC_CARD in gaia.conf \
+                 (run 'arecord -l' on the host to list ALSA capture devices)"
             );
         }
         Ok(None) => {} // still running – good
-        Err(e) => warn!("Cannot check arecord status: {e}"),
+        Err(e) => warn!("Cannot check ffmpeg status: {e}"),
     }
 
     info!(
-        "arecord started (pid={}, channels={}, card={:?})",
+        "ffmpeg mic capture started (pid={}, channels={}, card={:?})",
         child.id(),
         config.channels,
-        resolved_card
+        card
     );
 
     Ok(CaptureHandle {

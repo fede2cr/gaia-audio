@@ -1,32 +1,89 @@
 //! Gaia Processing Server – loads models, polls the capture server,
-//! runs TFLite inference, writes detections to SQLite.
+//! runs inference, writes detections to Parquet, coordinates via Redis.
 
+mod accel;
+mod agreement;
 mod analysis;
 mod client;
-mod db;
+mod compress;
 mod download;
+mod kv;
+mod live_status;
 mod manifest;
 mod mel;
+mod migrate_parquet;
 mod model;
+mod parquet_store;
 mod reporting;
+mod species_range;
 mod spectrogram;
+mod taxonomy;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{error, info};
 
 use gaia_common::detection::{Detection, ParsedFileName};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn exit_after_one_batch_enabled() -> bool {
+    std::env::var("GAIA_EXIT_AFTER_ONE_BATCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn shutdown_grace_secs() -> Option<u64> {
+    if let Ok(raw) = std::env::var("GAIA_SHUTDOWN_GRACE_SECS") {
+        if let Ok(secs) = raw.parse::<u64>() {
+            if secs > 0 {
+                return Some(secs);
+            }
+        }
+    }
+
+    if exit_after_one_batch_enabled() {
+        Some(15)
+    } else {
+        None
+    }
+}
+
+fn start_forced_shutdown_watchdog() {
+    if let Some(grace_secs) = shutdown_grace_secs() {
+        std::thread::spawn(move || {
+            while !SHUTDOWN.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(grace_secs));
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                error!(
+                    "Forced shutdown after {}s grace period while waiting for worker threads",
+                    grace_secs
+                );
+                std::process::exit(124);
+            }
+        });
+    }
+}
 
 /// Payload sent from the analysis thread to the reporting thread.
 pub struct ReportPayload {
     pub file: ParsedFileName,
     pub detections: Vec<Detection>,
     pub source_node: String,
+}
+
+/// A downloaded file ready for analysis by a worker thread.
+pub struct WorkItem {
+    pub local_path: PathBuf,
+    pub filename: String,
+    pub base_url: String,
+    pub config_snapshot: gaia_common::config::Config,
 }
 
 fn main() -> Result<()> {
@@ -37,26 +94,193 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // ── validate-model subcommand (build-time dry-run) ───────────────
+    // Usage: gaia-processing validate-model <path.onnx> [<path2.onnx> …]
+    //
+    // Loads each model with tract-onnx (load → optimise → runnable),
+    // identical to the runtime code path.  Exits 0 on success, 1 on
+    // failure.  This is invoked during `docker build` to catch
+    // tract-incompatible ONNX files before the container is published.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("validate-model") {
+        let paths = &args[2..];
+        if paths.is_empty() {
+            eprintln!("Usage: gaia-processing validate-model <model.onnx> [<model2.onnx> …]");
+            std::process::exit(2);
+        }
+        let mut failed = false;
+        for path in paths {
+            let p = std::path::Path::new(path);
+            info!("Validating with tract-onnx: {}", p.display());
+            match model::validate_onnx_with_tract(p) {
+                Ok(()) => info!("  PASS ✓  {}", p.display()),
+                Err(e) => {
+                    tracing::error!("  FAIL ✗  {}: {e:#}", p.display());
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // ── validate-manifests subcommand (build-time manifest check) ────
+    // Usage: gaia-processing validate-manifests <models-dir>
+    //
+    // Parses every manifest.toml under models-dir with strict TOML
+    // validation (duplicate keys, missing required fields, wrong types).
+    // Exits 0 when all manifests are valid, 1 on any failure.
+    //
+    // Invoked during `docker build` before the post-build container
+    // e2e check so malformed manifests are caught early instead of
+    // silently skipping models.
+    if args.get(1).map(|s| s.as_str()) == Some("validate-manifests") {
+        let dir = args.get(2).unwrap_or_else(|| {
+            eprintln!("Usage: gaia-processing validate-manifests <models-dir>");
+            std::process::exit(2);
+        });
+        info!("Validating manifests in {dir}");
+        match manifest::validate_all_manifests(Path::new(dir)) {
+            Ok(paths) => {
+                info!("✅ All {} manifest(s) valid", paths.len());
+                return Ok(());
+            }
+            Err(e) => {
+                error!("❌ Manifest validation failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // ── review-taxonomy subcommand (startup normalization check) ─────
+    // Usage: gaia-processing review-taxonomy <table.toml> [merged.toml]
+    //
+    // Validates scientific-name equivalences and class aliases, then
+    // writes a merged canonical table used by runtime normalization.
+    if args.get(1).map(|s| s.as_str()) == Some("review-taxonomy") {
+        let table = args.get(2).unwrap_or_else(|| {
+            eprintln!(
+                "Usage: gaia-processing review-taxonomy <taxonomy_table.toml> [merged_output.toml]"
+            );
+            std::process::exit(2);
+        });
+        let merged = args.get(3).map(std::path::PathBuf::from);
+        let merged_ref = merged.as_deref();
+        match taxonomy::review_and_merge(Path::new(table), merged_ref) {
+            Ok(report) => {
+                info!(
+                    "taxonomy review OK: species={}, aliases={}, class_aliases={}, class_overrides={}, table={}",
+                    report.species_count,
+                    report.alias_count,
+                    report.class_alias_count,
+                    report.class_override_count,
+                    report.table_path.display(),
+                );
+                if let Some(out) = report.merged_path {
+                    info!("taxonomy merged table written: {}", out.display());
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                error!("taxonomy review failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if std::env::var("RUST_LOG").map_or(false, |v| v.contains("debug")) {
+        info!("🔍 Debug logging ENABLED (RUST_LOG={})", std::env::var("RUST_LOG").unwrap_or_default());
+    }
+
     // ── load config ──────────────────────────────────────────────────
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| gaia_common::config::Config::default_path().to_string());
-    let config =
+    let mut config =
         gaia_common::config::load(&PathBuf::from(&config_path)).context("Config load failed")?;
 
     info!(
-        "Gaia Processing Server starting (capture_url={})",
+        "Processing server starting (capture_url={})",
         config.capture_server_url
     );
 
-    // ── initialize database ──────────────────────────────────────────
-    db::initialize(&config.db_path)?;
+    // ── GPU acceleration check ───────────────────────────────────────
+    let accel_var = std::env::var("GAIA_ACCEL").unwrap_or_default();
+    match accel::accel_kind() {
+        accel::AccelKind::Rocm => {
+            info!(
+                "Acceleration env: GAIA_ACCEL={:?} ROCM_VISIBLE_DEVICES={:?}",
+                accel_var,
+                std::env::var("ROCM_VISIBLE_DEVICES").unwrap_or_default()
+            );
+            info!("ROCm acceleration requested — ORT will try MIGraphX → ROCm → CPU");
+        }
+        accel::AccelKind::Cuda => {
+            info!(
+                "Acceleration env: GAIA_ACCEL={:?} CUDA_VISIBLE_DEVICES={:?}",
+                accel_var,
+                std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default()
+            );
+            info!("CUDA acceleration requested — ORT will try TensorRT → CUDA → CPU");
+        }
+        accel::AccelKind::None => {
+            info!(
+                "GPU acceleration not requested (GAIA_ACCEL={:?}) — using CPU inference (tract-onnx)",
+                accel_var
+            );
+        }
+    }
+
+    // ── initialize Valkey / Redis coordination layer ──────────────────
+    kv::initialize()?;
+
+    // ── initialize Parquet detection store ────────────────────────────
+    {
+        let det_dir = config.db_path.parent().unwrap_or(Path::new("/data")).join("detections");
+        // Run the one-time Sci_Name normalisation migration before
+        // initialising the store, so the store sees clean data.
+        if let Err(e) = migrate_parquet::run_if_needed(&det_dir) {
+            tracing::warn!("Parquet migration failed (non-fatal): {e:#}");
+        }
+        parquet_store::initialize(&det_dir, "default")?;
+    };
+
+    // Register this processing instance for coordination.
+    {
+        kv::register_instance("default")?;
+        info!("Registered processing instance: \"default\"");
+    }
 
     // ── discover and load models ─────────────────────────────────────
     let mut manifests = manifest::discover_manifests(&config.model_dir)?;
+    if !config.model_slugs.is_empty() {
+        let requested = config.model_slugs.clone();
+        manifests = manifest::filter_manifests_by_slugs(manifests, &requested);
+        info!(
+            "MODEL_SLUGS filter active: {:?} → {} model(s)",
+            requested,
+            manifests.len()
+        );
+    }
+
+    if manifests.is_empty() {
+        tracing::error!(
+            "No model manifests matched the configured MODEL_SLUGS={:?} in {}",
+            config.model_slugs,
+            config.model_dir.display(),
+        );
+        std::process::exit(1);
+    }
 
     // ── auto-download models from Zenodo if needed ───────────────────
     for m in &mut manifests {
+        // Download individual files (e.g. ONNX from HuggingFace)
+        if let Err(e) = download::ensure_direct_files(m) {
+            tracing::warn!("Direct file download failed for {}: {e:#}", m.manifest.model.name);
+        }
+        // Download variant-based files from Zenodo
         if let Some(variant) = m.effective_variant(config.model_variant.as_deref()) {
             download::ensure_model_files(m, &variant)?;
         }
@@ -103,11 +327,47 @@ fn main() -> Result<()> {
     }
 
     if models.is_empty() {
-        tracing::warn!(
-            "No models loaded. The processing server will run but cannot \
-             analyse audio until model files (tflite) are present."
+        tracing::error!(
+            "No models loaded — the processing server cannot analyse audio \
+             without at least one working model. Exiting.\n\
+             Check that model files (tflite/onnx) are present in {model_dir} \
+             and compatible with the current runtime.",
+            model_dir = config.model_dir.display(),
+        );
+        std::process::exit(1);
+    } else {
+        let names: Vec<&str> = models.iter().map(|m| m.manifest.manifest.model.name.as_str()).collect();
+        info!(
+            "{} model(s) loaded: [{}]",
+            models.len(),
+            names.join(", "),
         );
     }
+
+    // ── backfill per-species taxonomic class ─────────────────────────
+    // Models whose labels CSV contains a `class` column (e.g. BirdNET+
+    // V3.0) now set Domain per-species.  The old SQLite migration is
+    // skipped because detections are stored in Parquet files and the
+    // Domain column is written correctly by the parquet_store.
+    // (Legacy `db::migrate_domain_classes` is no longer called.)
+
+    let num_workers = config.processing_threads;
+    info!(
+        "Workers: {} (set PROCESSING_THREADS to change)",
+        num_workers
+    );
+
+    // ── ctrl-c ───────────────────────────────────────────────────────
+    let force_exit_on_sigint = exit_after_one_batch_enabled();
+    ctrlc::set_handler(move || {
+        SHUTDOWN.store(true, Ordering::Relaxed);
+        info!("Shutdown signal received");
+        if force_exit_on_sigint {
+            std::process::exit(130);
+        }
+    })
+    .context("Cannot set Ctrl-C handler")?;
+    start_forced_shutdown_watchdog();
 
     // ── mDNS registration + capture discovery ──────────────────────
     // With network_mode: host, mDNS multicast reaches the physical
@@ -123,12 +383,13 @@ fn main() -> Result<()> {
         );
         None
     } else {
+        info!("mDNS: starting processing discovery handle");
         match gaia_common::discovery::register(
             gaia_common::discovery::ServiceRole::Processing,
             0, // processing doesn't expose an HTTP port
         ) {
             Ok(h) => {
-                info!("mDNS: registered as {}", h.instance_name());
+                info!("mDNS: processing discovery ready as {}", h.instance_name());
                 Some(h)
             }
             Err(e) => {
@@ -138,12 +399,23 @@ fn main() -> Result<()> {
         }
     };
 
-    // ── ctrl-c ───────────────────────────────────────────────────────
-    ctrlc::set_handler(move || {
-        SHUTDOWN.store(true, Ordering::Relaxed);
-        info!("Shutdown signal received");
-    })
-    .context("Cannot set Ctrl-C handler")?;
+    // ── compression thread (fallback sweep every 30 min) ──────────
+    // Clips are now converted to Opus inline during extraction, but
+    // the background sweep catches any files that were missed (e.g.
+    // ffmpeg was temporarily unavailable, or legacy WAV files).
+    let compress_extracted = config.extracted_dir.clone();
+    let compress_db = config.db_path.clone();
+    let compress_thread = std::thread::Builder::new()
+        .name("compression".into())
+        .spawn(move || {
+            compress::compress_loop(
+                compress_extracted,
+                compress_db,
+                std::time::Duration::from_secs(30 * 60), // every 30 min
+                &SHUTDOWN,
+            );
+        })
+        .context("Cannot spawn compression thread")?;
 
     // ── reporting thread ─────────────────────────────────────────────
     let (report_tx, report_rx) = mpsc::sync_channel::<ReportPayload>(16);
@@ -156,26 +428,159 @@ fn main() -> Result<()> {
         })
         .context("Cannot spawn reporting thread")?;
 
-    // ── poll capture server(s) and process files ─────────────────────
-    if let Err(e) = client::poll_and_process(
-        &models,
-        &config,
+    // ── work channel: poll thread → worker threads ───────────────────
+    let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(num_workers * 2);
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+
+    // ── spawn worker threads ─────────────────────────────────────────
+    // Worker 0 takes the already-loaded models; workers 1..N each load
+    // their own copy from the same manifests.
+    let mut worker_handles = Vec::with_capacity(num_workers);
+
+    for worker_id in 0..num_workers {
+        let report_tx = report_tx.clone();
+        let work_rx = work_rx.clone();
+
+        let mut worker_models = if worker_id == 0 {
+            // First worker reuses the models already loaded above.
+            std::mem::take(&mut models)
+        } else {
+            // Additional workers load their own model copies.
+            let mut m = Vec::with_capacity(manifests.len());
+            for manifest in &manifests {
+                let load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    model::load_model(manifest, &config)
+                }));
+                match load_result {
+                    Ok(Ok(loaded)) => m.push(loaded),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Worker {worker_id}: cannot load model {}: {e:#}",
+                            manifest.manifest.model.name
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Worker {worker_id}: model {} panicked during loading",
+                            manifest.manifest.model.name
+                        );
+                    }
+                }
+            }
+            m
+        };
+
+        let handle = std::thread::Builder::new()
+            .name(format!("worker-{worker_id}"))
+            .spawn(move || {
+                info!("Worker {worker_id} ready ({} model(s))", worker_models.len());
+
+                // Build a per-worker HTTP client for deletion requests.
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .expect("Cannot create HTTP client");
+
+                loop {
+                    // Receive work items from the shared channel.
+                    let item = {
+                        let rx = work_rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    let item = match item {
+                        Ok(item) => item,
+                        Err(_) => break, // channel closed → shutdown
+                    };
+
+                    tracing::debug!("W{worker_id} analysing {}", item.filename);
+
+                    // ── run analysis ──────────────────────────────────
+                    if let Err(e) = analysis::process_file(
+                        &item.local_path,
+                        &mut worker_models,
+                        &item.config_snapshot,
+                        &report_tx,
+                        &item.base_url,
+                    ) {
+                        tracing::error!(
+                            "W{worker_id} error processing {}: {e:#}",
+                            item.filename
+                        );
+                    }
+
+                    // ── delete recording from capture server ─────────
+                    // Single processing container: delete immediately
+                    // after analysis (no multi-instance coordination).
+                    let url = format!(
+                        "{}/api/recordings/{}",
+                        item.base_url, item.filename
+                    );
+                    match client.delete(&url).send() {
+                        Ok(resp) if resp.status().is_success()
+                            || resp.status() == reqwest::StatusCode::NOT_FOUND =>
+                        {
+                            info!(
+                                "W{worker_id} deleted {}",
+                                item.filename
+                            );
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "W{worker_id} DELETE {} returned {}",
+                                item.filename,
+                                resp.status()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "W{worker_id} failed to delete {}: {e}",
+                                item.filename
+                            );
+                        }
+                    }
+                }
+
+                info!("Worker {worker_id} stopped");
+            })
+            .with_context(|| format!("Cannot spawn worker-{worker_id}"))?;
+
+        worker_handles.push(handle);
+    }
+
+    // ── poll capture server(s) and dispatch to workers ───────────────
+    if let Err(e) = client::poll_and_dispatch(
+        &mut config,
         discovery.as_ref(),
-        &report_tx,
+        &work_tx,
         &SHUTDOWN,
     ) {
         tracing::error!("Processing loop error: {e:#}");
     }
 
+    // Signal workers to finish, then wait.
+    drop(work_tx);
+    for h in worker_handles {
+        h.join().ok();
+    }
+
     // Signal reporting thread to finish
     drop(report_tx);
     report_thread.join().ok();
+    compress_thread.join().ok();
 
     // Clean up mDNS
     if let Some(dh) = discovery {
         dh.shutdown();
     }
 
-    info!("Gaia Processing Server stopped");
+    info!("Processing server stopped");
+
+    if exit_after_one_batch_enabled() {
+        info!(
+            "One-shot e2e mode complete — exiting immediately after successful shutdown"
+        );
+        std::process::exit(0);
+    }
+
     Ok(())
 }

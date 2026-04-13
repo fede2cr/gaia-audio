@@ -1,7 +1,7 @@
 //! Top navigation bar component.
 
-use leptos::*;
-use leptos_router::*;
+use leptos::prelude::*;
+use leptos::prelude::{ElementChild, IntoView};
 
 /// Site-wide navigation bar.
 #[component]
@@ -9,13 +9,16 @@ pub fn Nav() -> impl IntoView {
     view! {
         <nav class="nav-bar">
             <div class="nav-brand">
-                <A href="/" class="nav-logo">"🌍 Gaia Audio"</A>
+                <a href="/" class="nav-logo">"🌍 Gaia Audio"</a>
             </div>
             <div class="nav-links">
-                <A href="/" class="nav-link">"Live Feed"</A>
-                <A href="/calendar" class="nav-link">"Calendar"</A>
-                <A href="/species" class="nav-link">"Species"</A>
-                <A href="/import" class="nav-link">"Import"</A>
+                <a href="/" class="nav-link">"Live Feed"</a>
+                <a href="/calendar" class="nav-link">"Calendar"</a>
+                <a href="/species" class="nav-link">"Species"</a>
+                <a href="/learning" class="nav-link">"Learning"</a>
+                <a href="/excluded" class="nav-link">"Excluded"</a>
+                <a href="/import" class="nav-link">"Import"</a>
+                <a href="/settings" class="nav-link">"Settings"</a>
             </div>
         </nav>
     }

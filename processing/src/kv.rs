@@ -98,7 +98,7 @@ fn reconnect() {
 ///
 /// Returns `Err` with a `NotConnected` error when Redis has not been
 /// initialized — callers already handle `Err` gracefully, so this
-/// avoids panicking in environments without Redis (smoke tests, CI).
+/// avoids panicking in environments without Redis (CI validation).
 fn with_retry<T, F>(f: F) -> redis::RedisResult<T>
 where
     F: Fn(&mut redis::Connection) -> redis::RedisResult<T>,
