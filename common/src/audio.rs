@@ -4,12 +4,8 @@
 //! Provides WAV I/O, mono conversion, rubato-based resampling, overlapping
 //! chunking, and clip extraction.
 
-use std::io::Cursor;
-use std::process::Command;
-
 use anyhow::{Context, Result};
-use rubato::{Fft, FixedSync, Resampler};
-use audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{FftFixedIn, Resampler};
 use tracing::{debug, info};
 
 /// Read a WAV file, convert to mono f32, resample to `target_sr`, and split
@@ -22,63 +18,39 @@ pub fn read_audio(
 ) -> Result<Vec<Vec<f32>>> {
     info!("Reading audio: {}", path.display());
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let reader =
+        hound::WavReader::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    let spec = reader.spec();
+    let native_sr = spec.sample_rate;
+    let n_channels = spec.channels as usize;
 
-    let resampled = if ext == "wav" {
-        let mut raw = std::fs::read(path)
-            .with_context(|| format!("Cannot read {}", path.display()))?;
-        if fix_wav_data_chunk(&mut raw) {
-            debug!("Fixed WAV data-chunk alignment for {}", path.display());
-        }
-        let reader = hound::WavReader::new(Cursor::new(raw))
-            .with_context(|| format!("Cannot parse WAV: {}", path.display()))?;
-        let spec = reader.spec();
-        let native_sr = spec.sample_rate;
-        let n_channels = spec.channels as usize;
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => reader
+            .into_samples::<i32>()
+            .map(|s| s.unwrap_or(0) as f32 / i32::MAX as f32)
+            .collect(),
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .map(|s| s.unwrap_or(0.0))
+            .collect(),
+    };
 
-        let samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Int => {
-                let bits = spec.bits_per_sample.clamp(1, 32) as u32;
-                let max_amplitude = if bits == 32 {
-                    i32::MAX as f32
-                } else {
-                    ((1_i64 << (bits - 1)) - 1) as f32
-                };
-
-                reader
-                    .into_samples::<i32>()
-                    .take_while(|s| s.is_ok())
-                    .map(|s| (s.unwrap() as f32 / max_amplitude).clamp(-1.0, 1.0))
-                    .collect()
-            }
-            hound::SampleFormat::Float => reader
-                .into_samples::<f32>()
-                .take_while(|s| s.is_ok())
-                .map(|s| s.unwrap())
-                .collect(),
-        };
-
-        let mono: Vec<f32> = if n_channels == 1 {
-            samples
-        } else {
-            samples
-                .chunks(n_channels)
-                .map(|frame| frame.iter().sum::<f32>() / n_channels as f32)
-                .collect()
-        };
-        debug!("Read {} mono samples at {} Hz", mono.len(), native_sr);
-
-        if native_sr == target_sr {
-            mono
-        } else {
-            resample(&mono, native_sr, target_sr)?
-        }
+    // Convert to mono
+    let mono: Vec<f32> = if n_channels == 1 {
+        samples
     } else {
-        decode_audio_ffmpeg(path, target_sr)?
+        samples
+            .chunks(n_channels)
+            .map(|frame| frame.iter().sum::<f32>() / n_channels as f32)
+            .collect()
+    };
+    debug!("Read {} mono samples at {} Hz", mono.len(), native_sr);
+
+    // Resample if needed
+    let resampled = if native_sr == target_sr {
+        mono
+    } else {
+        resample(&mono, native_sr, target_sr)?
     };
     info!(
         "Audio ready: {} samples at {} Hz",
@@ -91,52 +63,6 @@ pub fn read_audio(
     Ok(chunks)
 }
 
-fn decode_audio_ffmpeg(path: &std::path::Path, target_sr: u32) -> Result<Vec<f32>> {
-    debug!(
-        "Decoding non-WAV audio via ffmpeg: {} → mono f32 @ {} Hz",
-        path.display(),
-        target_sr
-    );
-
-    let output = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            path.to_string_lossy().as_ref(),
-            "-f",
-            "f32le",
-            "-ac",
-            "1",
-            "-ar",
-            &target_sr.to_string(),
-            "pipe:1",
-        ])
-        .output()
-        .with_context(|| format!("Failed to run ffmpeg for {}", path.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "ffmpeg decode failed for {}: {}",
-            path.display(),
-            stderr.trim()
-        );
-    }
-
-    if output.stdout.len() < 4 {
-        anyhow::bail!("ffmpeg decode produced no audio for {}", path.display());
-    }
-
-    let mut out = Vec::with_capacity(output.stdout.len() / 4);
-    for chunk in output.stdout.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(out)
-}
-
 /// Resample a mono signal from `sr_in` to `sr_out` using rubato.
 fn resample(input: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
     debug!("Resampling {} → {} Hz", sr_in, sr_out);
@@ -146,24 +72,33 @@ fn resample(input: &[f32], sr_in: u32, sr_out: u32) -> Result<Vec<f32>> {
     let chunk_size = 1024;
     let sub_chunks = 2;
     let mut resampler =
-        Fft::<f64>::new(sr_in as usize, sr_out as usize, chunk_size, sub_chunks, 1, FixedSync::Input)
+        FftFixedIn::<f64>::new(sr_in as usize, sr_out as usize, chunk_size, sub_chunks, 1)
             .context("Failed to create resampler")?;
 
-    let input_len = input_f64.len();
-    let input_data = vec![input_f64];
-    let input_buf = SequentialSliceOfVecs::new(&input_data, 1, input_len)
-        .context("Failed to create input buffer")?;
+    let mut output: Vec<f64> = Vec::with_capacity(
+        (input_f64.len() as f64 * sr_out as f64 / sr_in as f64) as usize + chunk_size,
+    );
 
-    let output_len = resampler.process_all_needed_output_len(input_len);
-    let mut output_data = vec![vec![0.0f64; output_len]; 1];
-    let mut output_buf = SequentialSliceOfVecs::new_mut(&mut output_data, 1, output_len)
-        .context("Failed to create output buffer")?;
+    let frames_needed = resampler.input_frames_next();
+    let mut pos = 0;
+    while pos + frames_needed <= input_f64.len() {
+        let chunk = &input_f64[pos..pos + frames_needed];
+        let result = resampler
+            .process(&[chunk.to_vec()], None)
+            .context("Resampler error")?;
+        output.extend_from_slice(&result[0]);
+        pos += frames_needed;
+    }
 
-    let (_nbr_in, nbr_out) = resampler
-        .process_all_into_buffer(&input_buf, &mut output_buf, input_len, None)
-        .context("Resampler error")?;
+    if pos < input_f64.len() {
+        let remaining = &input_f64[pos..];
+        let result = resampler
+            .process_partial(Some(&[remaining.to_vec()]), None)
+            .context("Resampler partial error")?;
+        output.extend_from_slice(&result[0]);
+    }
 
-    Ok(output_data[0][..nbr_out].iter().map(|&s| s as f32).collect())
+    Ok(output.into_iter().map(|s| s as f32).collect())
 }
 
 /// Split a signal into overlapping chunks, zero-padding the last one if
@@ -210,51 +145,8 @@ pub fn extract_clip(
     start_sec: f64,
     stop_sec: f64,
 ) -> Result<()> {
-    let ext = in_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if ext != "wav" {
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let status = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-ss",
-                &format!("{start_sec:.3}"),
-                "-to",
-                &format!("{stop_sec:.3}"),
-                "-i",
-                in_path.to_string_lossy().as_ref(),
-                "-acodec",
-                "pcm_s16le",
-                out_path.to_string_lossy().as_ref(),
-            ])
-            .status()
-            .with_context(|| format!("Failed to run ffmpeg for {}", in_path.display()))?;
-
-        if !status.success() {
-            anyhow::bail!(
-                "ffmpeg clip extraction failed for {} (status {})",
-                in_path.display(),
-                status
-            );
-        }
-        return Ok(());
-    }
-
-    let mut raw = std::fs::read(in_path)
-        .with_context(|| format!("Cannot read {}", in_path.display()))?;
-    fix_wav_data_chunk(&mut raw);
-    let reader = hound::WavReader::new(Cursor::new(raw))
-        .with_context(|| format!("Cannot parse WAV: {}", in_path.display()))?;
+    let reader = hound::WavReader::open(in_path)
+        .with_context(|| format!("Cannot open {}", in_path.display()))?;
     let spec = reader.spec();
     let sr = spec.sample_rate as f64;
     let ch = spec.channels as usize;
@@ -263,15 +155,10 @@ pub fn extract_clip(
     let stop_sample = (stop_sec * sr) as usize * ch;
 
     let all_samples: Vec<i16> = match spec.sample_format {
-        hound::SampleFormat::Int => reader
-            .into_samples::<i16>()
-            .take_while(|s| s.is_ok())
-            .map(|s| s.unwrap())
-            .collect(),
+        hound::SampleFormat::Int => reader.into_samples::<i16>().map(|s| s.unwrap_or(0)).collect(),
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
-            .take_while(|s| s.is_ok())
-            .map(|s| (s.unwrap() * i16::MAX as f32) as i16)
+            .map(|s| (s.unwrap_or(0.0) * i16::MAX as f32) as i16)
             .collect(),
     };
 
@@ -296,77 +183,6 @@ pub fn extract_clip(
     }
     writer.finalize()?;
     Ok(())
-}
-
-/// Fix a WAV file whose data-chunk size is not a multiple of the sample
-/// frame size.  This is common with ffmpeg's `-f segment` muxer which may
-/// not perfectly finalize the RIFF/WAV header.
-///
-/// Modifies the bytes in place and returns `true` if a fixup was applied.
-fn fix_wav_data_chunk(raw: &mut [u8]) -> bool {
-    // Minimal RIFF/WAV: 12-byte RIFF header + at least one chunk.
-    if raw.len() < 12 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
-        return false;
-    }
-
-    // First pass: find "fmt " to read block_align.
-    let mut pos = 12usize;
-    let mut block_align: Option<u16> = None;
-    while pos + 8 <= raw.len() {
-        let chunk_size =
-            u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]])
-                as usize;
-        if &raw[pos..pos + 4] == b"fmt " && chunk_size >= 16 && pos + 8 + chunk_size <= raw.len()
-        {
-            // block_align sits at offset 12 inside the fmt payload.
-            block_align = Some(u16::from_le_bytes([
-                raw[pos + 8 + 12],
-                raw[pos + 8 + 13],
-            ]));
-            break;
-        }
-        let next = pos.checked_add(8 + chunk_size);
-        let next = match next {
-            Some(n) => n,
-            None => break,
-        };
-        pos = if chunk_size % 2 != 0 { next + 1 } else { next };
-    }
-
-    let ba = match block_align {
-        Some(ba) if ba > 0 => ba as usize,
-        _ => return false,
-    };
-
-    // Second pass: find "data" chunk and fix its size.
-    pos = 12;
-    while pos + 8 <= raw.len() {
-        let chunk_size =
-            u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]])
-                as usize;
-        if &raw[pos..pos + 4] == b"data" {
-            // Cap to the bytes actually present after the chunk header.
-            // ffmpeg -f segment often writes 0xFFFFFFFF ("unknown length").
-            let available = raw.len().saturating_sub(pos + 8);
-            let effective = chunk_size.min(available);
-            let remainder = effective % ba;
-            let fixed = (effective - remainder) as u32;
-            if fixed != chunk_size as u32 {
-                raw[pos + 4..pos + 8].copy_from_slice(&fixed.to_le_bytes());
-                return true;
-            }
-            return false; // already correct
-        }
-        // Guard against huge/bogus chunk sizes that would overflow `pos`.
-        let next = pos.checked_add(8 + chunk_size);
-        let next = match next {
-            Some(n) => n,
-            None => break,
-        };
-        pos = if chunk_size % 2 != 0 { next + 1 } else { next };
-    }
-
-    false
 }
 
 #[cfg(test)]

@@ -7,154 +7,68 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use anyhow::Result;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use gaia_common::audio;
 use gaia_common::config::Config;
 use gaia_common::detection::{Detection, ParsedFileName};
 
-use crate::kv;
-use crate::parquet_store;
-use crate::spectrogram::{self, Colormap, SpectrogramParams};
+use crate::db;
+use crate::spectrogram::{self, SpectrogramParams};
 use crate::ReportPayload;
 
 /// Run the reporting loop on its own thread.
 pub fn handle_queue(rx: Receiver<ReportPayload>, config: &Config, db_path: &Path) {
-    let mut config = config.clone();
     while let Ok(payload) = rx.recv() {
-        // Refresh settings (colormap, thresholds) from Redis so web UI
-        // changes are picked up without restarting the container.
-        kv::apply_settings_overrides(&mut config);
-
-        if let Err(e) = process_report(&payload, &config, db_path) {
+        if let Err(e) = process_report(&payload, config, db_path) {
             error!("Reporting error: {e:#}");
-        }
-
-        // Flush buffered detections to Parquet so the web UI sees them
-        // promptly (instead of waiting for FLUSH_THRESHOLD accumulation).
-        if let Err(e) = parquet_store::flush() {
-            error!("Parquet flush failed: {e}");
         }
 
         // Notify capture server to delete the source file (if local)
         // or delete it ourselves if running mono-node.
-        // When running in split mode (capture ↔ processing), the client
-        // has already deleted the recording from the remote capture
-        // server after processing, so we only clean up local files here.
         let src = &payload.file.file_path;
         if src.exists() {
             if let Err(e) = std::fs::remove_file(src) {
                 warn!("Cannot remove source file {}: {e}", src.display());
-            } else {
-                // Count remaining temp files in the same directory.
-                let remaining = src.parent()
-                    .and_then(|d| std::fs::read_dir(d).ok())
-                    .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| {
-                        e.path().extension().map(|x| x == "wav" || x == "mp3").unwrap_or(false)
-                    }).count())
-                    .unwrap_or(0);
-                info!(
-                    "Removed local temp {} ({remaining} audio files remaining in tmp)",
-                    src.display()
-                );
             }
+        } else {
+            // File was fetched from capture server and already cleaned up
+            // by the client after processing. Attempt to ask capture server
+            // to delete it.
+            delete_from_capture(config, src);
         }
-    }
-    // Flush any remaining buffered detections before the thread exits.
-    if let Err(e) = parquet_store::flush() {
-        error!("Final Parquet flush failed: {e}");
     }
     info!("Reporting thread finished");
 }
 
-fn process_report(payload: &ReportPayload, config: &Config, _db_path: &Path) -> Result<()> {
+fn process_report(payload: &ReportPayload, config: &Config, db_path: &Path) -> Result<()> {
     let file = &payload.file;
-
-    // Separate urban-noise detections (Engine, Dog, Human, …) from real
-    // species.  Noise detections are counted but NOT stored in the main
-    // detections table.
-    let (species_dets, noise_dets): (Vec<&Detection>, Vec<&Detection>) = payload
-        .detections
-        .iter()
-        .partition(|d| !kv::is_urban_noise(&d.scientific_name));
-
-    debug!(
-        "Report for {}: {} total detection(s) ({} species, {} noise)",
-        file.file_path.display(),
-        payload.detections.len(),
-        species_dets.len(),
-        noise_dets.len()
-    );
 
     write_json_file(file, &payload.detections, config)?;
 
-    // ── real species detections ──────────────────────────────────────
-    for detection in &species_dets {
-        // Attempt audio clip extraction.  Extraction failure MUST NOT
-        // prevent the detection from being recorded in the database.
-        let extracted = match extract_detection(file, detection, config) {
-            Ok(path) => {
-                // Only generate a spectrogram for freshly-extracted WAV
-                // files.  When extract_detection returns an .opus path the
-                // clip was already processed (and its spectrogram created)
-                // in a previous run — re-generating would fail because
-                // generate_from_wav cannot read Opus.
-                let is_opus = path.extension().and_then(|e| e.to_str()) == Some("opus");
-                if !is_opus {
-                    let spec_path = format!("{}.png", path.display());
-                    let spec_params = SpectrogramParams {
-                        colormap: config.colormap.parse::<Colormap>().unwrap_or_default(),
-                        ..SpectrogramParams::default()
-                    };
-                    if let Err(e) = spectrogram::generate_from_wav(
-                        &path,
-                        Path::new(&spec_path),
-                        &spec_params,
-                    ) {
-                        warn!("Spectrogram failed for {}: {e}", path.display());
-                    }
-                } else {
-                    debug!("Skipping spectrogram for already-compressed {}", path.display());
-                }
-                // Convert WAV clip → Opus immediately.  Falls back to
-                // the original WAV path if ffmpeg is unavailable.
-                let final_path = if is_opus {
-                    path
-                } else {
-                    crate::compress::compress_inline(&path).unwrap_or(path)
-                };
-                Some(final_path)
-            }
-            Err(e) => {
-                warn!("Clip extraction failed (detection will still be recorded): {e:#}");
-                None
-            }
-        };
+    for detection in &payload.detections {
+        let extracted_path = extract_detection(file, detection, config)?;
+
+        let spec_path = format!("{}.png", extracted_path.display());
+        if let Err(e) = spectrogram::generate_from_wav(
+            &extracted_path,
+            Path::new(&spec_path),
+            &SpectrogramParams::default(),
+        ) {
+            warn!("Spectrogram failed for {}: {e}", extracted_path.display());
+        }
 
         let summary = format_summary(detection, config);
-        let basename = extracted
-            .as_ref()
-            .and_then(|p| p.file_name())
+        let basename = extracted_path
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let model_tag = if !detection.model_name.is_empty() {
-            &detection.model_name
-        } else if !detection.model_slug.is_empty() {
-            &detection.model_slug
-        } else {
-            "unknown"
-        };
-        info!(
-            "[{model_tag}] {} {} ({:.1}%) @ {};{basename}",
-            detection.common_name,
-            detection.scientific_name,
-            detection.confidence * 100.0,
-            detection.time,
-        );
+        info!("{summary};{basename}");
 
-        write_to_log(&summary, &config.recs_dir);
+        write_to_log(&summary);
 
-        if let Err(e) = parquet_store::write_detection(
+        if let Err(e) = db::insert_detection(
+            db_path,
             detection,
             config.latitude,
             config.longitude,
@@ -164,54 +78,8 @@ fn process_report(payload: &ReportPayload, config: &Config, _db_path: &Path) -> 
             &basename,
             &payload.source_node,
         ) {
-            error!("Parquet insert failed: {e}");
+            error!("DB insert failed: {e}");
         }
-    }
-
-    // ── urban noise detections ───────────────────────────────────────
-    for detection in &noise_dets {
-        // For non-Human noise (Engine, Dog, …) we still extract the clip
-        // so the operator can review.  Human recordings are skipped for
-        // privacy reasons.
-        let is_human = detection.scientific_name.contains("Human");
-
-        if !is_human {
-            match extract_detection(file, detection, config) {
-                Ok(path) => {
-                    // Convert noise clip to Opus inline as well.
-                    crate::compress::compress_inline(&path);
-                }
-                Err(e) => {
-                    warn!("Noise clip extraction failed: {e}");
-                }
-            }
-        }
-
-        // Normalise the category: "Human vocal" / "Human whistle" → "Human"
-        let category = if is_human {
-            "Human"
-        } else {
-            &detection.scientific_name
-        };
-
-        let hour: u32 = detection
-            .time
-            .split(':')
-            .next()
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(0);
-
-        if let Err(e) = kv::increment_urban_noise(&detection.date, hour, category) {
-            error!("Urban noise update failed: {e}");
-        }
-
-        info!(
-            "[urban-noise] {}: {} ({:.1}%) at {}",
-            detection.date,
-            category,
-            detection.confidence * 100.0,
-            detection.time,
-        );
     }
 
     if config.birdweather_id.is_some() {
@@ -235,18 +103,12 @@ fn extract_detection(
     let safe_start = (detection.start - spacer).max(0.0);
     let safe_stop = (detection.stop + spacer).min(config.recording_length as f64);
 
-    let model_tag = if detection.model_slug.is_empty() {
-        "unknown"
-    } else {
-        &detection.model_slug
-    };
     let new_name = format!(
-        "{}-{}-{}-{}-{}-{}{}.wav",
+        "{}-{}-{}-{}-birdnet-{}{}.wav",
         detection.domain,
         detection.common_name_safe,
         detection.confidence_pct(),
         detection.date,
-        model_tag,
         file.rtsp_id,
         detection.time,
     );
@@ -258,42 +120,19 @@ fn extract_detection(
     let new_path = new_dir.join(&new_name);
 
     if new_path.exists() {
-        debug!("Extraction already exists (WAV): {}", new_path.display());
+        warn!("Extraction already exists, skipping: {}", new_path.display());
         return Ok(new_path);
     }
 
-    // Check whether an Opus-compressed version already exists (from a
-    // previous inline compression).  If so, return the Opus path
-    // directly — no need to re-extract and re-compress.
-    let opus_name = format!("{}.opus", &new_name[..new_name.len() - 4]);
-    let opus_path = new_dir.join(&opus_name);
-    if opus_path.exists() {
-        debug!("Extraction already exists (Opus): {}", opus_path.display());
-        return Ok(opus_path);
-    }
-
     audio::extract_clip(&file.file_path, &new_path, safe_start, safe_stop)?;
-    debug!(
-        "Extracted clip {:.1}s–{:.1}s from {} → {}",
-        safe_start, safe_stop,
-        file.file_path.display(),
-        new_path.display()
-    );
     Ok(new_path)
 }
 
 // ── summary / logging ────────────────────────────────────────────────────
 
 fn format_summary(d: &Detection, config: &Config) -> String {
-    let model = if !d.model_name.is_empty() {
-        &d.model_name
-    } else if !d.model_slug.is_empty() {
-        &d.model_slug
-    } else {
-        "unknown"
-    };
     format!(
-        "{};{};{};{};{};{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{};{};{}",
         d.domain,
         d.date,
         d.time,
@@ -306,12 +145,13 @@ fn format_summary(d: &Detection, config: &Config) -> String {
         d.week,
         config.sensitivity,
         config.overlap,
-        model,
     )
 }
 
-fn write_to_log(summary: &str, data_dir: &Path) {
-    let log_path = data_dir.join("GaiaDB.txt");
+fn write_to_log(summary: &str) {
+    let log_path = std::env::var("GAIA_DIR")
+        .map(|d| PathBuf::from(d).join("GaiaDB.txt"))
+        .unwrap_or_else(|_| PathBuf::from("/app/data/GaiaDB.txt"));
 
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)
@@ -383,10 +223,10 @@ fn bird_weather(
         _ => return Ok(()),
     };
 
-    // Only POST non-excluded bird detections to BirdWeather
+    // Only POST bird detections to BirdWeather
     let bird_dets: Vec<&Detection> = detections
         .iter()
-        .filter(|d| d.domain == "birds" && !d.excluded)
+        .filter(|d| d.domain == "birds")
         .collect();
     if bird_dets.is_empty() {
         return Ok(());
@@ -460,6 +300,34 @@ fn heartbeat(config: &Config) {
         match reqwest::blocking::get(url) {
             Ok(r) => info!("Heartbeat: {}", r.status()),
             Err(e) => error!("Heartbeat failed: {e}"),
+        }
+    }
+}
+
+// ── capture server cleanup ───────────────────────────────────────────────
+
+fn delete_from_capture(config: &Config, file_path: &Path) {
+    let filename = file_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let url = format!(
+        "{}/api/recordings/{}",
+        config.capture_server_url, filename
+    );
+    match reqwest::blocking::Client::new()
+        .delete(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+    {
+        Ok(r) if r.status().is_success() => {
+            info!("Deleted {filename} from capture server");
+        }
+        Ok(r) => {
+            warn!("Capture server DELETE {filename}: {}", r.status());
+        }
+        Err(e) => {
+            warn!("Cannot reach capture server for DELETE {filename}: {e}");
         }
     }
 }

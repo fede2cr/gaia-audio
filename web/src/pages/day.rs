@@ -1,30 +1,21 @@
 //! Day detail page – all detections for a specific date, grouped by species.
 
-use leptos::prelude::*;
-use leptos::prelude::{
-    ElementChild, For, IntoView, Resource, ServerFnError,
-    Suspense,
-};
-use leptos_router::hooks::use_params_map;
+use leptos::*;
+use leptos_router::*;
 
 use crate::components::detection_card::DetectionCard;
-use crate::components::hourly_chart::SpeciesHourlyGrid;
-use crate::components::model_filter::ModelFilter;
-use crate::model::{DayDetectionGroup, SpeciesHourlyCounts, WebDetection};
+use crate::model::{DayDetectionGroup, WebDetection};
 
-// ─── Server functions ────────────────────────────────────────────────────────
+// ─── Server function ─────────────────────────────────────────────────────────
 
-#[server(prefix = "/api")]
+#[server(GetDayDetections, "/api")]
 pub async fn get_day_detections(
     date: String,
-    model_slug: String,
 ) -> Result<Vec<DayDetectionGroup>, ServerFnError> {
-    use crate::server::{detections_duckdb as ddb, inaturalist};
+    use crate::server::{db, inaturalist};
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    let slug_opt = if model_slug.is_empty() { None } else { Some(model_slug.as_str()) };
-    let mut groups = ddb::day_detections_filtered(&state.db_path, &date, slug_opt)
-        .await
+    let mut groups = db::day_detections(&state.db_path, &date)
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))?;
 
     // Enrich with images
@@ -38,19 +29,6 @@ pub async fn get_day_detections(
     Ok(groups)
 }
 
-/// Hourly species×hour grid for a specific date.
-#[server(prefix = "/api")]
-pub async fn get_day_hourly(
-    date: String,
-) -> Result<Vec<SpeciesHourlyCounts>, ServerFnError> {
-    use crate::server::detections_duckdb as ddb;
-    let state = use_context::<crate::app::AppState>()
-        .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    ddb::daily_species_hourly(&state.db_path, &date)
-        .await
-        .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
-}
-
 // ─── Page component ──────────────────────────────────────────────────────────
 
 /// Detail view for a single day, showing every species detected.
@@ -58,37 +36,17 @@ pub async fn get_day_hourly(
 pub fn DayView() -> impl IntoView {
     let params = use_params_map();
     let date = move || {
-        params.with(|p| p.get("date").unwrap_or_default())
+        params.with(|p| p.get("date").cloned().unwrap_or_default())
     };
-    let (model_slug, set_model_slug) = signal(String::new());
 
-    let data = Resource::new(
-        move || (date(), model_slug.get()),
-        |(d, slug)| async move { get_day_detections(d.clone(), slug).await },
-    );
-    let hourly = Resource::new(date, |d| async move { get_day_hourly(d).await });
+    let data = create_resource(date, |d| async move { get_day_detections(d).await });
 
     view! {
         <div class="day-page">
             <h1>"Detections for " {date}</h1>
             <a href="/calendar" class="back-link">"← Back to Calendar"</a>
 
-            <ModelFilter selected=model_slug set_selected=set_model_slug />
-
-            // ── Species × Hour heatmap ───────────────────────────────
-            <Suspense fallback=|| view! { <p class="loading">"Loading chart\u{2026}"</p> }>
-                {move || hourly.get().map(|res| match res {
-                    Ok(grid) if !grid.is_empty() => Some(view! {
-                        <section class="day-hourly-section">
-                            <h2>"Activity by Hour"</h2>
-                            <SpeciesHourlyGrid data=grid />
-                        </section>
-                    }.into_any()),
-                    _ => None,
-                })}
-            </Suspense>
-
-            <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
+            <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
                 {move || data.get().map(|res| match res {
                     Ok(groups) => view! {
                         <div class="day-groups">
@@ -103,10 +61,10 @@ pub fn DayView() -> impl IntoView {
                                 }
                             />
                         </div>
-                    }.into_any(),
+                    }.into_view(),
                     Err(e) => view! {
                         <p class="error">"Error: " {e.to_string()}</p>
-                    }.into_any(),
+                    }.into_view(),
                 })}
             </Suspense>
         </div>
@@ -132,10 +90,10 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                 <img src={img_src} alt={group.common_name.clone()} class="day-group-img" loading="lazy" />
                 <div class="day-group-info">
                     <a href={species_href} class="day-group-name">
-                        <strong>{group.common_name.clone()}</strong>
-                        " ("{group.scientific_name.clone()}")"
+                        <strong>{&group.common_name}</strong>
+                        " ("{&group.scientific_name}")"
                     </a>
-                    <span class="domain-badge">{group.domain.clone()}</span>
+                    <span class="domain-badge">{&group.domain}</span>
                     <span class="confidence">"Best: " {conf}</span>
                     <span class="detection-count">{group.detections.len()}" detections"</span>
                 </div>
@@ -150,5 +108,5 @@ fn DayGroup(group: DayDetectionGroup) -> impl IntoView {
                 />
             </div>
         </div>
-    }.into_any()
+    }
 }

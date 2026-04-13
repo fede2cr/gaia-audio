@@ -42,15 +42,6 @@ pub struct Config {
     /// When set and the manifest has a [download] section, the processing
     /// server will auto-download the corresponding model from Zenodo.
     pub model_variant: Option<String>,
-    /// Comma-separated list of model slugs to load (e.g. "birdnet" or "perch").
-    /// When empty, all discovered models are loaded.
-    pub model_slugs: Vec<String>,
-    /// Instance identifier used to isolate temp directories when running
-    /// multiple processing containers on the same data volume.
-    pub processing_instance: String,
-    /// Number of parallel analysis threads (default 1).
-    pub processing_threads: usize,
-
 
     // ── privacy / extraction (processing) ────────────────────────────
     pub raw_spectrogram: bool,
@@ -63,26 +54,6 @@ pub struct Config {
 
     // ── database (processing) ────────────────────────────────────────
     pub db_path: PathBuf,
-
-    // ── Turso / libsql ───────────────────────────────────────────────
-    /// Turso database URL.  When set, overrides `db_path` as the
-    /// connection target.  For local-only mode this should be a file
-    /// path (e.g. `/data/birds.db`).  For future Turso Cloud support
-    /// it can be a `libsql://` URL.
-    pub turso_database_url: Option<String>,
-    /// Turso auth token.  Required when `turso_database_url` points to a
-    /// remote Turso Cloud instance; unused in local-only mode.
-    pub turso_auth_token: Option<String>,
-
-    // ── display (processing / web) ───────────────────────────────────
-    /// Spectrogram colour-map name ("default", "coolwarm", "magma", "viridis", "grayscale").
-    pub colormap: String,
-
-    // ── disk guard (capture) ─────────────────────────────────────────
-    /// Maximum allowed disk usage percentage (0–100).  When the volume
-    /// holding `recs_dir` exceeds this threshold the capture process is
-    /// paused until space is freed.  Default: 95.
-    pub disk_usage_max: f64,
 
     // ── network (capture ↔ processing) ───────────────────────────────
     /// Address the capture HTTP server listens on.
@@ -163,19 +134,6 @@ pub fn load(path: &Path) -> Result<Config> {
         sf_thresh: get_f64("SF_THRESH", 0.03),
         data_model_version: get_u32("DATA_MODEL_VERSION", 2),
         model_variant: get("MODEL_VARIANT").filter(|s| !s.is_empty()),
-        model_slugs: get("MODEL_SLUGS")
-            .map(|s| {
-                s.split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        processing_instance: get("PROCESSING_INSTANCE").unwrap_or_default(),
-        processing_threads: get("PROCESSING_THREADS")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
-            .max(1),
         raw_spectrogram: get("RAW_SPECTROGRAM")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
@@ -185,17 +143,7 @@ pub fn load(path: &Path) -> Result<Config> {
         birdweather_id: get("BIRDWEATHER_ID").filter(|s| !s.is_empty()),
         heartbeat_url: get("HEARTBEAT_URL").filter(|s| !s.is_empty()),
 
-        db_path: PathBuf::from(
-            get("TURSO_DATABASE_URL")
-                .or_else(|| get("DB_PATH"))
-                .unwrap_or_else(|| "/data/birds.db".into()),
-        ),
-        turso_database_url: get("TURSO_DATABASE_URL"),
-        turso_auth_token: get("TURSO_AUTH_TOKEN"),
-
-        colormap: get("COLORMAP").unwrap_or_else(|| "default".into()),
-
-        disk_usage_max: get_f64("DISK_USAGE_MAX", 95.0),
+        db_path: PathBuf::from(get("DB_PATH").unwrap_or_else(|| "/data/birds.db".into())),
 
         capture_listen_addr: get("CAPTURE_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:8089".into()),

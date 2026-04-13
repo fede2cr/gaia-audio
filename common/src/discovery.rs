@@ -8,7 +8,7 @@
 //! removing the need for hard-coded URLs or DNS when running containers on
 //! different hardware.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -31,15 +31,12 @@ pub enum ServiceRole {
 
 impl ServiceRole {
     /// mDNS service-type string including domain, e.g.
-    /// `_gaia-aud-cap._tcp.local.`
-    ///
-    /// The service name (between `_` and `._tcp`) must be ≤ 15 bytes
-    /// per RFC 6763 / DNS-SD.
+    /// `_gaia-audio-capture._tcp.local.`
     pub fn service_type(&self) -> &'static str {
         match self {
-            Self::Capture => "_gaia-aud-cap._tcp.local.",
-            Self::Processing => "_gaia-aud-proc._tcp.local.",
-            Self::Web => "_gaia-aud-web._tcp.local.",
+            Self::Capture => "_gaia-audio-capture._tcp.local.",
+            Self::Processing => "_gaia-audio-processing._tcp.local.",
+            Self::Web => "_gaia-audio-web._tcp.local.",
         }
     }
 
@@ -124,9 +121,7 @@ impl DiscoveryHandle {
         };
 
         debug!("mDNS: browsing for {} (timeout={}s)", role.service_type(), timeout.as_secs());
-        // Collect by instance name so multiple ServiceResolved events
-        // (one per interface / address family) are merged into a single peer.
-        let mut peer_map: HashMap<String, Peer> = HashMap::new();
+        let mut peers = Vec::new();
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -145,20 +140,12 @@ impl DiscoveryHandle {
                     let addrs: Vec<IpAddr> =
                         info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
                     let port = info.get_port();
-                    let instance = extract_instance_name(&name);
-
-                    let peer = peer_map.entry(instance.clone()).or_insert_with(|| Peer {
-                        instance_name: instance,
-                        addresses: Vec::new(),
+                    info!("mDNS: discovered peer {} at {:?}:{}", name, addrs, port);
+                    peers.push(Peer {
+                        instance_name: extract_instance_name(&name),
+                        addresses: addrs,
                         port,
                     });
-                    // Merge addresses, avoiding duplicates.
-                    for addr in addrs {
-                        if !peer.addresses.contains(&addr) {
-                            peer.addresses.push(addr);
-                        }
-                    }
-                    debug!("mDNS: resolved {} – addrs now {:?}", name, peer.addresses);
                 }
                 Ok(event) => {
                     debug!("mDNS: event {:?}", format_event(&event));
@@ -168,13 +155,8 @@ impl DiscoveryHandle {
         }
 
         let _ = self.daemon.stop_browse(role.service_type());
-        if peer_map.is_empty() {
+        if peers.is_empty() {
             debug!("mDNS: browse completed, no peers found for {}", role.service_type());
-        }
-
-        let peers: Vec<Peer> = peer_map.into_values().collect();
-        for p in &peers {
-            info!("mDNS: peer {} at {:?}:{}", p.instance_name, p.addresses, p.port);
         }
         peers
     }
@@ -234,12 +216,11 @@ pub fn register(role: ServiceRole, port: u16) -> Result<DiscoveryHandle> {
         role.service_type(),
         &instance_name,
         &host,
-        "",   // filled automatically by enable_addr_auto()
+        "",   // auto-detect addresses
         port,
         None, // no TXT properties
     )
-    .context("Cannot create mDNS ServiceInfo")?
-    .enable_addr_auto();
+    .context("Cannot create mDNS ServiceInfo")?;
 
     let fullname = service_info.get_fullname().to_string();
     let registered_addrs = format!("{:?}", service_info.get_addresses());

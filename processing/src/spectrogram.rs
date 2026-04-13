@@ -3,59 +3,11 @@
 //! Reused from `birdnet-server/src/spectrogram.rs`.
 
 use std::path::Path;
-use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use image::{ImageBuffer, Rgb};
 use rustfft::{num_complex::Complex, FftPlanner};
 use tracing::debug;
-
-/// Available colour palettes for spectrograms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Colormap {
-    /// Green-yellow-red "hot" palette (original Gaia default).
-    Default,
-    /// Blue → white → red (similar to BirdNET-Pi / Matplotlib coolwarm).
-    Coolwarm,
-    /// Black → purple → orange → yellow (Matplotlib magma).
-    Magma,
-    /// Dark blue → cyan → yellow (Matplotlib viridis).
-    Viridis,
-    /// Black → white (grayscale).
-    Grayscale,
-}
-
-impl Default for Colormap {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
-impl FromStr for Colormap {
-    type Err = ();
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "default" | "" => Ok(Self::Default),
-            "coolwarm" | "birdnet" => Ok(Self::Coolwarm),
-            "magma" => Ok(Self::Magma),
-            "viridis" => Ok(Self::Viridis),
-            "grayscale" | "gray" => Ok(Self::Grayscale),
-            _ => Ok(Self::Default),
-        }
-    }
-}
-
-impl std::fmt::Display for Colormap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Default => write!(f, "default"),
-            Self::Coolwarm => write!(f, "coolwarm"),
-            Self::Magma => write!(f, "magma"),
-            Self::Viridis => write!(f, "viridis"),
-            Self::Grayscale => write!(f, "grayscale"),
-        }
-    }
-}
 
 /// Parameters for spectrogram rendering.
 pub struct SpectrogramParams {
@@ -65,8 +17,6 @@ pub struct SpectrogramParams {
     pub max_freq: f64,
     pub width: u32,
     pub height: u32,
-    /// Colour palette.
-    pub colormap: Colormap,
 }
 
 impl Default for SpectrogramParams {
@@ -77,7 +27,6 @@ impl Default for SpectrogramParams {
             max_freq: 12000.0,
             width: 800,
             height: 256,
-            colormap: Colormap::default(),
         }
     }
 }
@@ -177,7 +126,7 @@ pub fn generate(
             let bin = bin.min(max_bin.saturating_sub(1));
 
             let val = magnitude[src_frame][bin];
-            let pixel = apply_colormap(params.colormap, val);
+            let pixel = colormap(val);
             img.put_pixel(x, y, pixel);
         }
     }
@@ -190,93 +139,6 @@ pub fn generate(
 
     debug!("Spectrogram written to {}", out_path.display());
     Ok(())
-}
-
-/// Generate a spectrogram as an in-memory PNG buffer (no disk write).
-///
-/// Used by the live-analysis feature to produce a spectrogram of the
-/// currently-analysed chunk without touching the filesystem.
-pub fn generate_to_png_buffer(
-    samples: &[f32],
-    sample_rate: u32,
-    params: &SpectrogramParams,
-) -> Result<Vec<u8>> {
-    use image::codecs::png::PngEncoder;
-    use image::ImageEncoder;
-    use std::io::Cursor;
-
-    let fft_size = params.fft_size;
-    let hop = params.hop_size;
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-
-    let n_frames = if samples.len() > fft_size {
-        (samples.len() - fft_size) / hop + 1
-    } else {
-        1
-    };
-
-    let n_bins = fft_size / 2 + 1;
-    let max_bin = if params.max_freq > 0.0 {
-        ((params.max_freq / sample_rate as f64) * fft_size as f64)
-            .ceil() as usize
-            + 1
-    } else {
-        n_bins
-    }
-    .min(n_bins);
-
-    let hann = hann_window(fft_size);
-    let mut magnitude = vec![vec![0.0f32; max_bin]; n_frames];
-
-    for (frame_idx, frame_start) in (0..samples.len().saturating_sub(fft_size))
-        .step_by(hop)
-        .enumerate()
-    {
-        if frame_idx >= n_frames {
-            break;
-        }
-        let mut buf: Vec<Complex<f32>> = samples[frame_start..frame_start + fft_size]
-            .iter()
-            .zip(hann.iter())
-            .map(|(&s, &w)| Complex::new(s * w, 0.0))
-            .collect();
-        fft.process(&mut buf);
-        for (bin, val) in buf.iter().take(max_bin).enumerate() {
-            let mag = (val.re * val.re + val.im * val.im).sqrt();
-            magnitude[frame_idx][bin] = 20.0 * (mag + 1e-10).log10();
-        }
-    }
-
-    // Normalise
-    let global_min = magnitude.iter().flat_map(|r| r.iter()).cloned().fold(f32::INFINITY, f32::min);
-    let global_max = magnitude.iter().flat_map(|r| r.iter()).cloned().fold(f32::NEG_INFINITY, f32::max);
-    let range = (global_max - global_min).max(1e-6);
-    for row in &mut magnitude {
-        for val in row.iter_mut() {
-            *val = (*val - global_min) / range;
-        }
-    }
-
-    let img_w = params.width;
-    let img_h = params.height;
-    let mut img = ImageBuffer::<Rgb<u8>, _>::new(img_w, img_h);
-    for x in 0..img_w {
-        let src_frame = (x as f64 / img_w as f64 * n_frames as f64) as usize;
-        let src_frame = src_frame.min(n_frames.saturating_sub(1));
-        for y in 0..img_h {
-            let bin = ((img_h - 1 - y) as f64 / img_h as f64 * max_bin as f64) as usize;
-            let bin = bin.min(max_bin.saturating_sub(1));
-            img.put_pixel(x, y, apply_colormap(params.colormap, magnitude[src_frame][bin]));
-        }
-    }
-
-    let mut cursor = Cursor::new(Vec::new());
-    PngEncoder::new(&mut cursor)
-        .write_image(img.as_raw(), img_w, img_h, image::ExtendedColorType::Rgb8)
-        .context("PNG encode")?;
-    Ok(cursor.into_inner())
 }
 
 /// Generate a spectrogram directly from a WAV file.
@@ -344,20 +206,8 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Apply the selected colourmap to a normalised [0, 1] value.
-fn apply_colormap(cm: Colormap, val: f32) -> Rgb<u8> {
+fn colormap(val: f32) -> Rgb<u8> {
     let v = val.clamp(0.0, 1.0);
-    match cm {
-        Colormap::Default => cm_default(v),
-        Colormap::Coolwarm => cm_coolwarm(v),
-        Colormap::Magma => cm_magma(v),
-        Colormap::Viridis => cm_viridis(v),
-        Colormap::Grayscale => cm_grayscale(v),
-    }
-}
-
-/// Original green-yellow-red "hot" palette.
-fn cm_default(v: f32) -> Rgb<u8> {
     let r = (255.0 * (3.0 * v - 1.0).clamp(0.0, 1.0)) as u8;
     let g = (255.0
         * (3.0 * v - 0.0)
@@ -365,76 +215,4 @@ fn cm_default(v: f32) -> Rgb<u8> {
             .min((3.0 - 3.0 * v).clamp(0.0, 1.0))) as u8;
     let b = (255.0 * (1.0 - 3.0 * v + 1.0).clamp(0.0, 1.0)) as u8;
     Rgb([r, g, b])
-}
-
-/// Blue → white → red (BirdNET-Pi style coolwarm).
-fn cm_coolwarm(v: f32) -> Rgb<u8> {
-    let (r, g, b) = if v < 0.5 {
-        let t = v * 2.0; // 0..1 over the blue half
-        (
-            (59.0 + t * 196.0),   // 59 → 255
-            (76.0 + t * 179.0),   // 76 → 255
-            (192.0 + t * 63.0),   // 192 → 255
-        )
-    } else {
-        let t = (v - 0.5) * 2.0; // 0..1 over the red half
-        (
-            255.0,                // 255
-            (255.0 - t * 195.0),  // 255 → 60
-            (255.0 - t * 195.0),  // 255 → 60
-        )
-    };
-    Rgb([r as u8, g as u8, b as u8])
-}
-
-/// Dark → purple → orange → yellow (magma-inspired).
-fn cm_magma(v: f32) -> Rgb<u8> {
-    // 5-stop gradient: black → dark purple → hot pink → orange → pale yellow
-    let (r, g, b) = if v < 0.25 {
-        let t = v * 4.0;
-        lerp3((0.0, 0.0, 4.0), (50.0, 10.0, 80.0), t)
-    } else if v < 0.5 {
-        let t = (v - 0.25) * 4.0;
-        lerp3((50.0, 10.0, 80.0), (180.0, 30.0, 100.0), t)
-    } else if v < 0.75 {
-        let t = (v - 0.5) * 4.0;
-        lerp3((180.0, 30.0, 100.0), (245.0, 150.0, 40.0), t)
-    } else {
-        let t = (v - 0.75) * 4.0;
-        lerp3((245.0, 150.0, 40.0), (252.0, 253.0, 191.0), t)
-    };
-    Rgb([r as u8, g as u8, b as u8])
-}
-
-/// Dark blue → teal → green → yellow (viridis-inspired).
-fn cm_viridis(v: f32) -> Rgb<u8> {
-    let (r, g, b) = if v < 0.25 {
-        let t = v * 4.0;
-        lerp3((68.0, 1.0, 84.0), (59.0, 82.0, 139.0), t)
-    } else if v < 0.5 {
-        let t = (v - 0.25) * 4.0;
-        lerp3((59.0, 82.0, 139.0), (33.0, 145.0, 140.0), t)
-    } else if v < 0.75 {
-        let t = (v - 0.5) * 4.0;
-        lerp3((33.0, 145.0, 140.0), (94.0, 201.0, 98.0), t)
-    } else {
-        let t = (v - 0.75) * 4.0;
-        lerp3((94.0, 201.0, 98.0), (253.0, 231.0, 37.0), t)
-    };
-    Rgb([r as u8, g as u8, b as u8])
-}
-
-/// Simple grayscale (black → white).
-fn cm_grayscale(v: f32) -> Rgb<u8> {
-    let c = (v * 255.0) as u8;
-    Rgb([c, c, c])
-}
-
-/// Linear interpolation between two RGB triples.
-fn lerp3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
-    (
-        a.0 + (b.0 - a.0) * t,
-        a.1 + (b.1 - a.1) * t,
-        a.2 + (b.2 - a.2) * t,
-    )
 }

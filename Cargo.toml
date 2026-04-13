@@ -19,14 +19,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Audio
 hound = "3.5"
-rubato = "1"
-audioadapter-buffers = "2"
+rubato = "0.15"
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # Inference
@@ -34,26 +32,25 @@ tract-tflite = "0.21"
 tract-onnx = "0.21"
 
 # Storage
-libsql = { version = "0.9", default-features = false, features = ["core"] }
-duckdb = { version = "1", features = ["bundled"] }
-redis = { version = "1", features = ["tokio-comp"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Image / FFT
 rustfft = "6.2"
 image = "0.25"
 
 # Config
-toml = "1"
+toml = "0.8"
 
 # Archive & checksum
-zip = "8"
-md5 = "0.8"
-tar = "0.4.45"
+zip = "2"
+md5 = "0.7"
+tar = "0.4"
 
 mdns-sd = "0.18"
 
 # Other
 ctrlc = { version = "3.4", features = ["termination"] }
+notify = "7"
 
 [profile.release]
 opt-level = 3

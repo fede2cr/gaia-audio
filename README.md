@@ -45,31 +45,22 @@ backend (`birdnet-server/`).
 
 ## Multi-Model Support
 
-Each model runs in its **own processing container instance**.  The control
-plane (`gaia-core`) starts a `gaia-audio-processing-<slug>` container per
-enabled model, each filtering by `MODEL_SLUGS=<slug>`.  This prevents
-race conditions between models processing the same recording files.
-
-Model manifests are bundled inside the container image and seeded into
-the shared `/models` volume on first start (no-clobber — user-placed
-manifests are preserved).
+Each model lives in its own directory with a `manifest.toml`:
 
 ```
 /models/
-├── birdnet/
-│   ├── manifest.toml          # seeded from image
-│   ├── audio-model.onnx       # pre-converted at build time (~49 MB)
-│   ├── meta-model.onnx        # pre-converted at build time (~28 MB)
-│   ├── en_us.txt              # labels (downloaded on first start)
+├── birds/
+│   ├── manifest.toml
+│   ├── BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite
+│   ├── BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt
 │   └── l18n/
-├── perch/
-│   ├── manifest.toml          # seeded from image
-│   ├── model.onnx             # downloaded on first start (~150 MB)
-│   └── labels.csv             # downloaded on first start
-└── batdetect2/
-    ├── manifest.toml          # seeded from image
-    ├── batdetect2.onnx        # downloaded on first start
-    └── labels.csv             # downloaded on first start
+├── bats/
+│   ├── manifest.toml
+│   ├── BatDetect2.tflite
+│   └── labels.txt
+└── insects/
+    ├── manifest.toml
+    └── ...
 ```
 
 ### Model Manifest (`manifest.toml`)
@@ -77,28 +68,19 @@ manifests are preserved).
 ```toml
 [model]
 name = "BirdNET V2.4"
-slug = "birdnet"                  # REQUIRED — used as container suffix & filter
 domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
-tflite_file = "audio-model.tflite"
-onnx_file = "audio-model.onnx"   # preferred when present
-labels_file = "en_us.txt"
+tflite_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite"
+onnx_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16.onnx"   # preferred when present
+labels_file = "BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt"
 v1_metadata = false
-apply_softmax = false             # BirdNET already applies softmax internally
-onnx_is_classifier = true         # accepts mel spectrogram, not raw audio
 
 [metadata_model]
 enabled = true
-tflite_file = "meta-model.tflite"
+tflite_file = "BirdNET_GLOBAL_6K_V2.4_MData_Model_V2_FP16.tflite"
 onnx_file = "meta-model.onnx"     # preferred when present
 ```
-
-The `slug` field is **required** and must match the value passed in
-`MODEL_SLUGS`.  It is also used as:
-- The container name suffix (`gaia-audio-processing-<slug>`)
-- The processing instance identifier for multi-instance coordination
-- The subdirectory name under `/models/`
 
 > **Why ONNX?** `tract-tflite` does not support every TFLite operator
 > (notably `SPLIT_V`, used by BirdNET V2.4).  Converting the model to ONNX
@@ -198,8 +180,6 @@ config-file values.
 | `RECS_DIR` | `/data` | both | Base recording directory |
 | `EXTRACTED` | `/data/Extracted` | processing | Extracted clip directory |
 | `MODEL_DIR` | `/models` | processing | Root model directory (auto-discovers subdirs) |
-| `MODEL_SLUGS` | | processing | Comma-separated model slugs to load (set automatically by gaia-core) |
-| `PROCESSING_INSTANCE` | | processing | Instance identifier for multi-instance coordination (set automatically) |
 | `MODEL_VARIANT` | | processing | Model variant: `fp32`, `fp16`, or `int8` (default from manifest) |
 | `DATABASE_LANG` | `en` | processing | Language for common names |
 | `RTSP_STREAMS` | | capture | Comma-separated RTSP URLs |
@@ -233,56 +213,12 @@ cd web && cargo leptos build --release
 # Build capture image
 podman build -f capture/Containerfile -t fede2/gaia-audio-capture .
 
-# Build processing image (recommended). This ALWAYS runs build-time
-# validations + smoke tests before producing the final image.
-podman build -f processing/Containerfile --progress=plain \
-  -t fede2/gaia-audio-processing .
+# Build processing image
+podman build -f processing/Containerfile -t fede2/gaia-audio-processing .
 
 # Build web dashboard image
 podman build -f web/Containerfile -t fede2/gaia-audio-web .
 ```
-
-### Processing Container Build Pipeline (recommended)
-
-```bash
-# 0) Always run from projects/gaia-audio/
-cd projects/gaia-audio
-
-# 1) Optional: validate conversion stages independently
-podman build -f processing/Containerfile --progress=plain --target converter .
-podman build -f processing/Containerfile --progress=plain --target birdnet3converter .
-podman build -f processing/Containerfile --progress=plain --target tract-validator .
-
-# 2) Run end-to-end model smoke test (required in CI)
-podman build -f processing/Containerfile --progress=plain \
-  --target smoke-test-runner -t gaia-processing-smoke-rust .
-
-# 3) Build final runtime image (default path; includes smoke tests)
-podman build -f processing/Containerfile --progress=plain \
-  -t fede2/gaia-audio-processing .
-
-# 4) Use --no-cache when diagnosing model/runtime regressions
-podman build -f processing/Containerfile --no-cache --progress=plain \
-  --target smoke-test-runner -t gaia-processing-smoke-rust .
-```
-
-The default final image build runs `smoke-test-runner` automatically.
-That smoke test prints per-model detection logs for:
-- BirdNET V2.4
-- BirdNET+ V3.0
-- Google Perch 2.0
-
-It validates not only model loading, but also what each model detects on the
-same input audio and whether confidence scores are sane.
-
-Build-time ONNX validation now runs through a native Rust binary
-(`validate_onnx`) baked from the processing crate, replacing the previous
-Python validator script.
-
-The processing image includes:
-- Pre-converted BirdNET V2.4 ONNX models (classifier ~49 MB + metadata ~28 MB)
-- Bundled manifests for BirdNET, Perch, and BatDetect2
-- An entrypoint script that seeds manifests into the `/models` volume
 
 ## Converting Models to ONNX
 
@@ -344,13 +280,9 @@ Create a working directory with the following structure before starting:
 gaia/
 ├── compose.yaml          # see below
 ├── gaia.conf             # KEY=VALUE config (see Configuration table above)
-├── models/               # model directories — seeded automatically from image
-│   ├── birdnet/
-│   │   └── manifest.toml # auto-downloads ONNX model on first start
-│   ├── perch/
-│   │   └── manifest.toml # auto-downloads from HuggingFace on first start
-│   └── batdetect2/
-│       └── manifest.toml # auto-downloads from HuggingFace on first start
+├── models/               # model directories with manifest.toml each
+│   └── birds/
+│       └── manifest.toml # auto-downloads model on first start if [download] is set
 ├── data/                 # shared volume – DB, recordings, extracted clips
 │   ├── birds.db          # SQLite database (created automatically)
 │   └── extracted/        # audio clips + spectrograms (created automatically)
@@ -380,45 +312,14 @@ services:
       - /proc/asound:/run/asound:ro   # ALSA card-name → number resolution
 
   # ── Model inference & analysis ──────────────────────────────────────
-  # Run one processing container per model.  Each filters by MODEL_SLUGS
-  # so only its manifest is loaded.  All share the same models + data
-  # volumes and coordinate deletion via the DB.
-  processing-birdnet:
+  processing:
     image: fede2/gaia-audio-processing
     restart: unless-stopped
     network_mode: host
     volumes:
       - ./gaia.conf:/etc/gaia/gaia.conf:ro
-      - ./models:/models
-      - ./data:/data
-    environment:
-      - MODEL_SLUGS=birdnet
-      - PROCESSING_INSTANCE=birdnet
-
-  processing-perch:
-    image: fede2/gaia-audio-processing
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./gaia.conf:/etc/gaia/gaia.conf:ro
-      - ./models:/models
-      - ./data:/data
-    environment:
-      - MODEL_SLUGS=perch
-      - PROCESSING_INSTANCE=perch
-
-  # Optional: requires a 256 kHz ultrasonic microphone
-  # processing-batdetect2:
-  #   image: fede2/gaia-audio-processing
-  #   restart: unless-stopped
-  #   network_mode: host
-  #   volumes:
-  #     - ./gaia.conf:/etc/gaia/gaia.conf:ro
-  #     - ./models:/models
-  #     - ./data:/data
-  #   environment:
-  #     - MODEL_SLUGS=batdetect2
-  #     - PROCESSING_INSTANCE=batdetect2
+      - ./models:/models            # model dirs with manifest.toml
+      - ./data:/data                # DB + extracted clips (read-write)
 
   # ── Web dashboard ──────────────────────────────────────────────────
   web:

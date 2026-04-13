@@ -27,22 +27,6 @@ meta = next(
 assert meta, "meta-model.tflite not found in TFLite zip"
 shutil.copy2(meta, OUTPUT)
 
-# Also extract en_us.txt (V2.4 species labels) for reuse by birdnet3.
-labels = next(
-    (
-        os.path.join(r, f)
-        for r, _, fs in os.walk("/convert/tflite_raw")
-        for f in fs
-        if f == "en_us.txt"
-    ),
-    None,
-)
-if labels:
-    shutil.copy2(labels, "/convert/en_us.txt")
-    print(f"Extracted labels: {os.path.getsize('/convert/en_us.txt')} bytes → /convert/en_us.txt")
-else:
-    print("WARNING: en_us.txt not found in TFLite zip")
-
 os.remove("tflite.zip")
 shutil.rmtree("/convert/tflite_raw")
 print(f"Extracted: {os.path.getsize(OUTPUT)} bytes → {OUTPUT}")

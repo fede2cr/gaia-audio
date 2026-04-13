@@ -3,34 +3,26 @@
 //! Evolved from `birdnet-server/src/analysis.rs`.  Now works with multiple
 //! models (one per domain) and tags each detection with its domain.
 
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::Datelike;
 use tracing::{debug, info, warn};
 
 use gaia_common::audio;
 use gaia_common::config::Config;
-use gaia_common::detection::{normalize_sci_name, Detection, ParsedFileName};
+use gaia_common::detection::{Detection, ParsedFileName};
 
-use crate::live_status::{self, LivePrediction};
 use crate::model::{self, LoadedModel, Prediction};
-use crate::agreement::{self, ModelWeight};
-use crate::taxonomy;
 use crate::ReportPayload;
 
 /// Process a single WAV file through all loaded models.
 pub fn process_file(
     file_path: &Path,
-    models: &mut [LoadedModel],
+    models: &[LoadedModel],
     config: &Config,
     report_tx: &std::sync::mpsc::SyncSender<ReportPayload>,
     source_node: &str,
 ) -> Result<()> {
-    let started = Instant::now();
-
     // Skip empty files
     let meta = std::fs::metadata(file_path)?;
     if meta.len() == 0 {
@@ -44,127 +36,11 @@ pub fn process_file(
         .with_context(|| format!("Cannot parse filename: {}", file_path.display()))?;
 
     let mut all_detections = Vec::new();
-    // Collect the top raw predictions across models for the live feed.
-    let mut live_predictions: Vec<LivePrediction> = Vec::new();
 
-    // Read the set of enabled models from Redis (managed in Settings).
-    // An empty set means the Redis key is missing — treat as "all models
-    // are enabled" (backward-compat with deployments not yet seeded).
-    let enabled_state = crate::kv::get_enabled_models_state();
-    let all_enabled = enabled_state.is_none();
-    let enabled: Vec<String> = enabled_state.unwrap_or_default();
-
-    // ── shared species-range data ────────────────────────────────────
-    // Pre-compute the species-range list from models that have a
-    // metadata model (e.g. BirdNET V2.4).  Models without their own
-    // metadata model (e.g. Perch) will use this shared list so that
-    // they also benefit from geographic filtering.
-    //
-    // We also collect the full set of bird label names from those
-    // models so that, for models lacking a `class` column in their
-    // labels (like Perch), we can tell birds from non-birds and only
-    // apply the geo filter to bird species.
-    let mut shared_species_range: Vec<String> = Vec::new();
-    let mut known_bird_labels: HashSet<String> = HashSet::new();
-    // Shared common-name map: merge names from all models so that any
-    // model (e.g. Perch) that lacks its own language file still gets
-    // proper common names from models that have one (e.g. BirdNET).
-    let mut shared_common_names: HashMap<String, String> = HashMap::new();
-    for model in models.iter_mut() {
-        if !all_enabled && !enabled.contains(&model.manifest.slug()) {
-            continue;
-        }
-        // Collect common names from every model.
-        let model_names = model::load_language(
-            &model.manifest.language_dir(), &config.database_lang,
-        ).unwrap_or_default();
-        for (sci, com) in &model_names {
-            let norm = taxonomy::canonical_species_name(&gaia_common::detection::normalize_sci_name(sci));
-            shared_common_names.entry(norm).or_insert_with(|| com.clone());
-        }
-        // Also include CSV-parsed common names.
-        for (sci, com) in model.csv_common_names() {
-            let norm = taxonomy::canonical_species_name(&gaia_common::detection::normalize_sci_name(sci));
-            shared_common_names.entry(norm).or_insert_with(|| com.clone());
-        }
-        if model.has_species_range_model() {
-            let list = model.get_species_list(
-                config.latitude,
-                config.longitude,
-                file.week(),
-            );
-            if !list.is_empty() && shared_species_range.is_empty() {
-                shared_species_range = list;
-            }
-            // All labels from a model that ships a species-range model are
-            // bird species (BirdNET V2.4's label set is bird-only).
-            for label in model.labels() {
-                // BirdNET labels: "Sci Name_Common Name" or just "Sci Name".
-                let sci = label.split('_').next().unwrap_or(label);
-                known_bird_labels.insert(taxonomy::canonical_species_name(&normalize_sci_name(sci)));
-            }
-        }
-    }
-
-    for model in models.iter_mut() {
-        if !all_enabled && !enabled.contains(&model.manifest.slug()) {
-            debug!("Skipping disabled model: {}", model.manifest.manifest.model.name);
-            continue;
-        }
-        let (detections, top_preds) = run_analysis(
-            &file, model, config,
-            &shared_species_range, &known_bird_labels,
-            &shared_common_names,
-        )?;
+    for model in models {
+        let detections = run_analysis(&file, model, config)?;
         all_detections.extend(detections);
-        live_predictions.extend(top_preds);
     }
-
-    // ── Cross-model agreement scoring ────────────────────────────────
-    // Compute weighted agreement scores across all models that
-    // processed this file.  BirdNET V2.4 (trust_weight=1.0) carries
-    // more weight than beta models (trust_weight=0.5).
-    {
-        let model_weights: Vec<ModelWeight> = models
-            .iter()
-            .filter(|m| all_enabled || enabled.contains(&m.manifest.slug()))
-            .map(|m| ModelWeight {
-                slug: m.manifest.slug(),
-                trust_weight: m.manifest.manifest.model.trust_weight,
-            })
-            .collect();
-        agreement::score_agreement(&mut all_detections, &model_weights);
-    }
-
-    // ── Update live analysis status ──────────────────────────────────
-    // Read a short chunk of audio at 24 kHz for the live spectrogram.
-    {
-        let live_sr = 24_000u32;
-        match gaia_common::audio::read_audio(file_path, live_sr, 3.0, 0.0) {
-            Ok(chunks) => {
-                let samples: Vec<f32> = chunks.into_iter().flatten().collect();
-                // Keep only the top 5 predictions by confidence.
-                live_predictions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-                live_predictions.truncate(5);
-                let captured_at = file.file_date.format("%Y-%m-%dT%H:%M:%S").to_string();
-                live_status::update(
-                    &file.file_path.file_name().unwrap_or_default().to_string_lossy(),
-                    &samples,
-                    live_sr,
-                    live_predictions,
-                    config.confidence,
-                    &config.colormap,
-                    source_node,
-                    &captured_at,
-                );
-            }
-            Err(e) => {
-                warn!("Cannot read audio for live spectrogram: {e:#}");
-            }
-        }
-    }
-
-    let detection_count = all_detections.len();
 
     report_tx
         .send(ReportPayload {
@@ -174,47 +50,16 @@ pub fn process_file(
         })
         .map_err(|_| anyhow::anyhow!("Reporting channel closed"))?;
 
-    let elapsed = started.elapsed();
-    info!(
-        "Analysis complete: {} (detections={}, elapsed={:.2}s)",
-        file_path.display(),
-        detection_count,
-        elapsed.as_secs_f64()
-    );
-
     Ok(())
 }
 
 /// Core analysis logic for a single model.
-///
-/// Returns the confident detections and the top raw predictions (for live feed).
-///
-/// `shared_species_range`: species-range list pre-computed from models
-/// that have a metadata model (e.g. BirdNET V2.4).  Used as a fallback
-/// when this model lacks its own metadata model.
-///
-/// `known_bird_labels`: scientific names from bird-only models so that
-/// we can distinguish bird vs. non-bird species in models that lack a
-/// taxonomic `class` column (e.g. Perch).
-///
-/// `shared_common_names`: merged common-name map from all models so
-/// that models without their own language file (e.g. Perch) can still
-/// display proper common names like "Keel-billed Toucan" instead of
-/// falling back to the scientific name.
 fn run_analysis(
     file: &ParsedFileName,
-    model: &mut LoadedModel,
+    model: &LoadedModel,
     config: &Config,
-    shared_species_range: &[String],
-    known_bird_labels: &HashSet<String>,
-    shared_common_names: &HashMap<String, String>,
-) -> Result<(Vec<Detection>, Vec<LivePrediction>)> {
-    let domain = model.domain().to_string();
-    let class_map = model.csv_classes().clone();
-    let model_slug = model.manifest.slug();
-    let model_name = model.manifest.manifest.model.name.clone();
-    // Tag for log messages: "BirdNET V2.4/birds" or "Google Perch 2.0/wildlife"
-    let tag = format!("{model_name}/{domain}");
+) -> Result<Vec<Detection>> {
+    let domain = model.domain();
 
     // ── custom species lists ─────────────────────────────────────────
     let base = std::env::var("GAIA_DIR").unwrap_or_else(|_| "/app".to_string());
@@ -222,35 +67,13 @@ fn run_analysis(
         model::load_species_list(Path::new(&base).join("include_species_list.txt").as_path());
     let exclude_list =
         model::load_species_list(Path::new(&base).join("exclude_species_list.txt").as_path());
-    let mut whitelist =
+    let whitelist =
         model::load_species_list(Path::new(&base).join("whitelist_species_list.txt").as_path());
 
-    // Merge in Redis-based exclusion overrides (species confirmed via the
-    // web UI by an ornithologist).  These bypass the occurrence threshold
-    // just like the file-based whitelist.
-    let db_overrides = crate::kv::load_exclusion_overrides();
-    for sp in db_overrides {
-        if !whitelist.contains(&sp) {
-            whitelist.push(sp);
-        }
-    }
-
     // ── language map ─────────────────────────────────────────────────
-    let mut names =
+    let names =
         model::load_language(&model.manifest.language_dir(), &config.database_lang)
             .unwrap_or_default();
-    // Fallback: when no language JSON exists (e.g. BirdNET+ V3.0), use
-    // common names parsed from the CSV labels file.
-    if names.is_empty() {
-        names = model.csv_common_names().clone();
-    }
-    // Merge in shared common names from other models.  This ensures that
-    // models without their own language file (e.g. Perch) still show
-    // "Keel-billed Toucan" instead of "Ramphastos sulfuratus" as the
-    // common name.  Existing names take priority — only fill gaps.
-    for (sci, com) in shared_common_names {
-        names.entry(sci.clone()).or_insert_with(|| com.clone());
-    }
 
     // ── read audio ───────────────────────────────────────────────────
     let chunks = match audio::read_audio(
@@ -261,36 +84,15 @@ fn run_analysis(
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("[{tag}] Error reading audio: {e}");
-            return Ok((vec![], vec![]));
+            tracing::error!("[{domain}] Error reading audio: {e}");
+            return Ok(vec![]);
         }
     };
 
     // ── run inference on each chunk ──────────────────────────────────
     let mut raw_detections: Vec<Vec<Prediction>> = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
+    for chunk in &chunks {
         let preds = model.predict(chunk, config.latitude, config.longitude, file.week())?;
-        // Log top-3 raw scores so operators can tell whether the model
-        // produces meaningful output.
-        if let Some(top) = preds.first() {
-            let top3: Vec<String> = preds.iter().take(3)
-                .map(|(name, conf)| format!("{name}={conf:.4}"))
-                .collect();
-            // Log at info for the first chunk so operators always see
-            // what the model is producing.  Subsequent chunks stay at
-            // debug to avoid flooding.
-            if i == 0 {
-                info!("[{tag}] chunk {i}: top = [{}]", top3.join(", "));
-            } else {
-                debug!("[{tag}] chunk {i}: top = [{}]", top3.join(", "));
-            }
-            if top.1 >= config.confidence {
-                info!(
-                    "[{tag}] chunk {i}: {} ({:.1}%) ≥ threshold {:.0}%",
-                    top.0, top.1 * 100.0, config.confidence * 100.0
-                );
-            }
-        }
         raw_detections.push(preds);
     }
 
@@ -310,92 +112,14 @@ fn run_analysis(
         pred_start = pred_end - config.overlap;
     }
 
-    // ── species-range model (location-based filtering) ──────────────
-    let own_species_list = model.get_species_list(
-        config.latitude,
-        config.longitude,
-        file.week(),
-    );
-    // Use the model's own species-range list if available; otherwise
-    // fall back to the shared list from another model (e.g. BirdNET's
-    // metadata model providing geographic filtering for Perch).
-    let predicted_species_list = if !own_species_list.is_empty() {
-        &own_species_list
-    } else {
-        shared_species_range
-    };
-    let predicted_species_set: HashSet<String> = predicted_species_list
-        .iter()
-        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
-        .collect();
-    let include_set: HashSet<String> = include_list
-        .iter()
-        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
-        .collect();
-    let exclude_set: HashSet<String> = exclude_list
-        .iter()
-        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
-        .collect();
-    let whitelist_set: HashSet<String> = whitelist
-        .iter()
-        .map(|s| taxonomy::canonical_species_name(&normalize_sci_name(s)))
-        .collect();
-    let class_map_norm: HashMap<String, String> = class_map
-        .iter()
-        .map(|(k, v)| {
-            (
-                taxonomy::canonical_species_name(&normalize_sci_name(k)),
-                taxonomy::normalize_classification(v),
-            )
-        })
-        .collect();
-    let using_shared = own_species_list.is_empty() && !shared_species_range.is_empty();
-
-    if !predicted_species_list.is_empty() {
-        if using_shared {
-            info!(
-                "[{tag}] Using shared species range filter: {} species expected at ({}, {}) week {}",
-                predicted_species_list.len(),
-                config.latitude,
-                config.longitude,
-                file.week(),
-            );
-        } else {
-            info!(
-                "[{tag}] Species range model: {} species expected at ({}, {}) week {}",
-                predicted_species_list.len(),
-                config.latitude,
-                config.longitude,
-                file.week(),
-            );
-        }
-    } else if config.latitude != -1.0 && config.longitude != -1.0 {
-        info!(
-            "[{tag}] No species-range model loaded — accepting all species"
-        );
-    }
-
-    // Log static range file availability (first file only).
-    {
-        let static_ranges = crate::species_range::global();
-        if !static_ranges.is_empty() {
-            let at_loc = static_ranges.species_at(
-                config.latitude, config.longitude, file.file_date.month(),
-            );
-            debug!(
-                "[{tag}] Static range file: {} total, {} at location month {}",
-                static_ranges.len(), at_loc.len(), file.file_date.month(),
-            );
-        }
-    }
-
     // ── apply confidence threshold + species filters ─────────────────
+    let predicted_species_list: Vec<String> = vec![];
 
     let mut confident_detections = Vec::new();
     for (start, end, entries) in &labeled {
         if let Some((sci_name, confidence)) = entries.first() {
             debug!(
-                "[{tag}] {start:.1}-{end:.1}: {sci_name} ({} = {confidence:.4})",
+                "[{domain}] {start:.1}-{end:.1}: {sci_name} ({} = {confidence:.4})",
                 names.get(sci_name.as_str()).unwrap_or(sci_name)
             );
         }
@@ -405,156 +129,46 @@ fn run_analysis(
                 continue;
             }
 
-            let sci_norm = normalize_sci_name(sci_name);
-            let sci_canonical = taxonomy::canonical_species_name(&sci_norm);
-
             let com_name = names
                 .get(sci_name.as_str())
-                .or_else(|| names.get(sci_norm.as_str()))
-                .or_else(|| names.get(sci_canonical.as_str()))
                 .cloned()
                 .unwrap_or_else(|| sci_name.clone());
 
-            if !include_set.is_empty() && !include_set.contains(sci_canonical.as_str()) {
-                warn!("[{tag}] Excluded (not in include list): {sci_name}");
+            if !include_list.is_empty() && !include_list.contains(sci_name) {
+                warn!("[{domain}] Excluded (not in include list): {sci_name}");
                 continue;
             }
-            if !exclude_set.is_empty() && exclude_set.contains(sci_canonical.as_str()) {
-                warn!("[{tag}] Excluded (in exclude list): {sci_name}");
+            if !exclude_list.is_empty() && exclude_list.contains(sci_name) {
+                warn!("[{domain}] Excluded (in exclude list): {sci_name}");
+                continue;
+            }
+            if !predicted_species_list.is_empty()
+                && !predicted_species_list.contains(sci_name)
+                && !whitelist.contains(sci_name)
+            {
+                warn!("[{domain}] Excluded (below occurrence threshold): {sci_name}");
                 continue;
             }
 
-            // Species-range filter: if the location model says this species
-            // is unlikely here, still record the detection but flag it as
-            // excluded so an ornithologist can review it later.
-            //
-            // The metadata model (V2.4) only knows about birds.  When
-            // BirdNET+ V3.0 detects non-bird species (Mammalia, Insecta,
-            // …) they would always be marked excluded because they are
-            // absent from the bird-only occurrence list.  Skip the check
-            // for species whose taxonomic class is not Aves.
-            //
-            // For models without a `class` column (e.g. Perch), fall back
-            // to checking if the species appears in the label set of a
-            // bird-only model (known_bird_labels).  Non-bird Perch
-            // species (crickets, frogs, …) would not be in that set and
-            // should pass through unfiltered unless the static range file
-            // says otherwise.
-            let class_is_bird = class_map
-                .get(sci_name.as_str())
-                .or_else(|| class_map_norm.get(sci_canonical.as_str()))
-                .map(|cls| taxonomy::is_bird_class(cls));
-            let known_bird = known_bird_labels.contains(sci_canonical.as_str());
-
-            let is_bird = match class_is_bird {
-                // If class says bird, trust it. If class is ambiguous or
-                // non-bird but this species is known in bird-only labels,
-                // trust the bird reference set (BirdNET V2.4 baseline).
-                Some(true) => true,
-                Some(false) => known_bird,
-                None => {
-                    if !known_bird_labels.is_empty() {
-                        known_bird
-                    } else {
-                        // No class info and no bird reference set — assume bird
-                        // for backward compatibility (matches previous default).
-                        true
-                    }
-                }
-            };
-
-            // Check the neural species-range model (birds).
-            let excluded_by_range_model = is_bird
-                && !predicted_species_set.is_empty()
-                && !predicted_species_set.contains(sci_canonical.as_str())
-                && !whitelist_set.contains(sci_canonical.as_str());
-
-            // Check the static CSV range file (non-birds: insects, frogs, bats, etc.).
-            let static_ranges = crate::species_range::global();
-            let excluded_by_static = if !is_bird && !static_ranges.is_empty() {
-                match static_ranges.check(sci_canonical.as_str(), config.latitude, config.longitude, file.file_date.month()) {
-                    Some(false) => !whitelist_set.contains(sci_canonical.as_str()),
-                    _ => false, // in range, or not in file → accept
-                }
-            } else {
-                false
-            };
-
-            let excluded = excluded_by_range_model || excluded_by_static;
-
-            if excluded {
-                let reason = if excluded_by_static {
-                    "out of static range"
-                } else {
-                    "below occurrence threshold"
-                };
-                warn!(
-                    "[{tag}] Recording excluded detection ({reason}): {sci_name} ({:.1}%)",
-                    confidence * 100.0
-                );
-            }
-
-            // Use per-species taxonomic class when the labels CSV
-            // provides one (e.g. BirdNET+ V3.0: Aves, Mammalia, …),
-            // otherwise fall back to the model-wide domain.
-            let det_domain = taxonomy::class_for_species(sci_canonical.as_str()).or_else(|| {
-                class_map
-                .get(sci_name.as_str())
-                .or_else(|| class_map_norm.get(sci_canonical.as_str()))
-                .map(|c| taxonomy::normalize_classification(c))
-            }).unwrap_or_else(|| taxonomy::normalize_classification(&domain));
-
-            let mut det = Detection::new(
-                &det_domain,
+            let det = Detection::new(
+                domain,
                 file.file_date,
                 *start,
                 *end,
-                &sci_canonical,
+                sci_name,
                 &com_name,
                 *confidence,
             );
-            det.excluded = excluded;
-            det.model_slug = model_slug.clone();
-            det.model_name = model_name.clone();
-            det.model_beta = model.manifest.manifest.model.beta;
             confident_detections.push(det);
         }
     }
 
-    let included = confident_detections.iter().filter(|d| !d.excluded).count();
-    let excluded = confident_detections.iter().filter(|d| d.excluded).count();
     info!(
-        "[{tag}] {}: {} detection(s) ({included} included, {excluded} excluded)",
+        "[{domain}] {}: {} confident detection(s)",
         file.file_path.display(),
         confident_detections.len()
     );
-
-    // Collect top raw predictions for the live feed (all chunks, top
-    // entry per chunk regardless of confidence threshold).
-    // Skip chunks where the top score is effectively zero — these are
-    // no-signal chunks (sigmoid baseline clamped to 0, or softmax with
-    // negligible probability) and would clutter the live feed.
-    let mut top_preds: Vec<LivePrediction> = Vec::new();
-    for (_start, _end, entries) in &labeled {
-        if let Some((sci_name, confidence)) = entries.first() {
-            if *confidence < 0.01 {
-                continue; // no meaningful signal in this chunk
-            }
-            let com_name = names
-                .get(sci_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| sci_name.clone());
-            top_preds.push(LivePrediction {
-                scientific_name: sci_name.clone(),
-                common_name: com_name,
-                confidence: *confidence,
-                model_slug: model_slug.clone(),
-                model_name: model_name.clone(),
-            });
-        }
-    }
-
-    Ok((confident_detections, top_preds))
+    Ok(confident_detections)
 }
 
 // ── privacy filter ───────────────────────────────────────────────────────
