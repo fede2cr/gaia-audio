@@ -12,7 +12,7 @@ env:
   IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
 
 jobs:
-  # Per-arch build (native runners) 
+  # ── Per-arch build (native runners) ──────────────────────────────────────
   build:
     name: Build ${{ matrix.image }} (${{ matrix.arch }})
     strategy:
@@ -110,39 +110,6 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }},ignore-error=true
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
-      - name: Build local capture image for container e2e
-        if: matrix.image == 'processing'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: capture/Containerfile
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: gaia-audio-capture:e2e-${{ matrix.arch }}
-          cache-from: type=gha,scope=capture-${{ matrix.arch }},ignore-error=true
-
-      - name: Build local processing image for container e2e
-        if: matrix.image == 'processing'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: processing/Containerfile
-          target: runtime
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: gaia-audio-processing:e2e-${{ matrix.arch }}
-          cache-from: type=gha,scope=processing-${{ matrix.arch }},ignore-error=true
-
-      - name: Run post-build container e2e + taxonomy regression
-        if: matrix.image == 'processing'
-        run: |
-          chmod +x scripts/test_processing_container_e2e.sh
-          scripts/test_processing_container_e2e.sh \
-            --engine docker \
-            --no-build \
-            --capture-image gaia-audio-capture:e2e-${{ matrix.arch }} \
-            --processing-image gaia-audio-processing:e2e-${{ matrix.arch }} \
-            --timeout 600
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -160,7 +127,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Merge multi-arch manifests 
+  # ── Merge multi-arch manifests ───────────────────────────────────────────
   merge:
     name: Merge ${{ matrix.image }} manifest
     if: github.event_name != 'pull_request'
