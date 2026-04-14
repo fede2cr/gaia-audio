@@ -12,7 +12,7 @@ env:
   IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/gaia-audio
 
 jobs:
-  # ── Per-arch build (native runners) ──────────────────────────────────────
+  # Per-arch build (native runners) 
   build:
     name: Build ${{ matrix.image }} (${{ matrix.arch }})
     strategy:
@@ -160,7 +160,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Merge multi-arch manifests ───────────────────────────────────────────
+  # Merge multi-arch manifests 
   merge:
     name: Merge ${{ matrix.image }} manifest
     if: github.event_name != 'pull_request'
