@@ -5,7 +5,6 @@
 async fn main() {
     use axum::Router;
     use leptos::prelude::*;
-    use leptos::prelude::ElementChild;
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use std::path::PathBuf;
     use tower_http::services::ServeDir;

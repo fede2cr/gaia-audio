@@ -139,6 +139,58 @@ fn count_parquet_files(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn parquet_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|path| path.extension().map(|x| x == "parquet").unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+fn escape_sql_path(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
+}
+
+fn readable_parquet_files(conn: &duckdb::Connection, dir: &Path) -> Vec<PathBuf> {
+    parquet_files(dir)
+        .into_iter()
+        .filter(|path| {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if size < 12 {
+                tracing::warn!(
+                    "Ignoring unreadable Parquet file {} ({} bytes)",
+                    path.display(),
+                    size
+                );
+                return false;
+            }
+
+            let escaped = escape_sql_path(path);
+            let probe_sql = format!(
+                "CREATE OR REPLACE TEMP VIEW __gaia_parquet_probe AS \
+                 SELECT * FROM read_parquet('{escaped}', union_by_name=true) LIMIT 0"
+            );
+
+            match conn.execute_batch(&probe_sql) {
+                Ok(()) => {
+                    let _ = conn.execute_batch("DROP VIEW IF EXISTS __gaia_parquet_probe");
+                    true
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("DROP VIEW IF EXISTS __gaia_parquet_probe");
+                    tracing::warn!("Ignoring unreadable Parquet file {}: {e}", path.display());
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
 /// Force a view refresh on the next `conn()` call, regardless of throttle.
 pub fn invalidate_view() {
     VIEW_REFRESHED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -176,18 +228,17 @@ pub async fn stats_cache_status(_db_path: &Path) -> Res<CacheSummaryStatus> {
 }
 
 fn refresh_view_inner(conn: &duckdb::Connection, dir: &Path) -> Result<(), duckdb::Error> {
-    let glob = format!("{}/*.parquet", dir.display());
-    // Check if any Parquet files exist — read_parquet errors on empty glob.
-    let has_files = std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().any(|e| {
-            e.path().extension().map(|x| x == "parquet").unwrap_or(false)
-        }))
-        .unwrap_or(false);
+    let readable_files = readable_parquet_files(conn, dir);
 
-    if has_files {
+    if !readable_files.is_empty() {
+        let files_sql = readable_files
+            .iter()
+            .map(|path| format!("'{}'", escape_sql_path(path)))
+            .collect::<Vec<_>>()
+            .join(", ");
         conn.execute_batch(&format!(
             "CREATE OR REPLACE VIEW detections AS \
-             SELECT * FROM read_parquet('{glob}', union_by_name=true)"
+             SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
         ))?;
     } else {
         // Empty placeholder with the correct schema so queries don't fail.
@@ -1404,14 +1455,7 @@ fn normalize_parquet_sci_names(detections_dir: &Path) -> Result<(), Box<dyn std:
         return Ok(());
     }
 
-    let has_files = std::fs::read_dir(detections_dir)
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.path().extension().map(|x| x == "parquet").unwrap_or(false))
-        })
-        .unwrap_or(false);
-
-    if !has_files {
+    if parquet_files(detections_dir).is_empty() {
         std::fs::write(&marker, "no files to migrate\n").ok();
         return Ok(());
     }
@@ -1422,13 +1466,24 @@ fn normalize_parquet_sci_names(detections_dir: &Path) -> Result<(), Box<dyn std:
     );
 
     let t0 = std::time::Instant::now();
-    let glob = format!("{}/*.parquet", detections_dir.display());
 
     let conn = duckdb::Connection::open_in_memory()
         .map_err(|e| format!("migration DuckDB: {e}"))?;
 
+    let readable_files = readable_parquet_files(&conn, detections_dir);
+    if readable_files.is_empty() {
+        std::fs::write(&marker, "no readable parquet files to migrate\n").ok();
+        return Ok(());
+    }
+
+    let files_sql = readable_files
+        .iter()
+        .map(|path| format!("'{}'", escape_sql_path(path)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     conn.execute_batch(&format!(
-        "CREATE TABLE migration AS SELECT * FROM read_parquet('{glob}', union_by_name=true)"
+        "CREATE TABLE migration AS SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
     ))
     .map_err(|e| format!("read parquet: {e}"))?;
 
@@ -1515,4 +1570,72 @@ fn normalize_parquet_sci_names(detections_dir: &Path) -> Result<(), Box<dyn std:
 
     std::fs::write(&marker, format!("{count} rows migrated\n")).ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("gaia-web-{label}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn refresh_view_skips_tiny_invalid_parquet_files() {
+        let dir = make_temp_dir("skip-invalid-parquet");
+        let valid_path = dir.join("valid.parquet");
+        let invalid_path = dir.join("broken.parquet");
+
+        let escaped = valid_path.display().to_string().replace('\'', "''");
+        let writer = duckdb::Connection::open_in_memory().unwrap();
+        writer
+            .execute(
+                &format!(
+                    "COPY (SELECT \
+                        1::BIGINT AS id, \
+                        '2026-04-17'::VARCHAR AS Date, \
+                        '04:35:15'::VARCHAR AS Time, \
+                        'birds'::VARCHAR AS Domain, \
+                        'Turdus merula'::VARCHAR AS Sci_Name, \
+                        'Common Blackbird'::VARCHAR AS Com_Name, \
+                        0.99::DOUBLE AS Confidence, \
+                        0.0::DOUBLE AS Lat, \
+                        0.0::DOUBLE AS Lon, \
+                        0.0::DOUBLE AS Cutoff, \
+                        16::INTEGER AS Week, \
+                        1.0::DOUBLE AS Sens, \
+                        0.0::DOUBLE AS Overlap, \
+                        'clip.wav'::VARCHAR AS File_Name, \
+                        'node-a'::VARCHAR AS Source_Node, \
+                        0::INTEGER AS Excluded, \
+                        'birdnet'::VARCHAR AS Model_Slug, \
+                        'BirdNET'::VARCHAR AS Model_Name, \
+                        0::INTEGER AS Model_Beta, \
+                        0.0::DOUBLE AS Agreement_Score, \
+                        ''::VARCHAR AS Agreement_Models) \
+                     TO '{escaped}' (FORMAT PARQUET)"
+                ),
+                [],
+            )
+            .unwrap();
+
+        std::fs::write(&invalid_path, b"bad").unwrap();
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        refresh_view_inner(&conn, &dir).unwrap();
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM detections", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

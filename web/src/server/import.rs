@@ -1206,7 +1206,7 @@ mod tests {
         ).unwrap();
 
         // Initialise the global DuckDB layer over this directory
-        super::detections_duckdb::initialize(&dir).unwrap();
+        crate::server::detections_duckdb::initialize(&dir).unwrap();
 
         let names = get_existing_filenames().unwrap();
 
@@ -1224,12 +1224,12 @@ mod tests {
     }
 
     /// Run with: BACKUP_PATH=/path/to/backup.tar cargo test -p gaia-web --features ssr -- --ignored test_analyse_real_backup --nocapture
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn test_analyse_real_backup() {
+    async fn test_analyse_real_backup() {
         let path = std::env::var("BACKUP_PATH")
             .expect("Set BACKUP_PATH env var to the .tar backup file");
-        let report = analyse_backup(Path::new(&path)).expect("analyse_backup failed");
+        let report = analyse_backup(Path::new(&path)).await.expect("analyse_backup failed");
 
         println!("\n╔══════════════════════════════════════╗");
         println!("║   BirdNET-Pi Backup Analysis Report  ║");
@@ -1247,7 +1247,7 @@ mod tests {
         println!("╠══════════════════════════════════════╣");
         println!("║ Audio files (mp3): {:>7}", report.audio_file_count);
         println!("║ Spectrograms:      {:>7}", report.spectrogram_count);
-        if let Some(lat) = report.latitude {
+        if report.latitude.is_some() {
             println!("║ Location:          (present, redacted from log)");
         }
         println!("╠══════════════════════════════════════╣");

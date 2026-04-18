@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Gaia Web – Leptos-based dashboard for real-time species monitoring.
 
 pub mod app;
