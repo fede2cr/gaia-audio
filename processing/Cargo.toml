@@ -8,6 +8,10 @@ license.workspace = true
 name = "gaia-processing"
 path = "src/main.rs"
 
+[[bin]]
+name = "validate_onnx"
+path = "src/bin/validate_onnx.rs"
+
 [dependencies]
 gaia-common = { path = "../common" }
 
@@ -26,7 +30,8 @@ tract-tflite.workspace = true
 tract-onnx.workspace = true
 
 # Storage
-rusqlite.workspace = true
+duckdb.workspace = true
+redis.workspace = true
 
 # Spectrogram
 rustfft.workspace = true
@@ -39,3 +44,28 @@ reqwest.workspace = true
 # Archive & checksum (Zenodo model download)
 zip.workspace = true
 md5.workspace = true
+libc = "0.2.184"
+
+# Inference via ONNX Runtime — used as a fallback when tract-onnx
+# cannot load a model (e.g. DFT/STFT ops in BirdNET V3), and as the
+# GPU-accelerated path when GPU hardware is detected at runtime.
+#
+# `load-dynamic` loads libonnxruntime.so at runtime — no native libs
+# needed at build time.  `rocm` and `cuda` just expose the EP types
+# (MIGraphX/ROCm and TensorRT/CUDA respectively); the actual GPU
+# libraries only need to be present at runtime.
+#
+# default-features = false avoids pulling in `download-binaries`
+# (wasteful with `load-dynamic`).  `tracing` gives us the ORT →
+# tracing bridge for structured logging.
+#
+# NOTE: do NOT enable `api-22`.  The api-22 feature adds
+# SessionOptionsSetEpSelectionPolicy(MaxEfficiency) at session builder
+# creation time, which requires EPs to populate an OrtEpDevice list.
+# CPU-only ORT 1.22.x does not implement this, causing:
+#   "Assertion '!this->empty()' failed" → abort.
+# GPU EPs (ROCm/CUDA) register correctly without api-22.
+[dependencies.ort]
+version = "2.0.0-rc.12"
+default-features = false
+features = ["std", "load-dynamic", "rocm", "cuda", "tracing", "api-21"]

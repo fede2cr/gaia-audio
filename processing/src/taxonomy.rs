@@ -63,6 +63,10 @@ pub struct ReviewReport {
 
 static TAXONOMY: OnceLock<TaxonomyTable> = OnceLock::new();
 
+fn normalize_class_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
 impl TaxonomyTable {
     fn empty() -> Self {
         Self::default()
@@ -86,7 +90,7 @@ impl TaxonomyTable {
                 .alias_to_canonical
                 .insert(canonical.clone(), canonical.clone());
 
-            if let Some(class_name) = entry.class.as_ref().map(|c| normalize_classification(c)) {
+            if let Some(class_name) = entry.class.as_ref().map(|c| normalize_class_key(c)) {
                 if !class_name.is_empty() {
                     table.canonical_class.insert(canonical.clone(), class_name);
                 }
@@ -137,7 +141,7 @@ impl TaxonomyTable {
     }
 
     pub fn normalize_classification(&self, raw: &str) -> String {
-        let key = raw.trim().to_ascii_lowercase();
+        let key = normalize_class_key(raw);
         if key.is_empty() {
             return String::new();
         }
@@ -351,5 +355,44 @@ mod tests {
         assert_eq!(t.normalize_classification("AVES"), "birds");
         assert_eq!(t.normalize_classification("BIRDS"), "birds");
         assert_eq!(t.normalize_classification("WILDLIFE"), "wildlife");
+    }
+
+    #[test]
+    fn loads_taxonomy_file_with_class_overrides() {
+        let unique = format!(
+            "gaia-taxonomy-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(
+            &path,
+            r#"
+[[species]]
+canonical = "Cyanocorax morio"
+aliases = ["Psilorhinus morio"]
+class = "AVES"
+
+[class_aliases]
+AVES = "birds"
+"#,
+        )
+        .unwrap();
+
+        let table = TaxonomyTable::load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            table.canonical_species_name("Psilorhinus morio"),
+            "Cyanocorax morio"
+        );
+        assert_eq!(
+            table.class_for_species("Cyanocorax morio").as_deref(),
+            Some("aves")
+        );
+        assert_eq!(table.normalize_classification("AVES"), "birds");
     }
 }

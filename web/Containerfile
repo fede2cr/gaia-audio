@@ -4,7 +4,7 @@ FROM debian:trixie AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     pkg-config libssl-dev \
-    gcc libc6-dev \
+    gcc g++ libc6-dev \
     perl make \
     && rm -rf /var/lib/apt/lists/*
 
@@ -43,13 +43,19 @@ RUN touch common/src/lib.rs web/src/lib.rs web/src/main.rs
 COPY web/public web/public
 
 # Build with cargo-leptos (compiles SSR binary + WASM hydration bundle)
-RUN cd web && cargo leptos build --release
+# Install matching wasm-bindgen-cli from source so cargo-leptos never needs to
+# download a prebuilt binary (no prebuilt binaries exist for arm64).
+ENV LEPTOS_WASM_OPT_VERSION=version_127
+RUN WB_VERSION=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/') \
+    && cargo install wasm-bindgen-cli --version "$WB_VERSION" \
+    && cd web && cargo leptos build --release
 
 # ── Runtime stage ──────────────────────────────────────────────────
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the server binary
@@ -64,6 +70,8 @@ RUN mkdir -p /data
 ENV LEPTOS_SITE_ROOT=/srv/site
 ENV LEPTOS_SITE_ADDR=0.0.0.0:3000
 ENV GAIA_DB_PATH=/data/detections.db
+ENV GAIA_EXTRACTED_DIR=/data/extracted
+ENV GAIA_TAXONOMY_TABLE=/data/_taxonomy/taxonomy_equivalences.toml
 
 EXPOSE 3000
 

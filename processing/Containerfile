@@ -1,10 +1,27 @@
+# ── Build instructions (from projects/gaia-audio/) ──────────────────
+#
+# Default (recommended): build the runtime image.
+#
+#    podman build -f processing/Containerfile --progress=plain \
+#      -t fede2/gaia-audio-processing .
+#
+# Optional: debug intermediate conversion/validation stages:
+#    podman build -f processing/Containerfile --progress=plain --target converter .
+#    podman build -f processing/Containerfile --progress=plain --target birdnet3converter .
+#    podman build -f processing/Containerfile --progress=plain --target tract-validator .
+#
+# The real end-to-end validation now runs AFTER build via:
+#    ./scripts/test_processing_container_e2e.sh --engine podman --no-build \
+#      --capture-image fede2/gaia-audio-capture \
+#      --processing-image fede2/gaia-audio-processing
+#
 # ── Build stage ─────────────────────────────────────────────────────
 FROM debian:trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     pkg-config libssl-dev \
-    gcc libc6-dev \
+    gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
@@ -51,7 +68,7 @@ RUN cargo build --release -p gaia-processing
 FROM python:3.11-slim AS converter
 
 RUN pip install --no-cache-dir 'pycparser<3' && \
-    pip install --no-cache-dir 'tensorflow==2.15.*' tf2onnx onnxruntime
+    pip install --no-cache-dir 'tensorflow==2.15.*' 'onnx<1.17' tf2onnx onnxruntime
 
 WORKDIR /convert
 COPY scripts/convert_keras_to_onnx.py .
@@ -76,43 +93,254 @@ os.remove('keras.zip'); \
 shutil.rmtree('/convert/keras_raw')" && \
     ls -lh /convert/keras/
 
+# Extract en_us.txt labels from the Keras zip (for species-range filtering).
+# The labels/ directory is flattened alongside the .h5 files.
+RUN cp /convert/keras/en_us.txt /convert/en_us.txt && \
+    echo "Extracted labels: $(wc -c < /convert/en_us.txt) bytes → /convert/en_us.txt"
+
 # Convert classifier sub-model to ONNX (Keras → split at concatenate → ONNX)
 RUN python3 convert_keras_to_onnx.py /convert/keras -o audio-model.onnx && \
     mv /convert/keras/audio-model.onnx /convert/audio-model.onnx && \
     ls -lh /convert/audio-model.onnx
 
 # Convert metadata model to ONNX.
-# The meta-model.h5 uses a custom MDataLayer that's hard to deserialise
-# in Keras, so we download the TFLite variant and convert it directly
-# with tf2onnx.  STRIDED_SLICE (which tract-tflite can't run) converts
-# to standard ONNX Slice/Gather ops just fine.
-RUN python3 download_meta_tflite.py && \
-    python3 -m tf2onnx.convert \
-        --tflite /convert/meta-model.tflite \
-        --output /convert/meta-model.onnx && \
-    rm /convert/meta-model.tflite && \
+# The meta-model.h5 uses a custom MDataLayer — our convert script provides
+# a stub implementation so we can convert directly from Keras to ONNX
+# without needing a separate TFLite download.
+RUN python3 convert_keras_to_onnx.py /convert/keras -o meta-model.onnx --meta-only && \
+    mv /convert/keras/meta-model.onnx /convert/meta-model.onnx && \
     ls -lh /convert/meta-model.onnx
 
+# ── BatDetect2 PyTorch → ONNX conversion at build time ────────────
+# Downloads the batdetect2 pip package (includes the ~7.6 MB PyTorch
+# checkpoint), exports the model to ONNX using torch.onnx.export,
+# and extracts the species class labels.
+#
+# Uses a separate stage with PyTorch to keep the runtime image lean.
+FROM python:3.11-slim AS batconverter
+
+RUN pip install --no-cache-dir batdetect2 onnx onnxruntime onnxscript
+
+WORKDIR /convert
+COPY scripts/convert_batdetect2_to_onnx.py .
+RUN python3 convert_batdetect2_to_onnx.py --output-dir /convert && \
+    ls -lh /convert/batdetect2.onnx /convert/labels.csv
+
+# ── BirdNET+ V3.0 ONNX download at build time ─────────────────────
+# Downloads the original BirdNET+ V3.0 ONNX model from Zenodo and
+# validates ONNX file integrity/structure (MD5 + ONNX checker).
+#
+# We run BirdNET3 through ONNX Runtime (`prefer_ort=true`), so we keep
+# the original graph to preserve ORT numerical behavior.
+FROM python:3.11-slim AS birdnet3converter
+
+RUN pip install --no-cache-dir onnx onnxruntime numpy
+
+WORKDIR /convert
+RUN python3 - <<'PY' && ls -lh /convert/birdnet3.onnx
+import hashlib
+import urllib.request
+import onnx
+
+url = "https://zenodo.org/api/records/18247420/files/BirdNET%2B_V3.0-preview3_Global_11K_FP32.onnx/content"
+out = "/convert/birdnet3.onnx"
+expected_md5 = "7b32222e13fd61114246b46a4c88d09d"
+
+with urllib.request.urlopen(url) as resp, open(out, "wb") as f:
+    while True:
+        chunk = resp.read(1 << 20)
+        if not chunk:
+            break
+        f.write(chunk)
+
+h = hashlib.md5()
+with open(out, "rb") as f:
+    while True:
+        chunk = f.read(1 << 20)
+        if not chunk:
+            break
+        h.update(chunk)
+
+actual = h.hexdigest()
+if actual != expected_md5:
+    raise SystemExit(f"MD5 mismatch: expected {expected_md5}, got {actual}")
+print("BirdNET3 MD5 verified:", actual)
+
+# Structural ONNX validation (deterministic, no runtime session creation).
+model = onnx.load(out)
+onnx.checker.check_model(model)
+print("BirdNET3 ONNX structure check passed")
+PY
+
+# ── ONNX Runtime shared library ───────────────────────────────────
+# When tract-onnx cannot handle a model (e.g. DFT/STFT ops in BirdNET
+# V3, Perch), the processing server falls back to ONNX Runtime via the
+# `ort` crate.
+#
+# IMPORTANT: we extract libonnxruntime.so from the Python pip package
+# rather than the GitHub releases tarball.  The pip-bundled build
+# handles DFT/STFT models correctly, while the tarball build hangs
+# indefinitely in CreateSession for those same models.
+#
+# VERSION PIN: ort-sys 2.0.0-rc.12 with `api-22` targets ORT C API v22.
+# Prefer a
+# ROCm-enabled ORT wheel at the same version to keep GPU inference
+# active on AMD hosts; fall back to CPU ORT only when the ROCm wheel is
+# unavailable for the current build platform.
+FROM python:3.11-slim AS ort-download
+ARG TARGETARCH
+RUN set -eux; \
+        if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+            pip install --no-cache-dir 'onnxruntime-rocm==1.22.2.post1' || \
+            pip install --no-cache-dir 'onnxruntime==1.22.1'; \
+        else \
+            pip install --no-cache-dir 'onnxruntime==1.22.1'; \
+        fi && \
+        ORT_LIB=$(find /usr/local/lib -type d -path '*/site-packages/onnxruntime/capi' | head -n1) && \
+        test -n "${ORT_LIB}" && \
+    cp "${ORT_LIB}"/libonnxruntime*.so* /usr/lib/ && \
+    ls -lh /usr/lib/libonnxruntime*.so* && \
+    ldconfig
+
+# CPU-only ORT bundle for build-time validation.
+# This avoids ROCm provider initialization stalls in CI/build containers
+# where AMD runtime devices are not available.
+FROM python:3.11-slim AS ort-download-cpu
+RUN set -eux; \
+    pip install --no-cache-dir 'onnxruntime==1.22.1' && \
+    ORT_LIB=$(find /usr/local/lib -type d -path '*/site-packages/onnxruntime/capi' | head -n1) && \
+    test -n "${ORT_LIB}" && \
+    cp "${ORT_LIB}"/libonnxruntime*.so* /usr/lib/ && \
+    ls -lh /usr/lib/libonnxruntime*.so* && \
+    ldconfig
+
+
+# ── ONNX runtime + tract validator (Rust) ─────────────────────────
+# Rewritten from scripts/validate_onnx.py into native Rust binary
+# `validate_onnx` to reduce Python surface area in the validation path.
+FROM debian:trixie-slim AS onnx-validator
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder      /build/target/release/validate_onnx   /usr/local/bin/validate_onnx
+COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so*      /usr/lib/
+RUN ldconfig
+
+COPY --from=converter          /convert/audio-model.onnx* /validate/
+COPY --from=converter          /convert/meta-model.onnx*  /validate/
+COPY --from=batconverter       /convert/batdetect2.onnx*  /validate/
+COPY --from=birdnet3converter  /convert/birdnet3.onnx*    /validate/
+
+RUN validate_onnx /validate/audio-model.onnx --shape 1,96,511,2 --skip-ort-checks && \
+    validate_onnx /validate/meta-model.onnx --shape 1,3 --skip-ort-checks && \
+    # BatDetect2 uses Resize mode `pytorch_half_pixel` which tract-onnx
+    # cannot currently load. ORT inference is already validated in the
+    # batconverter stage, so we do not duplicate it here where ORT init
+    # can intermittently stall in slim container environments.
+    touch /validate/.onnx-ok
+
+
+# ── tract-onnx dry-run validation ──────────────────────────────────
+# Actually load every ONNX model through tract-onnx (the runtime
+# inference engine) to catch incompatibilities that the Python
+# validator cannot detect — e.g. "shape input is variable", unsupported
+# ops, or broken shape inference.
+#
+# This uses the same code path as the production server (load →
+# optimise → runnable).  Any model that fails here WILL fail at
+# deployment time, so we abort the build early.
+#
+# NOTE: BirdNET+ V3.0 (birdnet3.onnx) uses DFT/STFT ops that
+# tract-onnx does not support — it falls back to ONNX Runtime at
+# runtime.  We skip it here; structure/integrity was already validated
+# in the birdnet3converter stage.
+FROM debian:trixie-slim AS tract-validator
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder    /build/target/release/gaia-processing /usr/local/bin/gaia-processing
+COPY --from=converter    /convert/audio-model.onnx* /validate/
+COPY --from=converter    /convert/meta-model.onnx*  /validate/
+COPY --from=batconverter /convert/batdetect2.onnx*  /validate/
+RUN gaia-processing validate-model \
+        /validate/audio-model.onnx \
+    /validate/meta-model.onnx && \
+    touch /validate/.tract-ok
+
+# Container-level end-to-end verification now runs after the runtime
+# image is built via `scripts/test_processing_container_e2e.sh`.
+# That framework boots the real capture and processing containers,
+# verifies mDNS discovery, processes a seeded example recording, and
+# requires the processing container to exit cleanly.
+
 # ── Runtime stage ──────────────────────────────────────────────────
-# Minimal image: Rust binary + pre-converted ONNX model.
-# No Python, no TensorFlow — all inference runs in native Rust.
-FROM debian:trixie-slim
+# Rust binary + pre-converted ONNX models.  No Python at runtime —
+# all inference (including DFT/STFT models like BirdNET V3 and Perch)
+# runs natively through the `ort` crate with ORT 1.24.2.
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 \
     ca-certificates \
+    ffmpeg \
+    strace \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gaia-processing /usr/local/bin/gaia-processing
 
+# Force Docker to run test stages (they are otherwise skipped because
+# nothing in the final image references them).  These sentinel files
+# are only created when the tests pass.
+COPY --from=onnx-validator    /validate/.onnx-ok    /tmp/.onnx-ok
+COPY --from=tract-validator    /validate/.tract-ok    /tmp/.tract-ok
+
+# ONNX Runtime shared library for native Rust inference.
+# Extracted from the pip onnxruntime package in the ort-download stage.
+COPY --from=ort-download /usr/lib/libonnxruntime*.so* /usr/lib/
+RUN ldconfig
+
+# CPU-only ORT fallback — avoids ROCm/HSA runtime init hangs when
+# GPU providers are not needed or when the ROCm-enabled library
+# stalls during dlopen.  resolve_ort_dylib_path() prefers this
+# library when GAIA_ACCEL is unset; init_ort_environment() retries
+# with it if the primary (ROCm) library times out.
+RUN mkdir -p /usr/lib/ort-cpu
+COPY --from=ort-download-cpu /usr/lib/libonnxruntime*.so* /usr/lib/ort-cpu/
+
 # Pre-converted BirdNET V2.4 classifier ONNX model (~49 MB).
 # At runtime, ensure_onnx_file() copies this to the model directory
 # if the manifest requests audio-model.onnx and it is absent.
-COPY --from=converter /convert/audio-model.onnx /usr/local/share/gaia/models/audio-model.onnx
+COPY --from=converter /convert/audio-model.onnx* /usr/local/share/gaia/models/
 
 # Pre-converted BirdNET V2.4 metadata ONNX model (~28 MB).
 # Location-based species filtering without tract-tflite STRIDED_SLICE issues.
-COPY --from=converter /convert/meta-model.onnx /usr/local/share/gaia/models/meta-model.onnx
+COPY --from=converter /convert/meta-model.onnx* /usr/local/share/gaia/models/
+
+# Pre-converted BatDetect2 ONNX model (~7.6 MB) + species labels.
+# The PyTorch checkpoint is exported to ONNX at build time in the
+# batconverter stage, so no Python/PyTorch is needed at runtime.
+COPY --from=batconverter /convert/batdetect2.onnx* /usr/local/share/gaia/models/
+COPY --from=batconverter /convert/labels.csv        /usr/local/share/gaia/models/batdetect2-labels.csv
+
+# Original BirdNET+ V3.0 ONNX model (~541 MB).
+# At runtime, ensure_onnx_file() copies this to the model directory.
+COPY --from=birdnet3converter /convert/birdnet3.onnx* /usr/local/share/gaia/models/
+
+# Bundle all model manifests so the entrypoint can seed them into the
+# models volume automatically.  Each manifest goes into its own
+# subdirectory matching the slug used at runtime.
+COPY examples/birds_manifest.toml    /usr/local/share/gaia/manifests/birdnet/manifest.toml
+COPY examples/perch_manifest.toml    /usr/local/share/gaia/manifests/perch/manifest.toml
+COPY examples/bats_manifest.toml     /usr/local/share/gaia/manifests/batdetect2/manifest.toml
+COPY examples/birdnet3_manifest.toml /usr/local/share/gaia/manifests/birdnet3/manifest.toml
+COPY examples/taxonomy_equivalences.toml /usr/local/share/gaia/manifests/_taxonomy/taxonomy_equivalences.toml
+# Reuse BirdNET V2.4 metadata model + labels for species-range filtering in V3.
+COPY --from=converter /convert/meta-model.onnx* /usr/local/share/gaia/manifests/birdnet3/
+# The V2.4 meta-model uses V2.4 labels (en_us.txt); bundle them separately
+# so the meta-model output maps to the correct species names.
+COPY --from=converter /convert/en_us.txt /usr/local/share/gaia/manifests/birdnet3/meta-labels.txt
+
+# Seed batdetect2 labels alongside the manifest so entrypoint.sh copies
+# them into /models/batdetect2/ (no-clobber) at container start.
+COPY --from=batconverter /convert/labels.csv /usr/local/share/gaia/manifests/batdetect2/labels.csv
 
 RUN mkdir -p /etc/gaia /data /models
 
@@ -129,9 +357,14 @@ DB_PATH=/data/detections.db\n\
 CAPTURE_SERVER_URL=http://capture:8089\n\
 POLL_INTERVAL_SECS=5\n\
 RECS_DIR=/data\n\
-EXTRACTED=/data/Extracted\n' > /etc/gaia/gaia.conf
+EXTRACTED=/data/extracted\n' > /etc/gaia/gaia.conf
+
+# Entrypoint script seeds bundled manifests into the models volume
+# (no-clobber) before starting the processing server.
+COPY processing/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 VOLUME ["/data", "/models"]
 
-ENTRYPOINT ["gaia-processing"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/etc/gaia/gaia.conf"]

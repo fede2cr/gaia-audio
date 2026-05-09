@@ -11,6 +11,7 @@
 
 [model]
 name = "BirdNET V2.4"
+slug = "birdnet"
 domain = "birds"
 sample_rate = 48000
 chunk_duration = 3.0
@@ -21,6 +22,9 @@ labels_file = "en_us.txt"
 v1_metadata = false
 # Set to true for models like Perch that output raw logits needing softmax
 apply_softmax = false
+# BirdNET's ONNX model is an extracted classifier sub-model that expects
+# precomputed mel-spectrogram input [1, 96, 511, 2], not raw audio.
+onnx_is_classifier = true
 
 [metadata_model]
 enabled = true

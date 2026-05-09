@@ -1,6 +1,8 @@
 //! Monthly calendar grid component with heatmap colouring.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{ElementChild, IntoView};
+use leptos::either::Either;
 
 use crate::model::CalendarDay;
 
@@ -52,13 +54,13 @@ pub fn CalendarGrid(
                    style={format!("--intensity: {}%", intensity)}>
                     <span class="cal-day-num">{day_num}</span>
                     {if total > 0 {
-                        view! {
+                        Either::Left(view! {
                             <span class="cal-day-stats">
                                 {total}" · "{species}" spp"
                             </span>
-                        }.into_view()
+                        })
                     } else {
-                        view! { <span></span> }.into_view()
+                        Either::Right(view! { <span></span> })
                     }}
                 </a>
             }

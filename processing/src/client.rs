@@ -1,4 +1,4 @@
-//! HTTP client that polls capture servers for new WAV recordings.
+//! HTTP client that polls capture servers for new recordings (WAV/Opus).
 //!
 //! When mDNS discovery is available the processing node automatically
 //! finds all capture nodes on the network.  Otherwise it falls back to
@@ -17,25 +17,23 @@ use gaia_common::config::Config;
 use gaia_common::discovery::{DiscoveryHandle, ServiceRole};
 use gaia_common::protocol::RecordingInfo;
 
-use crate::analysis;
-use crate::model::LoadedModel;
-use crate::ReportPayload;
+use crate::WorkItem;
 
 /// How often to re-scan mDNS for new/removed capture nodes.
 const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Poll all known capture servers for new recordings and process them.
+/// Poll all known capture servers for new recordings, download them,
+/// and dispatch work items to the worker pool.
 ///
-/// If `discovery` is `Some`, capture nodes are located (and periodically
-/// refreshed) via mDNS.  If mDNS finds no capture nodes the config's
-/// `capture_server_url` is used as a fallback.
+/// This function only handles downloading and dispatching — the actual
+/// analysis is performed by worker threads that receive `WorkItem`s via
+/// the `work_tx` channel.
 ///
 /// Blocks until `shutdown` is set.
-pub fn poll_and_process(
-    models: &[LoadedModel],
-    config: &Config,
+pub fn poll_and_dispatch(
+    config: &mut Config,
     discovery: Option<&DiscoveryHandle>,
-    report_tx: &SyncSender<ReportPayload>,
+    work_tx: &SyncSender<WorkItem>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -44,12 +42,31 @@ pub fn poll_and_process(
         .build()
         .context("Cannot create HTTP client")?;
 
-    let tmp_dir = config.recs_dir.join("processing_tmp");
+    let instance_suffix = if config.processing_instance.is_empty() {
+        "processing_tmp".to_string()
+    } else {
+        format!("processing_tmp_{}", config.processing_instance)
+    };
+    let tmp_dir = config.recs_dir.join(&instance_suffix);
     std::fs::create_dir_all(&tmp_dir)?;
 
-    // Track which files we've already processed this session.
+    let exit_after_one_batch = std::env::var("GAIA_EXIT_AFTER_ONE_BATCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if exit_after_one_batch {
+        info!(
+            "GAIA_EXIT_AFTER_ONE_BATCH set — the processing container will exit after the first dispatched batch"
+        );
+    }
+
+    // Track which files we've already dispatched this session.
     // Key = "base_url:filename" to avoid collisions across capture nodes.
-    let mut processed: HashSet<String> = HashSet::new();
+    let mut dispatched: HashSet<String> = HashSet::new();
+
+    // Track how many NEW items we actually dispatched per iteration so we
+    // can distinguish "new work to do" from "recordings on disk but
+    // already dispatched".
+    let mut dispatched_this_round: usize;
 
     // Build initial list of capture URLs
     let mut capture_urls = resolve_capture_urls(discovery, config);
@@ -68,7 +85,11 @@ pub fn poll_and_process(
             Err(e) => warn!("[{url}] Not reachable at startup: {e:#}"),
         }
     }
-
+    // Prune processing instances that haven't heartbeated in a while.
+    let pruned = crate::kv::prune_stale_instances(10);
+    if pruned > 0 {
+        info!("Pruned {pruned} stale processing instance(s) from previous runs");
+    }
     let mut last_discovery = Instant::now();
 
     loop {
@@ -76,11 +97,33 @@ pub fn poll_and_process(
             break;
         }
 
-        // Without models we cannot analyse anything.
-        if models.is_empty() {
-            warn!("No models loaded – skipping poll cycle");
-            std::thread::sleep(poll_interval);
-            continue;
+        // ── refresh settings from DB ─────────────────────────────
+        crate::kv::apply_settings_overrides(config);
+
+        // ── heartbeat so coordination layer knows we're alive ────
+        crate::kv::update_heartbeat("default");
+
+        // ── idle when no models are enabled ──────────────────────
+        // The container stays running but does not download or
+        // process files until at least one model is activated in
+        // Settings.  The set is checked every poll interval.
+        let enabled_models = crate::kv::get_enabled_models_state();
+        {
+            static IDLE_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if matches!(enabled_models.as_ref(), Some(v) if v.is_empty()) {
+                if !IDLE_LOGGED.load(Ordering::Relaxed) {
+                    info!("No models enabled — idling (container stays running)");
+                    IDLE_LOGGED.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(poll_interval);
+                continue;
+            } else if IDLE_LOGGED.swap(false, Ordering::Relaxed) {
+                info!(
+                    "Models re-enabled ({} active) — resuming polling",
+                    enabled_models.as_ref().map_or(0, |v| v.len())
+                );
+            }
         }
 
         // ── periodic mDNS re-discovery ───────────────────────────────
@@ -94,7 +137,7 @@ pub fn poll_and_process(
         }
 
         // ── poll each capture server ─────────────────────────────────
-        let mut found_any = false;
+        dispatched_this_round = 0;
 
         for base_url in &capture_urls {
             if shutdown.load(Ordering::Relaxed) {
@@ -113,8 +156,7 @@ pub fn poll_and_process(
                 continue;
             }
 
-            found_any = true;
-            info!(
+            debug!(
                 "[{}] Found {} recording(s) to process",
                 base_url,
                 recordings.len()
@@ -126,7 +168,19 @@ pub fn poll_and_process(
                 }
 
                 let key = format!("{}:{}", base_url, rec.filename);
-                if processed.contains(&key) {
+                if dispatched.contains(&key) {
+                    continue;
+                }
+
+                // Skip files this instance already processed in a previous
+                // run.  The dispatched HashSet is in-memory only and lost on
+                // restart, but the Redis processed set persists (with TTL).
+                if crate::kv::is_file_processed(&rec.filename, "default") {
+                    debug!(
+                        "[{}] Skipping {} — already processed by this instance",
+                        base_url, rec.filename
+                    );
+                    dispatched.insert(key);
                     continue;
                 }
 
@@ -145,38 +199,51 @@ pub fn poll_and_process(
                     }
                 }
 
-                // ── process ──────────────────────────────────────────
-                if let Err(e) =
-                    analysis::process_file(&local_path, models, config, report_tx, base_url)
-                {
-                    error!("Error processing {}: {e:#}", rec.filename);
+                // ── dispatch to worker pool ──────────────────────────
+                let item = WorkItem {
+                    local_path,
+                    filename: rec.filename.clone(),
+                    base_url: base_url.clone(),
+                    config_snapshot: config.clone(),
+                };
+                if work_tx.send(item).is_err() {
+                    warn!("Work channel closed — stopping dispatch");
+                    return Ok(());
                 }
 
-                // ── clean up local temp file ─────────────────────────
-                std::fs::remove_file(&local_path).ok();
-
-                // ── ask capture server to delete ─────────────────────
-                if let Err(e) = delete_recording(&client, base_url, &rec.filename) {
-                    warn!(
-                        "Failed to delete {} from {}: {e}",
-                        rec.filename, base_url
-                    );
-                }
-
-                processed.insert(key);
+                dispatched.insert(key);
+                dispatched_this_round += 1;
             }
         }
 
-        if !found_any {
-            debug!("No recordings on any capture node – sleeping");
+        if dispatched_this_round > 0 {
+            info!(
+                "Dispatched {dispatched_this_round} new recording(s) for processing"
+            );
+            if exit_after_one_batch {
+                info!(
+                    "GAIA_EXIT_AFTER_ONE_BATCH set — letting the current batch finish, then stopping"
+                );
+                shutdown.store(true, Ordering::Relaxed);
+            }
         }
 
-        // Prevent unbounded growth of the processed set
-        if processed.len() > 10_000 {
-            processed.clear();
+        // Prevent unbounded growth of the dispatched set
+        if dispatched.len() > 10_000 {
+            dispatched.clear();
+            crate::kv::cleanup_processing_log();
+            crate::kv::prune_stale_instances(10);
         }
 
-        std::thread::sleep(poll_interval);
+        // Only skip the sleep when we actually dispatched new work
+        // this round — there may be more files arriving soon.  When
+        // recordings exist on the capture node but have already been
+        // dispatched, sleeping prevents a busy-loop that would spam
+        // the logs and waste CPU.
+        if dispatched_this_round == 0 {
+            debug!("No new recordings to dispatch – sleeping {poll_interval:?}");
+            std::thread::sleep(poll_interval);
+        }
     }
 
     info!("Polling loop stopped");
@@ -232,6 +299,10 @@ fn list_recordings(
     }
 
     let recordings: Vec<RecordingInfo> = resp.json().context("Parse recordings JSON")?;
+    debug!(
+        "[{base_url}] GET /api/recordings → {} file(s)",
+        recordings.len()
+    );
     Ok(recordings)
 }
 
@@ -242,6 +313,7 @@ fn download_recording(
     out_path: &Path,
 ) -> Result<()> {
     let url = format!("{base_url}/api/recordings/{filename}");
+    let t0 = Instant::now();
     let resp = client.get(&url).send().context("GET recording")?;
 
     if !resp.status().is_success() {
@@ -253,10 +325,26 @@ fn download_recording(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(out_path, &bytes)?;
+    let elapsed = t0.elapsed();
+    let size_mb = bytes.len() as f64 / 1_048_576.0;
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        size_mb / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    debug!(
+        "Downloaded {} → {} ({:.2} MB in {:.1}s, {:.1} MB/s)",
+        filename,
+        out_path.display(),
+        size_mb,
+        elapsed.as_secs_f64(),
+        rate
+    );
     info!("Downloaded {} → {}", filename, out_path.display());
     Ok(())
 }
 
+#[allow(dead_code)]
 fn delete_recording(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -266,7 +354,11 @@ fn delete_recording(
     let resp = client.delete(&url).send().context("DELETE recording")?;
 
     if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-        debug!("Deleted {filename} from capture server");
+        debug!(
+            "DELETE {filename} from capture server → {} ({})",
+            resp.status(),
+            if resp.status().is_success() { "removed" } else { "already gone" }
+        );
         Ok(())
     } else {
         anyhow::bail!("DELETE {} returned {}", url, resp.status())

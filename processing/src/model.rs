@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::manifest::ResolvedManifest;
 use gaia_common::config::Config;
+use gaia_common::detection::normalize_sci_name;
 
 // ── constants ────────────────────────────────────────────────────────────
 
@@ -33,15 +34,33 @@ const MIN_TFLITE_SIZE: u64 = 1024;
 
 /// A loaded model ready for inference, built from a manifest.
 pub struct LoadedModel {
-    runner: TypedRunnableModel<TypedModel>,
+    /// tract-onnx or tract-tflite runner.  `None` when the model was
+    /// loaded through the ORT fallback (tract could not handle it).
+    runner: Option<TypedRunnableModel<TypedModel>>,
+    /// ONNX Runtime session – used when tract cannot load the model
+    /// (e.g. unsupported DFT/STFT operators in BirdNET V3), **or** when
+    /// `GAIA_ACCEL` is set for GPU-accelerated inference (rocm or cuda).
+    /// Requires `libonnxruntime.so` to be available at runtime.
+    ort_session: Option<crate::accel::OrtSession>,
     meta_model: Option<MetaDataModel>,
     labels: Vec<String>,
+    /// Common-name map parsed from CSV labels (sci_name → com_name).
+    /// Used as fallback when no JSON language file is available (e.g.
+    /// BirdNET+ V3.0).
+    csv_common_names: HashMap<String, String>,
+    /// Taxonomic class map parsed from CSV labels (sci_name → class).
+    /// Populated for models whose label file has a `class` column
+    /// (e.g. BirdNET+ V3.0: Aves, Mammalia, Insecta, …).
+    csv_classes: HashMap<String, String>,
     pub manifest: ResolvedManifest,
     sensitivity: f64,
     /// When `true` the ONNX model is a classifier-only sub-model that
     /// expects a mel-spectrogram input `[1, 96, 511, 2]` instead of raw
     /// audio `[1, N]`.  The mel computation is handled by [`crate::mel`].
     onnx_classifier: bool,
+    /// One-time diagnostic flag: log raw logit statistics on the first
+    /// inference so operators can verify the model's output scale.
+    first_predict_logged: bool,
 }
 
 /// Species-occurrence metadata model (filters by location/week).
@@ -169,22 +188,188 @@ fn validate_tflite_file(path: &Path) -> Result<()> {
 /// otherwise falls back to TFLite.
 pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<LoadedModel> {
     // ── choose format ────────────────────────────────────────────────
-    let (runner, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
+    let (runner, ort_session, onnx_classifier) = if let Some(onnx_path) = resolved.onnx_path() {
         if onnx_path.exists() {
-            info!("Loading ONNX classifier from {}", onnx_path.display());
-            (load_onnx_runner(&onnx_path)?, true)
+            let is_classifier = resolved.manifest.model.onnx_is_classifier;
+            let prefer_ort = resolved.manifest.model.prefer_ort;
+            info!(
+                "Loading ONNX model from {} (classifier={}, prefer_ort={})",
+                onnx_path.display(),
+                is_classifier,
+                prefer_ort,
+            );
+
+            // 0. If the manifest says prefer_ort, skip tract entirely.
+            //    Some models load in tract but produce incorrect inference
+            //    (e.g. patched DFT → all-zero output, MatMul-replaced DFT
+            //    → input-independent predictions).
+            //
+            //    Always use CPU-only ORT for prefer_ort models: these
+            //    models have exotic ops (DFT, STFT) that MIGraphX /
+            //    TensorRT cannot compile — attempting GPU compilation
+            //    hangs indefinitely with no benefit.  CPU inference is
+            //    fast enough (~66 ms per chunk).
+            //
+            //    If ORT fails (missing library, init hang, etc.), fall
+            //    through to tract as a last resort so the pipeline keeps
+            //    running with the remaining models.
+            if prefer_ort {
+                if crate::accel::is_gpu_requested() {
+                    info!(
+                        "GAIA_ACCEL requested, but {} uses prefer_ort; forcing CPU-only ORT to avoid ROCm/CUDA stalls on this model",
+                        onnx_path.display()
+                    );
+                }
+                let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
+                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                    Ok(sess) => {
+                        info!(
+                            "ORT active (prefer_ort, CPU-only) for {}",
+                            onnx_path.display()
+                        );
+                        (None, Some(sess), is_classifier)
+                    }
+                    Err(cpu_e) => {
+                        tracing::warn!(
+                            "prefer_ort ORT session failed ({cpu_e:#}); \
+                             falling back to tract-onnx (inference may be degraded)"
+                        );
+                        // Try tract as last resort — some models produce
+                        // degraded output but still provide value.
+                        match load_onnx_runner(&onnx_path) {
+                            Ok(r) => {
+                                tracing::warn!(
+                                    "tract-onnx loaded {} as fallback (prefer_ort failed)",
+                                    onnx_path.display()
+                                );
+                                (Some(r), None, is_classifier)
+                            }
+                            Err(tract_e) => {
+                                tracing::error!(
+                                    "Both ORT and tract failed for {}: ORT={cpu_e:#}, tract={tract_e:#}",
+                                    onnx_path.display()
+                                );
+                                return Err(cpu_e.context(
+                                    "prefer_ort is set but both ORT and tract-onnx failed"
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+
+            // 1. Try tract-onnx.
+            let tract_result = load_onnx_runner(&onnx_path);
+
+            // 2. If tract failed, try the baked (patched) copy.
+            let tract_result = match tract_result {
+                ok @ Ok(_) => ok,
+                Err(e) => {
+                    let fallback = onnx_path.file_name().map(|f| {
+                        Path::new(crate::download::BAKED_MODELS_DIR).join(f)
+                    });
+                    if let Some(baked) = fallback.filter(|p| p.exists() && *p != onnx_path) {
+                        tracing::warn!(
+                            "ONNX load failed ({e:#}); retrying with baked model at {}",
+                            baked.display()
+                        );
+                        if let Err(copy_err) = std::fs::copy(&baked, &onnx_path) {
+                            tracing::warn!(
+                                "Could not overwrite {} with baked model: {copy_err}",
+                                onnx_path.display()
+                            );
+                        }
+                        load_onnx_runner(&onnx_path)
+                    } else {
+                        Err(e)
+                    }
+                }
+            };
+
+            // 3. If tract still failed, try ONNX Runtime CPU fallback.
+            //    This handles models with operators tract cannot optimise
+            //    (e.g. DFT/STFT in BirdNET V3).
+            //
+            //    We force CPU-only here: models that fail tract have
+            //    exotic ops (DFT, STFT) that MIGraphX / TensorRT
+            //    cannot compile efficiently — attempting GPU compilation
+            //    can hang for a very long time with no benefit.
+            match tract_result {
+                Ok(r) => (Some(r), None, is_classifier),
+                Err(tract_err) => {
+                    tracing::warn!(
+                        "tract-onnx failed for {} ({tract_err:#}); \
+                         trying ONNX Runtime CPU-only fallback",
+                        onnx_path.display()
+                    );
+                    let cache_dir = onnx_path.parent().unwrap_or(Path::new("/tmp")).join(".ort-cache");
+                    if crate::accel::is_gpu_requested() {
+                        match crate::accel::OrtSession::new(&onnx_path, &cache_dir) {
+                            Ok(sess) => {
+                                info!(
+                                    "ONNX Runtime fallback active for {}",
+                                    onnx_path.display()
+                                );
+                                (None, Some(sess), is_classifier)
+                            }
+                            Err(ort_err) => {
+                                tracing::warn!(
+                                    "ONNX Runtime accelerated fallback failed ({ort_err:#}); retrying CPU-only"
+                                );
+                                match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                                    Ok(sess) => {
+                                        info!(
+                                            "ONNX Runtime CPU fallback active for {}",
+                                            onnx_path.display()
+                                        );
+                                        (None, Some(sess), is_classifier)
+                                    }
+                                    Err(cpu_err) => {
+                                        tracing::error!(
+                                            "ONNX Runtime fallback also failed: {cpu_err:#}"
+                                        );
+                                        return Err(tract_err.context(
+                                            "tract-onnx failed and ONNX Runtime fallback \
+                                             is unavailable (is libonnxruntime.so installed?)"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match crate::accel::OrtSession::new_cpu(&onnx_path, &cache_dir) {
+                            Ok(sess) => {
+                                info!(
+                                    "ONNX Runtime CPU fallback active for {}",
+                                    onnx_path.display()
+                                );
+                                (None, Some(sess), is_classifier)
+                            }
+                            Err(cpu_err) => {
+                                tracing::error!(
+                                    "ONNX Runtime fallback also failed: {cpu_err:#}"
+                                );
+                                return Err(tract_err.context(
+                                    "tract-onnx failed and ONNX Runtime fallback \
+                                     is unavailable (is libonnxruntime.so installed?)"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            } // else (tract path)
         } else {
             info!(
                 "ONNX file configured but missing ({}), falling back to TFLite",
                 onnx_path.display()
             );
-            (load_tflite_runner(&resolved.tflite_path())?, false)
+            (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
         }
     } else {
-        (load_tflite_runner(&resolved.tflite_path())?, false)
+        (Some(load_tflite_runner(&resolved.tflite_path())?), None, false)
     };
-
-    let labels = load_labels(&resolved.labels_path())?;
+    let (labels, csv_common_names, csv_classes) = load_labels(&resolved.labels_path())?;
 
     let meta_model = match load_meta_model(resolved, &labels, config.sf_thresh) {
         Ok(m) => m,
@@ -197,16 +382,29 @@ pub fn load_model(resolved: &ResolvedManifest, config: &Config) -> Result<Loaded
         }
     };
 
+    // BirdNET-Analyzer uses SIGMOID_SENSITIVITY (default 1.0) directly
+    // as the slope of flat_sigmoid: 1/(1+exp(-sensitivity * clip(x,-20,20))).
+    // Higher values → steeper sigmoid → higher reported confidences.
     let sensitivity = config.sensitivity.clamp(0.5, 1.5);
-    let adjusted_sensitivity = (1.0 - (sensitivity - 1.0)).clamp(0.5, 1.5);
+
+    // ── ORT session ───────────────────────────────────────────────────
+    // The ORT session is only used when tract could not load the model
+    // (e.g. unsupported DFT/STFT ops).  If tract succeeded, we keep the
+    // tract runner — it's fast and avoids the potentially slow MIGraphX /
+    // TensorRT compilation step.  When ORT *is* active and GAIA_ACCEL is
+    // set, it will automatically try the GPU EP chain → CPU.
 
     Ok(LoadedModel {
         runner,
+        ort_session,
         meta_model,
         labels,
+        csv_common_names,
+        csv_classes,
         manifest: resolved.clone(),
-        sensitivity: adjusted_sensitivity,
+        sensitivity,
         onnx_classifier,
+        first_predict_logged: false,
     })
 }
 
@@ -236,6 +434,19 @@ fn load_onnx_runner(path: &Path) -> Result<TypedRunnableModel<TypedModel>> {
         .context("Cannot make ONNX model runnable")
 }
 
+/// Validate that an ONNX file can be loaded, optimised, and made
+/// runnable by tract-onnx.
+///
+/// This exercises the exact same code path as the runtime model
+/// loader.  It is meant to be called at container **build** time
+/// (via `gaia-processing validate-model <path>`) so that
+/// incompatibilities (unsupported ops, variable Reshape shapes, etc.)
+/// are caught before the image is published.
+pub fn validate_onnx_with_tract(path: &Path) -> Result<()> {
+    let _runner = load_onnx_runner(path)?;
+    Ok(())
+}
+
 impl LoadedModel {
     /// The model's domain (e.g. "birds", "bats").
     pub fn domain(&self) -> &str {
@@ -257,6 +468,35 @@ impl LoadedModel {
         self.manifest.manifest.model.v1_metadata
     }
 
+    /// Common-name map extracted from CSV labels.
+    ///
+    /// Non-empty for models whose label file is a CSV with a `com_name`
+    /// column (e.g. BirdNET+ V3.0).  Can be used as a fallback when no
+    /// JSON language file ships with the model.
+    pub fn csv_common_names(&self) -> &HashMap<String, String> {
+        &self.csv_common_names
+    }
+
+    /// Taxonomic class map extracted from CSV labels.
+    ///
+    /// Non-empty for models whose label file has a `class` column
+    /// (e.g. BirdNET+ V3.0: Aves, Mammalia, Insecta, …).  Returns
+    /// `sci_name → class`.  When the map is empty (V2.4, Perch, …)
+    /// callers should fall back to [`Self::domain()`].
+    pub fn csv_classes(&self) -> &HashMap<String, String> {
+        &self.csv_classes
+    }
+
+    /// Full list of scientific names the model was trained on.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Whether this model has a species-range (metadata) model loaded.
+    pub fn has_species_range_model(&self) -> bool {
+        self.meta_model.is_some()
+    }
+
     /// Run inference on a single audio chunk.
     ///
     /// Returns a sorted list of `(label, confidence)` pairs,
@@ -266,12 +506,43 @@ impl LoadedModel {
     /// boundary), the mel preprocessing is computed in Rust via
     /// [`crate::mel::birdnet_mel_spectrogram`] before feeding the classifier.
     pub fn predict(
-        &self,
+        &mut self,
         chunk: &[f32],
         lat: f64,
         lon: f64,
         week: u32,
     ) -> Result<Vec<Prediction>> {
+        // ── ORT path (GPU-accelerated or CPU fallback) ───────────────
+        if let Some(ort) = &mut self.ort_session {
+            let out_idx = self.manifest.manifest.model.prediction_output_index;
+            let logits = if self.onnx_classifier {
+                let mel = crate::mel::birdnet_mel_spectrogram(chunk);
+                ort.predict(mel, vec![1, 96, 511, 2], out_idx)?
+            } else {
+                let n = chunk.len();
+                ort.predict(chunk.to_vec(), vec![1, n], out_idx)?
+            };
+
+            self.log_first_prediction(&logits);
+            let scores = self.transform_scores(&logits);
+
+            let mut predictions: Vec<Prediction> = self
+                .labels
+                .iter()
+                .zip(scores.iter())
+                .map(|(label, &score)| {
+                    let safe_score = if score.is_finite() { score } else { 0.0 };
+                    (label.clone(), safe_score as f64)
+                })
+                .collect();
+            predictions.sort_by(|a, b| b.1.total_cmp(&a.1));
+            return Ok(predictions);
+        }
+
+        // ── tract path (tract-onnx / tract-tflite) ──────────────────
+        let runner = self.runner.as_ref()
+            .context("No inference backend available (tract did not load and ORT is absent)")?;
+
         let result = if self.onnx_classifier {
             // ── ONNX classifier: audio → Rust mel → CNN ──────────
             let mel = crate::mel::birdnet_mel_spectrogram(chunk);
@@ -279,7 +550,7 @@ impl LoadedModel {
                 tract_ndarray::Array4::from_shape_vec((1, 96, 511, 2), mel)
                     .context("Cannot reshape mel spectrogram")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into()])
                 .context("ONNX classifier inference failed")?
         } else if self.v1_metadata() {
@@ -294,7 +565,7 @@ impl LoadedModel {
                 tract_ndarray::Array2::from_shape_vec((1, 6), mdata.to_vec())
                     .context("Cannot reshape metadata")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into(), mdata_tensor.into()])
                 .context("V1 inference failed")?
         } else {
@@ -304,38 +575,183 @@ impl LoadedModel {
                 tract_ndarray::Array2::from_shape_vec((1, n), chunk.to_vec())
                     .context("Cannot reshape audio chunk")?
                     .into();
-            self.runner
+            runner
                 .run(tvec![input.into()])
                 .context("Inference failed")?
         };
 
-        let output = result[0]
+        let output = result[self.manifest.manifest.model.prediction_output_index]
             .to_array_view::<f32>()
             .context("Cannot read output tensor")?;
 
         let logits: Vec<f32> = output.iter().copied().collect();
-        let scores = if self.manifest.manifest.model.apply_softmax {
-            softmax(&logits)
-        } else {
-            self.scale_logits(&logits)
-        };
+        self.log_first_prediction(&logits);
+        let scores = self.transform_scores(&logits);
 
         let mut predictions: Vec<Prediction> = self
             .labels
             .iter()
             .zip(scores.iter())
-            .map(|(label, &score)| (label.clone(), score as f64))
+            .map(|(label, &score)| {
+                let safe_score = if score.is_finite() { score } else { 0.0 };
+                (label.clone(), safe_score as f64)
+            })
             .collect();
 
-        predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        predictions.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(predictions)
     }
 
-    /// Apply sigmoid scaling with sensitivity adjustment.
-    fn scale_logits(&self, logits: &[f32]) -> Vec<f32> {
+    /// Log raw logit statistics once per model so operators can verify
+    /// the model's output scale and diagnose zero-detection issues.
+    fn log_first_prediction(&mut self, logits: &[f32]) {
+        if self.first_predict_logged {
+            return;
+        }
+        self.first_predict_logged = true;
+
+        let name = &self.manifest.manifest.model.name;
+        let n_logits = logits.len();
+        let n_labels = self.labels.len();
+        let transform = self.effective_transform();
+
+        if n_logits != n_labels {
+            tracing::warn!(
+                "[{name}] Logit/label mismatch: model produced {n_logits} logits \
+                 but labels file has {n_labels} entries.  Predictions will be \
+                 truncated to the shorter of the two — check labels_file in \
+                 the manifest."
+            );
+        }
+
+        if logits.is_empty() {
+            info!("[{name}] First inference: 0 logits (model produced no output!)");
+            return;
+        }
+
+        let finite_logits: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+        let non_finite = logits.len().saturating_sub(finite_logits.len());
+
+        let max_logit = finite_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_logit = finite_logits
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let positive = finite_logits.iter().filter(|&&x| x > 0.0).count();
+
+        // Top-5 raw logits (before any transform).
+        let mut sorted: Vec<f32> = finite_logits.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let top5: Vec<String> = if sorted.is_empty() {
+            vec!["<no finite logits>".to_string()]
+        } else {
+            sorted.iter().take(5).map(|x| format!("{x:.4}")).collect()
+        };
+
+        info!(
+            "[{name}] First inference: {n_logits} logits, {n_labels} labels, \
+             range=[{min_logit:.4}, {max_logit:.4}], {positive} positive, \
+             non_finite={non_finite}, top5=[{}], transform={transform:?}",
+            top5.join(", ")
+        );
+
+        if sorted.is_empty() {
+            tracing::warn!(
+                "[{name}] All logits are non-finite (NaN/Inf). \
+                 This usually indicates model/runtime incompatibility."
+            );
+            return;
+        }
+
+        // Also show what the transform does to the top logit.
+        let top_score = match transform {
+            crate::manifest::ScoreTransform::Sigmoid => {
+                let s = self.sensitivity as f32;
+                let c = max_logit.clamp(-20.0, 20.0);
+                let raw = 1.0 / (1.0 + (-s * c).exp());
+                if raw <= 0.5 { 0.0 } else { raw }
+            }
+            crate::manifest::ScoreTransform::Softmax => {
+                // Compute softmax to show what the top score will be.
+                let sm = softmax(logits);
+                sm.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            }
+            crate::manifest::ScoreTransform::CenteredSigmoid => {
+                // Approximate: re-center top logit by the global mean.
+                let n = logits.len() as f32;
+                let mean = logits.iter().sum::<f32>() / n;
+                let var = logits.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+                let std = var.sqrt().max(1.0);
+                let z = ((max_logit - mean) / std).clamp(-20.0, 20.0);
+                1.0 / (1.0 + (-z).exp())
+            }
+            crate::manifest::ScoreTransform::None => max_logit.clamp(0.0, 1.0),
+        };
+        if !top_score.is_nan() {
+            info!(
+                "[{name}] Top logit {max_logit:.4} → score {top_score:.4} \
+                 (sensitivity={:.2})",
+                self.sensitivity,
+            );
+        }
+    }
+
+    /// Resolve which score transform to use for this model.
+    ///
+    /// Priority: `score_transform` field > legacy `apply_softmax` bool > sigmoid default.
+    fn effective_transform(&self) -> crate::manifest::ScoreTransform {
+        use crate::manifest::ScoreTransform;
+        if let Some(t) = self.manifest.manifest.model.score_transform {
+            return t;
+        }
+        if self.manifest.manifest.model.apply_softmax {
+            return ScoreTransform::Softmax;
+        }
+        ScoreTransform::Sigmoid
+    }
+
+    /// Transform raw model logits into 0..1 confidence scores.
+    fn transform_scores(&self, logits: &[f32]) -> Vec<f32> {
+        use crate::manifest::ScoreTransform;
+        match self.effective_transform() {
+            ScoreTransform::Softmax => softmax(logits),
+            ScoreTransform::Sigmoid => self.sigmoid_scale(logits),
+            ScoreTransform::CenteredSigmoid => centered_sigmoid(logits),
+            ScoreTransform::None => {
+                // Clamp raw logits to [0, 1].
+                logits
+                    .iter()
+                    .map(|&x| if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 })
+                    .collect()
+            }
+        }
+    }
+
+    /// Apply sigmoid scaling with sensitivity.
+    ///
+    /// Matches BirdNET-Analyzer `flat_sigmoid`:
+    ///   `1 / (1 + exp(-sensitivity * clip(x, -20, 20)))`
+    /// where `sensitivity` = `cfg.SIGMOID_SENSITIVITY` (default 1.0).
+    ///
+    /// Scores ≤ 0.5 are clamped to 0: `sigmoid(0) = 0.5` is the
+    /// mathematical "no signal" baseline, so anything at or below it
+    /// carries no positive information and should not be treated as a
+    /// detection at any confidence threshold.
+    fn sigmoid_scale(&self, logits: &[f32]) -> Vec<f32> {
+        let s = self.sensitivity as f32;
         logits
             .iter()
-            .map(|&x| 1.0 / (1.0 + (-self.sensitivity as f32 * x).exp()))
+            .map(|&x| {
+                if !x.is_finite() {
+                    return 0.0;
+                }
+                let clamped = x.clamp(-20.0, 20.0);
+                let score = 1.0 / (1.0 + (-s * clamped).exp());
+                if score <= 0.5 { 0.0 } else { score }
+            })
             .collect()
     }
 
@@ -354,10 +770,59 @@ impl LoadedModel {
 // ── softmax ──────────────────────────────────────────────────────────────
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    if logits.is_empty() {
+        return vec![];
+    }
+
+    let finite: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; logits.len()];
+    }
+
+    let max = finite.into_iter().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&x| if x.is_finite() { (x - max).exp() } else { 0.0 })
+        .collect();
     let sum: f32 = exps.iter().sum();
+
+    if !sum.is_finite() || sum <= 0.0 {
+        return vec![0.0; logits.len()];
+    }
+
     exps.iter().map(|&e| e / sum).collect()
+}
+
+// ── centered sigmoid ─────────────────────────────────────────────────────
+
+/// Z-score centered sigmoid: normalise logits to zero-mean / unit-variance
+/// (with a floor of 1.0 on the std to avoid over-amplification), then
+/// apply the standard sigmoid.  This ensures the per-chunk average logit
+/// maps to 50% and only genuinely strong activations reach >80%.
+fn centered_sigmoid(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return vec![];
+    }
+
+    let finite: Vec<f32> = logits.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; logits.len()];
+    }
+
+    let n = finite.len() as f32;
+    let mean = finite.iter().sum::<f32>() / n;
+    let variance = finite.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    let std = variance.sqrt().max(1.0);
+    logits
+        .iter()
+        .map(|&x| {
+            if !x.is_finite() {
+                return 0.0;
+            }
+            let z = ((x - mean) / std).clamp(-20.0, 20.0);
+            1.0 / (1.0 + (-z).exp())
+        })
+        .collect()
 }
 
 // ── metadata model ───────────────────────────────────────────────────────
@@ -367,13 +832,24 @@ fn load_meta_model(
     _labels: &[String],
     sf_thresh: f64,
 ) -> Result<Option<MetaDataModel>> {
+    let disable_species_range = std::env::var("GAIA_DISABLE_SPECIES_RANGE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if disable_species_range {
+        info!(
+            "Skipping metadata model load for {} (GAIA_DISABLE_SPECIES_RANGE=1)",
+            resolved.manifest.model.name
+        );
+        return Ok(None);
+    }
+
     // ── prefer ONNX when configured and present ──────────────────────
     if let Some(onnx_path) = resolved.metadata_onnx_path() {
         if onnx_path.exists() {
             info!("Loading ONNX metadata model: {}", onnx_path.display());
             let runner = load_onnx_runner(&onnx_path)
                 .with_context(|| format!("Cannot load ONNX metadata model: {}", onnx_path.display()))?;
-            let labels = load_labels(&resolved.labels_path())?;
+            let (labels, _, _) = load_labels(&resolved.metadata_labels_path())?;
             return Ok(Some(MetaDataModel {
                 runner,
                 labels,
@@ -405,7 +881,7 @@ fn load_meta_model(
         .into_optimized()?
         .into_runnable()?;
 
-    let labels = load_labels(&resolved.labels_path())?;
+    let (labels, _, _) = load_labels(&resolved.metadata_labels_path())?;
 
     Ok(Some(MetaDataModel {
         runner,
@@ -444,20 +920,52 @@ impl MetaDataModel {
             }
         };
 
-        let filter: Vec<f32> = output.iter().copied().collect();
+        // BirdNET-Analyzer's explore() compares the meta-model output
+        // DIRECTLY to LOCATION_FILTER_THRESHOLD (no sigmoid).  The model
+        // already outputs occurrence probabilities in [0, 1].
+        let raw: Vec<f32> = output.iter().copied().collect();
 
-        let mut scored: Vec<(f32, &str)> = filter
+        let mut scored: Vec<(f32, &str)> = raw
             .iter()
             .zip(self.labels.iter())
             .map(|(&score, label)| (score, label.as_str()))
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Log the value range and top/bottom species for diagnostics.
+        if let (Some(top), Some(bot)) = (scored.first(), scored.last()) {
+            tracing::info!(
+                "Meta-model raw output: {}/{} labels, range [{:.6}, {:.6}], \
+                 top={} ({:.6}), bottom={} ({:.6})",
+                raw.len(),
+                self.labels.len(),
+                bot.0,
+                top.0,
+                top.1,
+                top.0,
+                bot.1,
+                bot.0,
+            );
+        }
+
         let list: Vec<String> = scored
             .iter()
             .filter(|(score, _)| *score >= self.sf_thresh as f32)
-            .map(|(_, label)| label.split('_').next().unwrap_or(label).to_string())
+            .map(|(_, label)| {
+                let sci = label.split('_').next().unwrap_or(label);
+                normalize_sci_name(sci)
+            })
             .collect();
+
+        tracing::info!(
+            "Species range filter: {} of {} species pass sf_thresh={:.3} at ({}, {}) week {}",
+            list.len(),
+            self.labels.len(),
+            self.sf_thresh,
+            lat,
+            lon,
+            week,
+        );
 
         self.cached_params = Some(params);
         self.cached_list = list.clone();
@@ -467,26 +975,151 @@ impl MetaDataModel {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Load label file.  Each line is one label.
-/// Labels of the form `Sci Name_Common Name` are normalised to `Sci Name`.
-fn load_labels(label_path: &Path) -> Result<Vec<String>> {
+/// Load label file.
+///
+/// Supports two formats:
+///   - **Plain text** (`.txt`): one label per line.
+///     Labels of the form `Sci Name_Common Name` are normalised to `Sci Name`.
+///   - **CSV** (`.csv`): comma- or semicolon-separated values.
+///     The delimiter is auto-detected from the first non-empty line.
+///     When a header row is detected (starting with `ebird`, `species`,
+///     or `idx`), it is used to locate the `sci_name` / `com_name`
+///     columns; otherwise the first column is taken as the label.
+///
+/// Returns `(labels, common_names)`.  The common-name map is populated
+/// only for CSV files that have a recognisable `com_name` column;
+/// for plain-text labels the map is empty.
+///
+/// When the CSV also contains a `class` column (e.g. BirdNET+ V3.0:
+/// `Aves`, `Mammalia`, `Insecta`, …), a third map `sci_name → class`
+/// is returned so that callers can use per-species taxonomic class
+/// instead of the coarse per-model domain.
+fn load_labels(
+    label_path: &Path,
+) -> Result<(Vec<String>, HashMap<String, String>, HashMap<String, String>)> {
     let text = std::fs::read_to_string(label_path)
         .with_context(|| format!("Cannot read labels: {}", label_path.display()))?;
 
-    let labels: Vec<String> = text
-        .lines()
-        .map(|line| {
-            let line = line.trim();
-            if line.matches('_').count() == 1 {
-                line.split('_').next().unwrap_or(line).to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
+    // Strip the UTF-8 BOM if present (BirdNET+ V3.0 labels.csv starts with one).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
 
-    info!("Loaded {} labels from {}", labels.len(), label_path.display());
-    Ok(labels)
+    let is_csv = label_path
+        .extension()
+        .map_or(false, |ext| ext.eq_ignore_ascii_case("csv"));
+
+    let mut common_names: HashMap<String, String> = HashMap::new();
+    let mut classes: HashMap<String, String> = HashMap::new();
+
+    let labels: Vec<String> = if is_csv {
+        // Auto-detect delimiter: semicolon if the first line contains `;`,
+        // otherwise comma.
+        let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let delim = if first_line.contains(';') { ';' } else { ',' };
+
+        // Detect header row and find the scientific name column index.
+        let mut lines = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+        let first = lines.next().unwrap_or("");
+        let lower_first = first.to_lowercase();
+        // Recognised header prefixes (BirdNET, Perch, general CSV).
+        // Also treat single-token lines without a space as non-species
+        // headers (e.g. Perch's "inat2024_fsd50k" dataset identifier),
+        // since valid scientific names are always binomial ("Genus species").
+        let is_header = lower_first.starts_with("ebird")
+            || lower_first.starts_with("species")
+            || lower_first.starts_with("idx")
+            || lower_first.starts_with("inat")
+            || (!first.contains(delim) && !first.contains(' '));
+
+        // Find the column index for sci_name (or use 0 as default).
+        let sci_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| {
+                    let c = col.trim().to_lowercase();
+                    c == "sci_name" || c == "scientific_name"
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Find the column index for com_name / common_name (if present).
+        let com_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| {
+                    let c = col.trim().to_lowercase();
+                    c == "com_name" || c == "common_name"
+                })
+        } else {
+            None
+        };
+
+        // Find the column index for `class` (taxonomic class, e.g. Aves).
+        let class_col = if is_header {
+            first
+                .split(delim)
+                .position(|col| col.trim().eq_ignore_ascii_case("class"))
+        } else {
+            None
+        };
+
+        let data_lines: Box<dyn Iterator<Item = &str>> = if is_header {
+            Box::new(lines)
+        } else {
+            // First line is data, not a header — include it.
+            Box::new(std::iter::once(first).chain(lines))
+        };
+
+        data_lines
+            .map(|line| {
+                let cols: Vec<&str> = line.split(delim).collect();
+                let sci = normalize_sci_name(cols.get(sci_col).unwrap_or(&line).trim());
+                if let Some(ci) = com_col {
+                    if let Some(cn) = cols.get(ci) {
+                        let cn = cn.trim();
+                        if !cn.is_empty() {
+                            common_names.insert(sci.clone(), cn.to_string());
+                        }
+                    }
+                }
+                if let Some(ci) = class_col {
+                    if let Some(cls) = cols.get(ci) {
+                        let cls = cls.trim();
+                        if !cls.is_empty() {
+                            classes.insert(sci.clone(), cls.to_string());
+                        }
+                    }
+                }
+                sci
+            })
+            .collect()
+    } else {
+        text.lines()
+            .map(|line| {
+                let line = line.trim();
+                if let Some((sci_part, com_part)) = line.split_once('_') {
+                    let sci = normalize_sci_name(sci_part);
+                    let com = com_part.trim();
+                    if !com.is_empty() {
+                        common_names.insert(sci.clone(), com.to_string());
+                    }
+                    sci
+                } else {
+                    normalize_sci_name(line)
+                }
+            })
+            .collect()
+    };
+
+    info!(
+        "Loaded {} labels ({} with common names, {} with class) from {}",
+        labels.len(),
+        common_names.len(),
+        classes.len(),
+        label_path.display(),
+    );
+    Ok((labels, common_names, classes))
 }
 
 /// Load the JSON language file that maps `scientific_name → common_name`.
@@ -674,7 +1307,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// Smoke-test ONNX model loading via tract-onnx.
+    /// Validate ONNX model loading via tract-onnx.
     ///
     /// Only runs when the classifier ONNX file exists at the expected path.
     #[test]

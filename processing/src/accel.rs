@@ -26,6 +26,9 @@ use tracing::{info, warn};
 
 /// `true` once ORT has been successfully initialised.
 static ORT_AVAILABLE: AtomicBool = AtomicBool::new(false);
+/// When set, force ORT initialisation to prefer the CPU-only runtime
+/// library even if `GAIA_ACCEL=rocm|cuda` is present.
+static ORT_FORCE_CPU_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Returns `true` when ORT init completed successfully.
 ///
@@ -65,10 +68,23 @@ fn init_ort_environment() {
 
         // ── Build candidate list ──────────────────────────────────
         let mut candidates: Vec<PathBuf> = Vec::new();
+        let force_cpu_only = ORT_FORCE_CPU_ONLY.load(Ordering::Acquire)
+            || std::env::var("GAIA_FORCE_CPU_ORT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+        if force_cpu_only {
+            info!("ORT: CPU-only failover requested — preferring /usr/lib/ort-cpu runtime");
+            if let Some(cpu_lib) = find_ort_in_dir("/usr/lib/ort-cpu") {
+                candidates.push(cpu_lib);
+            }
+        }
 
         // Primary candidate from resolve_ort_dylib_path()
         if let Some(primary) = resolve_ort_dylib_path() {
-            candidates.push(primary);
+            if !candidates.contains(&primary) {
+                candidates.push(primary);
+            }
         }
 
         // CPU-only fallback (always a candidate, even when GPU is
@@ -282,12 +298,13 @@ fn resolve_ort_dylib_path() -> Option<PathBuf> {
         }
     }
 
-    // When GPU is NOT requested, prefer a CPU-only ORT build to
-    // completely avoid ROCm/HSA runtime initialisation.
-    if accel_kind() == AccelKind::None {
+    // When GPU is NOT requested, or CPU-only ORT is explicitly forced,
+    // prefer a CPU-only build to completely avoid ROCm/HSA runtime
+    // initialisation.
+    if accel_kind() == AccelKind::None || ORT_FORCE_CPU_ONLY.load(Ordering::Acquire) {
         if let Some(cpu_lib) = find_ort_in_dir("/usr/lib/ort-cpu") {
             info!(
-                "ORT: using CPU-only library (no GPU requested): {}",
+                "ORT: using CPU-only library: {}",
                 cpu_lib.display()
             );
             return Some(cpu_lib);
@@ -420,7 +437,7 @@ pub fn is_gpu_requested() -> bool {
 /// CPU-only with ORT defaults.  Used for DFT/STFT models that tract
 /// cannot handle (BirdNET V3, Perch).
 ///
-/// Build-time smoke tests exercise this path for BirdNET V3/Perch.
+/// Container validation exercises this path for BirdNET V3/Perch.
 pub struct OrtSession {
     session: ort::session::Session,
 }
@@ -626,6 +643,7 @@ impl OrtSession {
     /// `cache_dir` is provided for future use but currently ignored
     /// (CPU EP has no caching).
     pub fn new_cpu(onnx_path: &Path, _cache_dir: &Path) -> Result<Self> {
+        ORT_FORCE_CPU_ONLY.store(true, Ordering::Release);
         info!(
             "Creating ONNX Runtime session (CPU-only fallback) for {}",
             onnx_path.display()

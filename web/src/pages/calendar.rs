@@ -1,21 +1,27 @@
 //! Calendar page – monthly overview with heatmap.
 
-use leptos::*;
+use leptos::prelude::*;
+use leptos::prelude::{
+    signal, ElementChild, IntoView, Resource, ServerFnError,
+    Suspense,
+};
+use leptos::either::Either;
 
 use crate::components::calendar_grid::CalendarGrid;
 use crate::model::CalendarDay;
 
 // ─── Server function ─────────────────────────────────────────────────────────
 
-#[server(GetCalendarData, "/api")]
+#[server(prefix = "/api")]
 pub async fn get_calendar_data(
     year: i32,
     month: u32,
 ) -> Result<Vec<CalendarDay>, ServerFnError> {
-    use crate::server::db;
+    use crate::server::detections_duckdb as ddb;
     let state = use_context::<crate::app::AppState>()
         .ok_or_else(|| ServerFnError::new("Missing AppState"))?;
-    db::calendar_data(&state.db_path, year, month)
+    ddb::calendar_data(&state.db_path, year, month)
+        .await
         .map_err(|e| ServerFnError::new(format!("DB error: {e}")))
 }
 
@@ -26,11 +32,11 @@ pub async fn get_calendar_data(
 pub fn CalendarPage() -> impl IntoView {
     // Current month selection
     let now = js_sys_now();
-    let (year, set_year) = create_signal(now.0);
-    let (month, set_month) = create_signal(now.1);
+    let (year, set_year) = signal(now.0);
+    let (month, set_month) = signal(now.1);
 
     // Fetch calendar data whenever year/month changes
-    let calendar = create_resource(
+    let calendar = Resource::new(
         move || (year.get(), month.get()),
         |(y, m)| async move { get_calendar_data(y, m).await },
     );
@@ -62,14 +68,14 @@ pub fn CalendarPage() -> impl IntoView {
                 <button on:click=go_next class="cal-nav-btn">"Next →"</button>
             </div>
 
-            <Suspense fallback=move || view! { <p class="loading">"Loading calendar…"</p> }>
+            <Suspense fallback=|| view! { <p class="loading">"Loading calendar\u{2026}"</p> }>
                 {move || calendar.get().map(|res| match res {
-                    Ok(days) => view! {
+                    Ok(days) => Either::Left(view! {
                         <CalendarGrid year=year.get() month=month.get() days=days />
-                    }.into_view(),
-                    Err(e) => view! {
+                    }),
+                    Err(e) => Either::Right(view! {
                         <p class="error">"Error: " {e.to_string()}</p>
-                    }.into_view(),
+                    }),
                 })}
             </Suspense>
         </div>
@@ -79,10 +85,11 @@ pub fn CalendarPage() -> impl IntoView {
 /// Returns (year, month) for the current date.
 /// On WASM we cannot use `chrono::Local`, so we parse from js_sys.
 fn js_sys_now() -> (i32, u32) {
-    // Fallback for SSR – use chrono if available.
+    // Fallback for SSR – use UTC (the calendar merely defaults to a month;
+    // the actual data is queried separately with proper TZ handling).
     #[cfg(feature = "ssr")]
     {
-        let now = chrono::Local::now();
+        let now = chrono::Utc::now();
         return (now.format("%Y").to_string().parse().unwrap_or(2025),
                 now.format("%m").to_string().parse().unwrap_or(1));
     }

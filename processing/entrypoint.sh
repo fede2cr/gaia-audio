@@ -10,6 +10,13 @@ set -e
 
 BUNDLED_DIR="/usr/local/share/gaia/manifests"
 MODELS_DIR="/models"
+DIRECT_SUBCOMMAND="${1:-}"
+SKIP_STARTUP_TAXONOMY_REVIEW=0
+case "$DIRECT_SUBCOMMAND" in
+    review-taxonomy|validate-model|validate-manifests)
+        SKIP_STARTUP_TAXONOMY_REVIEW=1
+        ;;
+esac
 
 # ── Purge stale meta-model.onnx that tract-onnx cannot load ──────
 # Early container builds shipped a meta-model.onnx with a dynamic
@@ -87,7 +94,7 @@ if [ ! -f "$TAXONOMY_TABLE" ] && [ -f "/models/_taxonomy/taxonomy_equivalences.t
     TAXONOMY_TABLE="/models/_taxonomy/taxonomy_equivalences.toml"
 fi
 TAXONOMY_MERGED="$(dirname "$TAXONOMY_TABLE")/taxonomy_merged.toml"
-if [ -f "$TAXONOMY_TABLE" ]; then
+if [ -f "$TAXONOMY_TABLE" ] && [ "$SKIP_STARTUP_TAXONOMY_REVIEW" -ne 1 ]; then
     TAXONOMY_REVIEW_TIMEOUT_SECS="${GAIA_TAXONOMY_REVIEW_TIMEOUT_SECS:-0}"
     echo "[entrypoint] Starting taxonomy review in background (timeout=${TAXONOMY_REVIEW_TIMEOUT_SECS}s)"
     (
@@ -113,6 +120,22 @@ if [ -f "$TAXONOMY_TABLE" ]; then
             fi
         fi
     ) &
+elif [ "$SKIP_STARTUP_TAXONOMY_REVIEW" -eq 1 ]; then
+    echo "[entrypoint] Skipping startup taxonomy review for direct subcommand: $DIRECT_SUBCOMMAND"
 fi
 
-exec gaia-processing "$@"
+if [ "${GAIA_STRACE:-0}" = "1" ] || [ "${GAIA_STRACE:-}" = "true" ]; then
+    mkdir -p /data/strace
+    echo "[entrypoint] Starting gaia-processing under strace → /data/strace/gaia-processing.strace.*"
+    set -- strace -ff -tt -s 128 -o /data/strace/gaia-processing.strace gaia-processing "$@"
+else
+    set -- gaia-processing "$@"
+fi
+
+GAIA_PROCESS_TIMEOUT_SECS="${GAIA_PROCESS_TIMEOUT_SECS:-0}"
+if [ "$GAIA_PROCESS_TIMEOUT_SECS" -gt 0 ] 2>/dev/null; then
+    echo "[entrypoint] Enforcing process timeout: ${GAIA_PROCESS_TIMEOUT_SECS}s"
+    exec timeout --foreground -k 15 "${GAIA_PROCESS_TIMEOUT_SECS}s" "$@"
+fi
+
+exec "$@"

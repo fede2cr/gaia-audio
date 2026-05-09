@@ -43,6 +43,35 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::info;
 
+/// How raw model outputs (logits) should be transformed into 0..1
+/// confidence scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreTransform {
+    /// BirdNET-style sigmoid:  `1/(1+exp(-sensitivity*clip(x,-20,20)))`
+    /// with scores ≤ 0.5 clamped to 0.  This is the default for
+    /// backward compatibility.
+    #[default]
+    Sigmoid,
+    /// Standard softmax normalisation across all classes.
+    Softmax,
+    /// Z-score centered sigmoid: `sigmoid((x - mean) / max(std, 1.0))`.
+    ///
+    /// Normalises each chunk's logits so that the per-chunk average maps
+    /// to 50% confidence.  Species whose logit is significantly above
+    /// the mean get high confidence; species near the average stay near
+    /// 50%.  The standard-deviation divisor (floored at 1.0) prevents
+    /// over-amplification when all logits are similar.
+    ///
+    /// Use for models with many output classes where raw logits cluster
+    /// at similar values (e.g. Google Perch 2.0 with ~15K classes).
+    CenteredSigmoid,
+    /// No transformation — raw logits are clamped to 0..1 and used
+    /// as-is.  Only suitable when the model already outputs values in
+    /// the 0..1 range.
+    None,
+}
+
 /// Top-level manifest structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
@@ -58,6 +87,10 @@ pub struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelSection {
     pub name: String,
+    /// Short machine-friendly identifier (e.g. `"birdnet"`).  Derived
+    /// from `name` when not explicitly set in the manifest.
+    #[serde(default)]
+    pub slug: Option<String>,
     pub domain: String,
     pub sample_rate: u32,
     pub chunk_duration: f64,
@@ -71,9 +104,60 @@ pub struct ModelSection {
     /// BirdNET V1 requires a metadata input tensor.
     #[serde(default)]
     pub v1_metadata: bool,
-    /// Whether to apply softmax to raw logits (e.g. Perch).
+    /// Whether to apply softmax to raw logits.
+    /// **Deprecated** — prefer `score_transform`.  Kept for backward
+    /// compatibility: when `score_transform` is unset and this is `true`,
+    /// softmax is used.
     #[serde(default)]
     pub apply_softmax: bool,
+    /// How to convert raw model logits into 0..1 confidence scores.
+    ///   - `"sigmoid"` (default): BirdNET-style flat sigmoid.
+    ///   - `"softmax"`: standard softmax across all classes.
+    ///   - `"none"`: clamp to 0..1, no transformation (Perch).
+    #[serde(default)]
+    pub score_transform: Option<ScoreTransform>,
+    /// When `true`, the ONNX model is a classifier sub-model that expects
+    /// a precomputed mel-spectrogram input `[1, 96, 511, 2]` instead of
+    /// raw audio `[1, N]`.  Only BirdNET V2.4's extracted classifier needs
+    /// this; most ONNX models (e.g. Perch) accept raw audio directly.
+    #[serde(default)]
+    pub onnx_is_classifier: bool,
+    /// Which ONNX output tensor contains the class predictions.
+    ///
+    /// Multi-output models place predictions at different indices:
+    ///   - BirdNET V2.4:  1 output  → predictions at index **0** (default)
+    ///   - BirdNET V3.0:  2 outputs → predictions at index **1**
+    ///                    (output 0 = 1280-dim embeddings)
+    ///   - Perch V2:      4 outputs → predictions at index **3**
+    ///                    (0 = embedding, 1 = spatial_emb, 2 = spectrogram)
+    ///
+    /// Defaults to `0` for backward compatibility with single-output models.
+    #[serde(default)]
+    pub prediction_output_index: usize,
+    /// Skip tract-onnx and go directly to ONNX Runtime (CPU).
+    ///
+    /// Some models load in tract but produce incorrect inference:
+    ///   - BirdNET+ V3.0: patched DFT ops load but output all zeros.
+    ///   - Perch no_dft: MatMul-replaced DFT loads but outputs are
+    ///     input-independent (identical for all audio chunks).
+    ///
+    /// Setting this to `true` forces the ORT CPU fallback path,
+    /// which handles these models correctly.  Requires
+    /// `libonnxruntime.so` to be available.
+    #[serde(default)]
+    pub prefer_ort: bool,
+    /// Mark this model as beta / experimental.  Beta detections are
+    /// displayed with a "BETA" badge in the UI so ornithologists know
+    /// the model is less proven than established ones (e.g. BirdNET V2.4).
+    #[serde(default)]
+    pub beta: bool,
+    /// Trust weight for cross-model agreement scoring.
+    ///
+    /// Higher values give this model more influence when computing
+    /// consensus scores.  BirdNET V2.4 (proven accurate) defaults to
+    /// 1.0; experimental models should use lower values (e.g. 0.5).
+    #[serde(default = "default_trust_weight")]
+    pub trust_weight: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +171,12 @@ pub struct MetadataSection {
     /// shrink_axis_mask in BirdNET V2.4's metadata model).
     #[serde(default)]
     pub onnx_file: Option<String>,
+    /// Optional separate labels file for the metadata model.
+    /// When set, the meta-model uses this file instead of the main
+    /// model's labels.  Useful when reusing a V2.4 meta-model with
+    /// V3.0 (which has a different species set).
+    #[serde(default)]
+    pub labels_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,15 +186,19 @@ pub struct LanguageSection {
     pub dir: String,
 }
 
-/// Zenodo download configuration – allows automatic model fetching.
+/// Download configuration – automatic model fetching from Zenodo or
+/// direct URLs (e.g. HuggingFace).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadSection {
-    /// Zenodo record ID (e.g. "15050749").
-    pub zenodo_record_id: String,
+    /// Zenodo record ID (e.g. "15050749").  Required for Zenodo downloads;
+    /// omit for models using only `direct_files`.
+    #[serde(default)]
+    pub zenodo_record_id: Option<String>,
     /// Default variant if `MODEL_VARIANT` is not set (e.g. "fp16").
     #[serde(default = "default_variant")]
     pub default_variant: String,
-    /// Map of variant name → download info.
+    /// Map of variant name → download info.  Empty for non-Zenodo models.
+    #[serde(default)]
     pub variants: HashMap<String, VariantInfo>,
     /// Optional Keras zip filename on Zenodo for ONNX conversion.
     /// When specified, `ensure_onnx_file()` will download this zip,
@@ -115,6 +209,18 @@ pub struct DownloadSection {
     /// Expected MD5 hex digest of the Keras zip file.
     #[serde(default)]
     pub keras_md5: Option<String>,
+    /// Direct file downloads: maps local filename → remote URL.
+    ///
+    /// Files are downloaded individually (not from a Zenodo zip).  Useful
+    /// for models hosted on HuggingFace or other direct-download sources.
+    ///
+    /// ```toml
+    /// [download.direct_files]
+    /// "model.onnx" = "https://huggingface.co/org/repo/resolve/main/model.onnx"
+    /// "labels.csv" = "https://huggingface.co/org/repo/resolve/main/labels.csv"
+    /// ```
+    #[serde(default)]
+    pub direct_files: HashMap<String, String>,
 }
 
 /// Information about a single model variant available on Zenodo.
@@ -143,6 +249,10 @@ fn default_variant() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_trust_weight() -> f64 {
+    1.0
 }
 fn default_l18n() -> String {
     "l18n".to_string()
@@ -192,6 +302,19 @@ impl ResolvedManifest {
             .map(|f| self.base_dir.join(f))
     }
 
+    /// Labels file for the metadata model.
+    ///
+    /// When `[metadata_model].labels_file` is set, returns that path;
+    /// otherwise falls back to the main model's labels.
+    pub fn metadata_labels_path(&self) -> PathBuf {
+        self.manifest
+            .metadata_model
+            .as_ref()
+            .and_then(|m| m.labels_file.as_ref())
+            .map(|f| self.base_dir.join(f))
+            .unwrap_or_else(|| self.labels_path())
+    }
+
     pub fn language_dir(&self) -> PathBuf {
         let sub = self
             .manifest
@@ -206,6 +329,43 @@ impl ResolvedManifest {
         &self.manifest.model.domain
     }
 
+    /// Short machine-friendly identifier for the model.
+    ///
+    /// Uses the explicit `slug` from the manifest when present, otherwise
+    /// derives one from the model name (lower-case, non-alphanumeric
+    /// characters replaced with `-`, collapsed, trimmed).
+    pub fn slug(&self) -> String {
+        if let Some(ref s) = self.manifest.model.slug {
+            if !s.is_empty() {
+                return s.clone();
+            }
+        }
+        // Derive from name: "BirdNET V2.4" → "birdnet-v2-4"
+        let raw: String = self
+            .manifest
+            .model
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        // Collapse consecutive dashes and trim leading/trailing
+        let mut slug = String::with_capacity(raw.len());
+        let mut prev_dash = true; // suppress leading dash
+        for c in raw.chars() {
+            if c == '-' {
+                if !prev_dash {
+                    slug.push('-');
+                }
+                prev_dash = true;
+            } else {
+                slug.push(c);
+                prev_dash = false;
+            }
+        }
+        slug.trim_end_matches('-').to_string()
+    }
+
     /// Apply variant overrides from the `[download]` section.
     ///
     /// If the selected variant provides `tflite_file`, `labels_file`, or
@@ -216,6 +376,12 @@ impl ResolvedManifest {
             Some(d) => d.clone(),
             None => return Ok(()),
         };
+
+        // Models with only direct_files (no Zenodo variants) skip
+        // variant resolution entirely — there's nothing to override.
+        if download.variants.is_empty() {
+            return Ok(());
+        }
 
         let variant = download
             .variants
@@ -256,11 +422,81 @@ impl ResolvedManifest {
     }
 }
 
+/// Validate raw TOML text as a model manifest.
+///
+/// This performs a strict parse + deserialise check and returns a clear
+/// error message on failure (e.g. duplicate keys, missing required
+/// fields).  Used both by `load_manifest` and by the build-time
+/// `validate-manifests` subcommand to fail fast on malformed files.
+pub fn validate_manifest_toml(text: &str) -> Result<()> {
+    // Step 1: parse as generic TOML value — catches syntax errors
+    // (duplicate keys, invalid types, bad escapes) before serde runs.
+    let _: toml::Value = toml::from_str(text).context("TOML syntax error")?;
+    // Step 2: deserialise into the typed Manifest struct — catches
+    // missing required fields, wrong types, unknown enum variants.
+    let _: Manifest = toml::from_str(text).context("Manifest schema error")?;
+    Ok(())
+}
+
+/// Validate all manifest TOML files under `root_dir`.
+///
+/// Returns the list of validated paths on success, or an error listing
+/// every file that failed validation.  This is stricter than
+/// `discover_manifests` which logs a warning and skips invalid entries.
+pub fn validate_all_manifests(root_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut ok: Vec<PathBuf> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let dirs_to_check: Vec<PathBuf> = if root_dir.join("manifest.toml").exists() {
+        vec![root_dir.to_path_buf()]
+    } else {
+        std::fs::read_dir(root_dir)
+            .with_context(|| format!("Cannot read {}", root_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("manifest.toml").exists())
+            .collect()
+    };
+
+    for dir in &dirs_to_check {
+        let manifest_path = dir.join("manifest.toml");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("{}: {e}", manifest_path.display()));
+                continue;
+            }
+        };
+        match validate_manifest_toml(&text) {
+            Ok(()) => {
+                info!("  PASS  {}", manifest_path.display());
+                ok.push(manifest_path);
+            }
+            Err(e) => {
+                tracing::error!("  FAIL  {}: {e:#}", manifest_path.display());
+                errors.push(format!("{}: {e:#}", manifest_path.display()));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(ok)
+    } else {
+        anyhow::bail!(
+            "{} manifest(s) failed validation:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+}
+
 /// Load a single manifest from a directory.
 pub fn load_manifest(dir: &Path) -> Result<ResolvedManifest> {
     let manifest_path = dir.join("manifest.toml");
     let text = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("Cannot read {}", manifest_path.display()))?;
+    validate_manifest_toml(&text)
+        .with_context(|| format!("Invalid manifest: {}", manifest_path.display()))?;
     let manifest: Manifest =
         toml::from_str(&text).with_context(|| format!("Invalid manifest: {}", manifest_path.display()))?;
     info!(
@@ -279,6 +515,9 @@ pub fn load_manifest(dir: &Path) -> Result<ResolvedManifest> {
 /// Auto-discover all model manifests under `root_dir`.
 ///
 /// Each immediate subdirectory that contains a `manifest.toml` is loaded.
+/// When multiple directories yield the same slug (e.g. an old `birds/` and
+/// a new `birdnet/`), only the first one found is kept — duplicates are
+/// logged and skipped.
 pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     let mut manifests = Vec::new();
 
@@ -298,6 +537,7 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
     }
 
     // Otherwise scan subdirectories
+    let mut seen_slugs = std::collections::HashSet::new();
     for entry in std::fs::read_dir(root_dir)
         .with_context(|| format!("Cannot read {}", root_dir.display()))?
     {
@@ -305,7 +545,19 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
         let path = entry.path();
         if path.is_dir() && path.join("manifest.toml").exists() {
             match load_manifest(&path) {
-                Ok(m) => manifests.push(m),
+                Ok(m) => {
+                    let slug = m.slug();
+                    if seen_slugs.contains(&slug) {
+                        tracing::warn!(
+                            "Duplicate slug '{}' in {} — skipping (already loaded from another directory)",
+                            slug,
+                            path.display(),
+                        );
+                    } else {
+                        seen_slugs.insert(slug);
+                        manifests.push(m);
+                    }
+                }
                 Err(e) => tracing::warn!("Skipping {}: {e}", path.display()),
             }
         }
@@ -322,6 +574,43 @@ pub fn discover_manifests(root_dir: &Path) -> Result<Vec<ResolvedManifest>> {
         info!("Discovered {} model(s)", manifests.len());
     }
     Ok(manifests)
+}
+
+fn normalize_slug_filter(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// Keep only manifests whose slug matches one of the requested slugs.
+///
+/// Matching is case-insensitive and treats `_` and `-` as equivalent.
+pub fn filter_manifests_by_slugs(
+    manifests: Vec<ResolvedManifest>,
+    requested_slugs: &[String],
+) -> Vec<ResolvedManifest> {
+    if requested_slugs.is_empty() {
+        return manifests;
+    }
+
+    let requested: std::collections::HashSet<String> = requested_slugs
+        .iter()
+        .map(|s| normalize_slug_filter(s))
+        .collect();
+
+    manifests
+        .into_iter()
+        .filter(|m| requested.contains(&normalize_slug_filter(&m.slug())))
+        .collect()
+}
+
+/// Returns true when the model slug is enabled by the configured filter.
+pub fn slug_is_selected(slug: &str, requested_slugs: &[String]) -> bool {
+    if requested_slugs.is_empty() {
+        return true;
+    }
+    let normalized = normalize_slug_filter(slug);
+    requested_slugs
+        .iter()
+        .any(|s| normalize_slug_filter(s) == normalized)
 }
 
 #[cfg(test)]
@@ -399,7 +688,7 @@ tflite_file = "model_int8.tflite"
 "#;
         let m: Manifest = toml::from_str(toml).unwrap();
         let dl = m.download.as_ref().unwrap();
-        assert_eq!(dl.zenodo_record_id, "15050749");
+        assert_eq!(dl.zenodo_record_id.as_deref(), Some("15050749"));
         assert_eq!(dl.default_variant, "fp16");
         assert_eq!(dl.variants.len(), 3);
         assert_eq!(dl.variants["fp32"].zenodo_file, "BirdNET_v2.4_tflite.zip");
@@ -485,5 +774,46 @@ zenodo_file = "test.zip"
             resolved.effective_variant(Some("int8")),
             Some("int8".to_string())
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_keys() {
+        let toml = r#"
+[model]
+name = "Broken"
+slug = "broken"
+domain = "birds"
+sample_rate = 48000
+chunk_duration = 3.0
+tflite_file = "model.tflite"
+labels_file = "labels.txt"
+beta = true
+trust_weight = 0.5
+beta = true
+trust_weight = 0.5
+"#;
+        let err = validate_manifest_toml(toml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate key"),
+            "Expected 'duplicate key' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_manifest() {
+        let toml = r#"
+[model]
+name = "BirdNET V2.4"
+slug = "birdnet"
+domain = "birds"
+sample_rate = 48000
+chunk_duration = 3.0
+tflite_file = "model.tflite"
+labels_file = "labels.txt"
+beta = true
+trust_weight = 0.5
+"#;
+        validate_manifest_toml(toml).unwrap();
     }
 }
