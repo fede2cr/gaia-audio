@@ -156,17 +156,53 @@ fn escape_sql_path(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
 }
 
+/// Subdirectory under the detections directory where unreadable / corrupt
+/// Parquet files are moved aside so the scanner does not re-warn about them
+/// on every refresh.  Files are preserved (not deleted) for forensic recovery.
+const CORRUPT_SUBDIR: &str = ".corrupt";
+
+/// Move a corrupt Parquet file into the quarantine subdirectory.
+/// Returns the destination path on success.  On any I/O failure we log a
+/// warning and return `None` (caller will continue to skip the file but it
+/// will keep showing up at the next scan — better than crashing).
+fn quarantine_file(path: &Path, reason: &str) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let corrupt_dir = parent.join(CORRUPT_SUBDIR);
+    if let Err(e) = std::fs::create_dir_all(&corrupt_dir) {
+        tracing::warn!(
+            "Could not create quarantine dir {}: {e}",
+            corrupt_dir.display()
+        );
+        return None;
+    }
+    let file_name = path.file_name()?;
+    let dest = corrupt_dir.join(file_name);
+    match std::fs::rename(path, &dest) {
+        Ok(()) => {
+            tracing::warn!(
+                "Quarantined unreadable Parquet file {} → {} ({reason})",
+                path.display(),
+                dest.display()
+            );
+            Some(dest)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to quarantine unreadable Parquet file {}: {e} ({reason})",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn readable_parquet_files(conn: &duckdb::Connection, dir: &Path) -> Vec<PathBuf> {
     parquet_files(dir)
         .into_iter()
         .filter(|path| {
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if size < 12 {
-                tracing::warn!(
-                    "Ignoring unreadable Parquet file {} ({} bytes)",
-                    path.display(),
-                    size
-                );
+                quarantine_file(path, &format!("{size} bytes"));
                 return false;
             }
 
@@ -183,7 +219,7 @@ fn readable_parquet_files(conn: &duckdb::Connection, dir: &Path) -> Vec<PathBuf>
                 }
                 Err(e) => {
                     let _ = conn.execute_batch("DROP VIEW IF EXISTS __gaia_parquet_probe");
-                    tracing::warn!("Ignoring unreadable Parquet file {}: {e}", path.display());
+                    quarantine_file(path, &format!("probe failed: {e}"));
                     false
                 }
             }
